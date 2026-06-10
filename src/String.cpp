@@ -1432,6 +1432,11 @@ int String::indexOf(const String &inValue, Dynamic inStart) const
    if (__s==0)
       return -1;
    int s = inStart==null() ? 0 : inStart->__ToInt();
+   // A negative start means "from the beginning" (matches other targets). Without
+   // this clamp the search reads before the buffer (out-of-bounds) and can return
+   // a bogus negative index.
+   if (s < 0)
+      s = 0;
    int l = inValue.length;
 
    if (l==0) {
