@@ -3793,7 +3793,16 @@ public:
                         }
 
                         #ifdef HXCPP_ALIGN_ALLOC
-                        destPos += ALIGN_PADDING(destPos);
+                        // The fit test above reserved space for this alignment
+                        // padding (allocSize + ALIGN_PADDING), so the padding must
+                        // be charged against destLen as well as destPos - otherwise
+                        // destLen over-counts the free space and a later object can
+                        // be placed past the end of the block.
+                        {
+                           int alignPad = ALIGN_PADDING(destPos);
+                           destPos += alignPad;
+                           destLen -= alignPad;
+                        }
                         #endif
 
                         int startRow = destPos>>IMMIX_LINE_BITS;
@@ -4001,9 +4010,15 @@ public:
 
                            // TODO - not copy + paste
 
-                        printf("Move!\n");
                            #ifdef HXCPP_ALIGN_ALLOC
-                           destPos += ALIGN_PADDING(destPos);
+                           // Charge the alignment padding against destLen too (see
+                           // the matching fix in MoveBlocks) so destLen cannot
+                           // over-count free space and overflow the block.
+                           {
+                              int alignPad = ALIGN_PADDING(destPos);
+                              destPos += alignPad;
+                              destLen -= alignPad;
+                           }
                            #endif
 
                            int startRow = destPos>>IMMIX_LINE_BITS;
@@ -4254,6 +4269,23 @@ public:
       else
          for(int i=0;i<mAllBlocks.size();i++)
             mAllBlocks[i]->VisitBlock(inCtx);
+
+      // Large objects are not stored in blocks and never move, but they can hold
+      // references into the moved heap, so their members must be visited too -
+      // the mAllBlocks pass above only covers block-sized allocations.  The
+      // remembered-set path covers these via the write barrier.
+      if (!inRemembered)
+         for(int i=0;i<mLargeList.size();i++)
+         {
+            unsigned int *blob = mLargeList[i];
+            if ( (blob[1] & IMMIX_ALLOC_MARK_ID) == hx::gMarkID &&
+                 (blob[1] & IMMIX_ALLOC_IS_CONTAINER) )
+            {
+               hx::Object *obj = (hx::Object *)(blob + 2);
+               if (*(void **)obj)
+                  obj->__Visit(inCtx);
+            }
+         }
 
       for(int i=0;i<mLocalAllocs.size();i++)
          VisitLocalAlloc(mLocalAllocs[i], inCtx);
