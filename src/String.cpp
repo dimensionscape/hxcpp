@@ -939,19 +939,33 @@ String::String(const double &inRHS)
 
 String::String(const cpp::Int64 &inRHS)
 {
-   char buf[100];
-   SPRINTF(buf,100,"%lld", (long long int)inRHS);
-   buf[99]='\0';
-   __s = GCStringDup(buf,-1,&length);
+   // Direct digit writing instead of snprintf("%lld"); see String::fromInt.
+   char buf[24]; // "-9223372036854775808" is 20 chars
+   char *p = buf + sizeof(buf);
+   unsigned long long u = (unsigned long long)(long long)inRHS;
+   bool neg = (long long)inRHS < 0;
+   if (neg)
+      u = (unsigned long long)0 - u; // magnitude, well-defined even for INT64_MIN
+   do {
+      *--p = (char)('0' + (u % 10));
+      u /= 10;
+   } while (u);
+   if (neg)
+      *--p = '-';
+   __s = GCStringDup(p, (int)(buf + sizeof(buf) - p), &length);
 }
 
 
 String::String(const cpp::UInt64 &inRHS)
 {
-   char buf[100];
-   SPRINTF(buf,100,"%llu", (unsigned long long int)inRHS);
-   buf[99]='\0';
-   __s = GCStringDup(buf,-1,&length);
+   char buf[24]; // 20-digit max for unsigned 64-bit
+   char *p = buf + sizeof(buf);
+   unsigned long long u = (unsigned long long)inRHS;
+   do {
+      *--p = (char)('0' + (u % 10));
+      u /= 10;
+   } while (u);
+   __s = GCStringDup(p, (int)(buf + sizeof(buf) - p), &length);
 }
 
 String::String(const float &inRHS)
