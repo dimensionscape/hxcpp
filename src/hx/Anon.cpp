@@ -241,7 +241,10 @@ bool Anon_obj::__Remove(String inKey)
    if (slot>=0)
    {
       VariantKey *fixed = getFixed();
-      while(slot<mFixedFields)
+      // Shift the elements after 'slot' down by one. Stop at mFixedFields-1:
+      // fixed[] only has mFixedFields slots, so reading fixed[mFixedFields]
+      // would be an out-of-bounds access (and a String/Variant copy from it).
+      while(slot<mFixedFields-1)
       {
          fixed[slot] = fixed[slot+1];
          slot++;

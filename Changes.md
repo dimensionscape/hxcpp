@@ -35,6 +35,7 @@
 * Fixed behaviour of indexOf and lastIndexOf on empty strings not aligning with other targets
 * Fixed behaviour of directory reading function not aligning with other targets
 * Fixed haxelib not being invoked with the current working directory
+* Fixed out-of-bounds read when deleting a fixed field of an anonymous object (Reflect.deleteField)
 
 * Removed Haxe 3 support
 
