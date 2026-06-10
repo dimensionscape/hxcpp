@@ -867,8 +867,25 @@ String::String(const cpp::CppInt32__ &inRHS)
 
 
 
+// Non-finite doubles must stringify the same as other Haxe targets (JS, hl,
+// jvm...): "NaN", "Infinity", "-Infinity". printf is platform-specific here
+// (MSVC emits "-nan(ind)"/"inf", glibc "nan"/"inf"), so handle them explicitly.
+static const char *_hx_non_finite_str(double v)
+{
+   if (v != v) return "NaN";
+   if (v == HUGE_VAL) return "Infinity";
+   if (v == -HUGE_VAL) return "-Infinity";
+   return 0;
+}
+
 String::String(const double &inRHS)
 {
+   const char *nonFinite = _hx_non_finite_str(inRHS);
+   if (nonFinite)
+   {
+      __s = GCStringDup(nonFinite,-1,&length);
+      return;
+   }
    char buf[100];
    SPRINTF(buf,100,HX_DOUBLE_PATTERN,inRHS);
    buf[99]='\0';
@@ -895,6 +912,12 @@ String::String(const cpp::UInt64 &inRHS)
 
 String::String(const float &inRHS)
 {
+   const char *nonFinite = _hx_non_finite_str(inRHS);
+   if (nonFinite)
+   {
+      __s = GCStringDup(nonFinite,-1,&length);
+      return;
+   }
    char buf[100];
    SPRINTF(buf,100,HX_DOUBLE_PATTERN,inRHS);
    buf[99]='\0';
