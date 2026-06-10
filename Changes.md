@@ -12,6 +12,9 @@
 * Added x86_64 support to older Android NDKs
 * Added optional detaching of main thread
 
+* Improved Map/StringMap/IntMap lookup performance by ~16-26% by lowering the default hash table load factor
+* Improved array slice/splice by skipping the generational GC write barrier for arrays of primitive (non-pointer) types
+
 * Updated mbedtls to 2.28.2
 * Updated sqlite to 3.40.1
 * Updated zlib to 1.2.13

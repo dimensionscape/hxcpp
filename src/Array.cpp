@@ -300,8 +300,12 @@ void ArrayBase::Splice(ArrayBase *outResult,int inPos,int inLen)
    {
       outResult->resize(inLen);
       memcpy(outResult->mBase, mBase+inPos*s, s*inLen);
-      // todo - only needed if we have dirty pointer elements
-      HX_OBJ_WB_PESSIMISTIC_GET(outResult);
+#ifdef HXCPP_GC_GENERATIONAL
+      // Only needed if we have pointer elements - primitive (atomic) arrays
+      // carry no GC refs, so skip the remembered-set push entirely.
+      if (!AllocAtomic())
+         HX_OBJ_WB_PESSIMISTIC_GET(outResult);
+#endif
    }
    memmove(mBase+inPos*s, mBase + (inPos+inLen)*s, (length-(inPos+inLen))*s);
    resize(length-inLen);
@@ -327,8 +331,12 @@ void ArrayBase::Slice(ArrayBase *outResult,int inPos,int inEnd)
       outResult->resize(n);
       int s = GetElementSize();
       memcpy(outResult->mBase, mBase+inPos*s, n*s);
-      // todo - only needed if we have dirty pointer elements
-      HX_OBJ_WB_PESSIMISTIC_GET(outResult);
+#ifdef HXCPP_GC_GENERATIONAL
+      // Only needed if we have pointer elements - primitive (atomic) arrays
+      // carry no GC refs, so skip the remembered-set push entirely.
+      if (!AllocAtomic())
+         HX_OBJ_WB_PESSIMISTIC_GET(outResult);
+#endif
    }
 }
 
