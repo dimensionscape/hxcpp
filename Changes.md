@@ -18,6 +18,7 @@
 * Reduced large-map build time ~24-36% by switching hash table growth from 2x to 4x once a map is large (small maps keep 2x, so their memory is unchanged)
 * Improved array slice/splice by skipping the generational GC write barrier for arrays of primitive (non-pointer) types
 * Increased Socket.read() chunk buffer from 256 bytes to 16KB, cutting recv() syscalls ~64x when reading a stream to EOF
+* Sped up String.indexOf on byte strings using memchr: ~58x faster for sparse/absent single-char search (the common contains check) and ~2.5x faster for multi-char search
 
 * Updated mbedtls to 2.28.2
 * Updated sqlite to 3.40.1

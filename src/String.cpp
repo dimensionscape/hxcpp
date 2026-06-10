@@ -1327,6 +1327,13 @@ static int TIndexOf(int s, const T *str, int strLen, const T *sought, int sought
    if (soughtLen==1)
    {
       T test = *sought;
+      // Byte strings: memchr is SIMD-optimized, much faster than a hand loop.
+      // sizeof(T)==1 is constant-folded; the memchr branch is dead for char16_t.
+      if (sizeof(T)==1 && s<strLen)
+      {
+         const T *found = (const T *)memchr(str+s, (unsigned char)test, strLen-s);
+         return found ? (int)(found-str) : -1;
+      }
       while(s<strLen)
       {
          if (str[s]==test)
@@ -1336,6 +1343,24 @@ static int TIndexOf(int s, const T *str, int strLen, const T *sought, int sought
    }
    else
    {
+      // Find candidate start positions with memchr (on the first unit) and only
+      // memcmp there, instead of memcmp at every position.
+      if (sizeof(T)==1)
+      {
+         T first = *sought;
+         int last = strLen - soughtLen;
+         while(s<=last)
+         {
+            const T *cand = (const T *)memchr(str+s, (unsigned char)first, last+1-s);
+            if (!cand)
+               return -1;
+            s = (int)(cand-str);
+            if (!memcmp(str+s, sought, soughtLen))
+               return s;
+            s++;
+         }
+         return -1;
+      }
       while(s+soughtLen<=strLen)
       {
          if (!memcmp(str + s,sought,soughtLen*sizeof(T)))
