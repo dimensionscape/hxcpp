@@ -48,6 +48,7 @@ using namespace std;
 namespace hx
 {
 char HX_DOUBLE_PATTERN[20] = "%.15g";
+bool HX_DOUBLE_PATTERN_CUSTOM = false;
 #define HX_INT_PATTERN "%d"
 #define HX_UINT_PATTERN "%ud"
 }
@@ -57,6 +58,7 @@ void __hxcpp_set_float_format(String inFormat)
   int last = inFormat.length < 19 ? inFormat.length : 19;
   memcpy(HX_DOUBLE_PATTERN, inFormat.utf8_str(), last*sizeof(char) );
   HX_DOUBLE_PATTERN[last] = '\0';
+  hx::HX_DOUBLE_PATTERN_CUSTOM = true;
 }
 
 // --- GC helper
@@ -887,7 +889,24 @@ String::String(const double &inRHS)
       return;
    }
    char buf[100];
-   SPRINTF(buf,100,HX_DOUBLE_PATTERN,inRHS);
+   if (HX_DOUBLE_PATTERN_CUSTOM)
+   {
+      SPRINTF(buf,100,HX_DOUBLE_PATTERN,inRHS);
+   }
+   else
+   {
+      // Emit the shortest %g representation that round-trips. 17 significant
+      // digits always suffice to round-trip a double, but try fewer first so
+      // simple values stay short ("0.1", not "0.10000000000000001"). This makes
+      // String<->parseFloat lossless and matches other Haxe targets, which the
+      // previous fixed "%.15g" did not (e.g. 0.1+0.2 printed "0.3").
+      for(int prec=15; prec<=17; prec++)
+      {
+         SPRINTF(buf,100,"%.*g",prec,inRHS);
+         if (strtod(buf,0)==inRHS)
+            break;
+      }
+   }
    buf[99]='\0';
    __s = GCStringDup(buf,-1,&length);
 }

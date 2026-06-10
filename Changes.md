@@ -39,6 +39,7 @@
 * Fixed behaviour of directory reading function not aligning with other targets
 * Fixed haxelib not being invoked with the current working directory
 * Fixed Std.string of NaN/Infinity to match other targets ("NaN", "Infinity", "-Infinity") instead of platform printf output ("-nan(ind)", "inf")
+* Fixed Std.string(Float) losing precision: now emits the shortest representation that round-trips (e.g. 0.1+0.2 prints "0.30000000000000004"), so String<->parseFloat is lossless and matches other targets
 * Fixed out-of-bounds read when deleting a fixed field of an anonymous object (Reflect.deleteField)
 
 * Removed Haxe 3 support
