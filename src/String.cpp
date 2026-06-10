@@ -1414,8 +1414,15 @@ static int TIndexOf(int s, const T *str, int strLen, const T *sought, int sought
          }
          return -1;
       }
-      while(s+soughtLen<=strLen)
+      // Skip to first-unit candidates before paying for the full compare
+      T first = *sought;
+      int last = strLen - soughtLen;
+      while(s<=last)
       {
+         while(s<=last && str[s]!=first)
+            s++;
+         if (s>last)
+            break;
          if (!memcmp(str + s,sought,soughtLen*sizeof(T)))
             return s;
          s++;
@@ -1457,9 +1464,39 @@ int String::indexOf(const String &inValue, Dynamic inStart) const
       if (s016 && s116)
          return TIndexOf(s, __w, length, inValue.__w, inValue.length);
 
+      if (s016)
+      {
+         // Wide haystack, byte needle - skip to first-unit candidates.
+         // StrMatch compares against signed char, where bytes >= 0x80 can
+         // never equal a char16_t unit, so skipping on the unsigned value
+         // can only ever skip positions StrMatch would reject.
+         char16_t first = (char16_t)(unsigned char)inValue.__s[0];
+         while(s+l<=length)
+         {
+            while(s+l<=length && __w[s]!=first)
+               s++;
+            if (s+l>length)
+               break;
+            if (StrMatch(__w+s, inValue.__s, l))
+               return s;
+            s++;
+         }
+         return -1;
+      }
+
+      // Byte haystack, wide needle.  A first unit outside the signed char
+      // range can never match (StrMatch semantics), so don't scan at all;
+      // otherwise memchr candidates on the byte data.
+      char16_t first = inValue.__w[0];
+      if (first>127)
+         return -1;
       while(s+l<=length)
       {
-         if (s016 ? StrMatch(__w+s, inValue.__s, l) : StrMatch(inValue.__w, __s+s, l) )
+         const char *cand = (const char *)memchr(__s+s, (char)first, length-l-s+1);
+         if (!cand)
+            return -1;
+         s = (int)(cand-__s);
+         if (StrMatch(inValue.__w, __s+s, l))
             return s;
          s++;
       }
@@ -1486,9 +1523,10 @@ static int TLastIndexOf(int s, const T *str, int strLen, const T *sought, int so
    }
    else
    {
+      T first = *sought;
       while(s>=0)
       {
-         if (!memcmp(str + s,sought,soughtLen*sizeof(T)))
+         if (str[s]==first && !memcmp(str + s,sought,soughtLen*sizeof(T)))
             return s;
          --s;
       }
@@ -1521,9 +1559,35 @@ int String::lastIndexOf(const String &inValue, Dynamic inStart) const
       if (s016 && s116)
          return TLastIndexOf(s, __w, length, inValue.__w, inValue.length);
 
+      if (s016)
+      {
+         // Wide haystack, byte needle - skip backwards on the first unit
+         // (see indexOf for why the unsigned conversion is safe)
+         char16_t first = (char16_t)(unsigned char)inValue.__s[0];
+         while(s>=0)
+         {
+            while(s>=0 && __w[s]!=first)
+               s--;
+            if (s<0)
+               break;
+            if (StrMatch(__w+s, inValue.__s, l))
+               return s;
+            s--;
+         }
+         return -1;
+      }
+
+      // Byte haystack, wide needle
+      char16_t first = inValue.__w[0];
+      if (first>127)
+         return -1;
       while(s>=0)
       {
-         if (s016 ? StrMatch(__w+s, inValue.__s, l) : StrMatch(inValue.__w, __s+s, l) )
+         while(s>=0 && __s[s]!=(char)first)
+            s--;
+         if (s<0)
+            break;
+         if (StrMatch(inValue.__w, __s+s, l))
             return s;
          s--;
       }

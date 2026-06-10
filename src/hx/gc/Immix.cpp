@@ -2093,18 +2093,26 @@ void MarkAllocUnchecked(void *inPtr,hx::MarkContext *__inCtx)
 
       char *block = (char *)(ptr_i & IMMIX_BLOCK_BASE_MASK);
       char *rowMark = block + ((ptr_i & IMMIX_BLOCK_OFFSET_MASK)>>IMMIX_LINE_BITS);
-      *rowMark = 1;
+      // Several objects share a row, so the byte is usually set already -
+      // checking first keeps the cache line shared between marker threads
+      // instead of ping-ponging it with redundant stores
+      if (!*rowMark)
+         *rowMark = 1;
       if (rows>1)
       {
-         rowMark[1] = 1;
+         if (!rowMark[1])
+            rowMark[1] = 1;
          if (rows>2)
          {
-            rowMark[2] = 1;
+            if (!rowMark[2])
+               rowMark[2] = 1;
             if (rows>3)
             {
-               rowMark[3] = 1;
+               if (!rowMark[3])
+                  rowMark[3] = 1;
                for(int r=4; r<rows; r++)
-                  rowMark[r]=1;
+                  if (!rowMark[r])
+                     rowMark[r]=1;
             }
          }
       }
@@ -2162,18 +2170,24 @@ void MarkObjectAllocUnchecked(hx::Object *inPtr,hx::MarkContext *__inCtx)
       if ( ((ptr_i & IMMIX_BLOCK_OFFSET_MASK)>>IMMIX_LINE_BITS) + rows > IMMIX_LINES) DebuggerTrap();
       #endif
 
-      *rowMark = 1;
+      // Check before storing - see MarkAllocUnchecked
+      if (!*rowMark)
+         *rowMark = 1;
       if (rows>1)
       {
-         rowMark[1] = 1;
+         if (!rowMark[1])
+            rowMark[1] = 1;
          if (rows>2)
          {
-            rowMark[2] = 1;
+            if (!rowMark[2])
+               rowMark[2] = 1;
             if (rows>3)
             {
-               rowMark[3] = 1;
+               if (!rowMark[3])
+                  rowMark[3] = 1;
                for(int r=4; r<rows; r++)
-                  rowMark[r]=1;
+                  if (!rowMark[r])
+                     rowMark[r]=1;
             }
          }
       }
@@ -3119,6 +3133,7 @@ public:
       mLargeAllocated = 0;
       mLargeMin = (size_t)-1;
       mLargeMax = 0;
+      mRecycleSize = 0;
       mLargeAllocSpace = 40 << 20;
       mLargeAllocForceRefresh = mLargeAllocSpace;
       // Start at 1 Meg...
@@ -3210,6 +3225,7 @@ public:
             return;
          }
          largeObjectRecycle.push(blob);
+         mRecycleSize = largeObjectRecycle.size();
          mLargeListLock.unlock();
       }
    }
@@ -3243,26 +3259,30 @@ public:
       bool isLocked = false;
 
 
-      if (largeObjectRecycle.size())
+      // Probe the count only - scanning the vector itself unlocked raced
+      // with concurrent push/qerase under the lock (and the old recheck
+      // 'continue' skipped the entry swapped into the current slot)
+      if (mRecycleSize)
       {
+         if (do_lock && !isLocked)
+         {
+            mLargeListLock.lock();
+            isLocked = true;
+         }
          for(int i=0;i<largeObjectRecycle.size();i++)
          {
             if ( largeObjectRecycle[i][0] == inSize )
             {
-               if (do_lock && !isLocked)
-               {
-                  mLargeListLock.lock();
-                  isLocked = true;
-                  if (  i>=largeObjectRecycle.size() || largeObjectRecycle[i][0] != inSize )
-                     continue;
-               }
-
                result = largeObjectRecycle[i];
                largeObjectRecycle.qerase(i);
-               // You can use this to test race condition
-               //Sleep(1);
+               mRecycleSize = largeObjectRecycle.size();
                break;
             }
+         }
+         if (do_lock && !result)
+         {
+            mLargeListLock.unlock();
+            isLocked = false;
          }
       }
 
@@ -5145,6 +5165,7 @@ public:
          else
             idx++;
       }
+      mRecycleSize = largeObjectRecycle.size();
 
       int l1 = mLargeList.size();
 
@@ -5635,6 +5656,9 @@ public:
    hx::QuickVec<LocalAllocator *> mLocalAllocs;
    LocalAllocator *mLocalPool[LOCAL_POOL_SIZE];
    hx::QuickVec<unsigned int *> largeObjectRecycle;
+   // Lock-free probe for AllocLarge - only read unlocked, maintained under
+   // mLargeListLock (or stop-the-world in the sweep)
+   volatile int mRecycleSize;
 };
 
 

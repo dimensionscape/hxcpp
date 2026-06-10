@@ -264,7 +264,7 @@ struct HxSemaphore
       int usec = (int)((inSeconds-isec)*1000000.0);
       timespec spec;
       spec.tv_nsec = (tv.tv_usec + usec) * 1000;
-      if (spec.tv_nsec>1000000000)
+      if (spec.tv_nsec>=1000000000)
       {
          spec.tv_nsec-=1000000000;
          isec++;

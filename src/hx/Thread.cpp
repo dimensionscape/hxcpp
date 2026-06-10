@@ -549,7 +549,15 @@ public:
 
 	hx::InternalFinalizer *mFinalizer;
 
-	#if defined(HX_WINDOWS) || defined(__SNC__)
+	#if defined(HX_WINDOWS)
+	double Now()
+	{
+		// Monotonic and 64-bit - clock() is a 32-bit millisecond count on
+		// MSVC, which wraps negative after ~24.8 days of process uptime and
+		// breaks every timed wait from then on
+		return (double)GetTickCount64()*0.001;
+	}
+	#elif defined(__SNC__)
 	double Now()
 	{
 		return (double)clock()/CLOCKS_PER_SEC;
