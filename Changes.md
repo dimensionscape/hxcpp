@@ -14,6 +14,7 @@
 
 * Improved Map/StringMap/IntMap lookup performance by ~16-26% by lowering the default hash table load factor
 * Fixed catastrophic IntMap collisions for keys with low-bit structure (pointers, aligned/strided ids) by mixing integer hashes; up to ~280x faster lookups for such keys with no regression for dense keys
+* Applied the same hash mixing to Int64 and object map keys (fixes ~168x slower lookups for strided Int64 keys; modest gain for object keys)
 * Improved array slice/splice by skipping the generational GC write barrier for arrays of primitive (non-pointer) types
 
 * Updated mbedtls to 2.28.2

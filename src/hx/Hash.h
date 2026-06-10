@@ -26,11 +26,11 @@ inline unsigned int HashMixInt(unsigned int h)
 }
 
 inline unsigned int HashCalcHash(int inKey) { return HashMixInt((unsigned int)inKey); }
-inline unsigned int HashCalcHash(cpp::Int64 inKey) { return (unsigned int)((inKey >> 32) ^ inKey); }
+inline unsigned int HashCalcHash(cpp::Int64 inKey) { return HashMixInt((unsigned int)((inKey >> 32) ^ inKey)); }
 inline unsigned int HashCalcHash(const String &inKey) { return inKey.hash(); }
 inline unsigned int HashCalcHash(const Dynamic &inKey)
 {
-   return __hxcpp_obj_hash(inKey);
+   return HashMixInt(__hxcpp_obj_hash(inKey));
 }
 
 inline void HashClear(int &ioValue) { }
