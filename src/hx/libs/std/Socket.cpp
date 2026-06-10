@@ -3,6 +3,7 @@
 #include <hx/OS.h>
 
 #include <string.h>
+#include <stddef.h>
 
 
 #ifdef NEKO_WINDOWS
@@ -25,7 +26,7 @@
 typedef INT (WSAAPI *inet_pton_func)( INT Family, PCSTR pszAddrString, PVOID pAddrBuf);
 typedef PCSTR (WSAAPI *inet_ntop_func)(INT  Family, PVOID pAddr, PSTR pStringBuf, size_t StringBufSize);
 
-#   define FDSIZE(n)   (sizeof(u_int) + (n) * sizeof(SOCKET))
+#   define FDSIZE(n)   (offsetof(fd_set, fd_array) + (n) * sizeof(SOCKET))
 #   define SHUT_WR      SD_SEND
 #   define SHUT_RD      SD_RECEIVE
 #   define SHUT_RDWR   SD_BOTH
