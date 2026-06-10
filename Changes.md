@@ -50,6 +50,7 @@
 * Fixed out-of-bounds read when deleting a fixed field of an anonymous object (Reflect.deleteField)
 * Fixed String.indexOf with a negative start index reading out of bounds and returning a bogus negative result (now clamps to 0, matching other targets)
 * Fixed String.lastIndexOf with a negative start index returning -1 instead of matching at index 0 (now clamps to 0, matching other targets)
+* Fixed Dynamic modulo (%) dereferencing a null operand without a guard (now coerces null to 0 like the other dynamic operators)
 
 * Removed Haxe 3 support
 

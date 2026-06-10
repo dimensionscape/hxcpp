@@ -519,10 +519,14 @@ Dynamic Dynamic::operator+(const cpp::Variant &v) const
 
 double Dynamic::operator%(const Dynamic &inRHS) const
 {
-   if (mPtr->__GetType()==vtInt && inRHS.mPtr->__GetType()==vtInt)
+   // Guard null operands like operator+ does, so a null Dynamic does not crash
+   // here (e.g. from cppia or native callers); a null coerces to 0.
+   int t1 = mPtr ? mPtr->__GetType() : vtNull;
+   int t2 = inRHS.mPtr ? inRHS.mPtr->__GetType() : vtNull;
+   if (t1==vtInt && t2==vtInt)
       return mPtr->__ToInt() % inRHS->__ToInt();
-   double lhs = mPtr->__ToDouble();
-   double rhs = inRHS->__ToDouble();
+   double lhs = mPtr ? mPtr->__ToDouble() : 0.0;
+   double rhs = inRHS.mPtr ? inRHS.mPtr->__ToDouble() : 0.0;
    int even = (int)(lhs/rhs);
    double remain = lhs - even * rhs;
    if (remain<0) remain += fabs(rhs);
