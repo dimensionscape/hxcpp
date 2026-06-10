@@ -346,13 +346,17 @@ Array<unsigned char> _hx_std_socket_read( Dynamic o )
 {
    SOCKET sock = val_sock(o);
    Array<unsigned char> result = Array_obj<unsigned char>::__new();
-   char buf[256];
+   // Read in large chunks: a 256-byte buffer forced one recv() syscall (and
+   // array append) per 256 bytes when slurping a stream to EOF. 16KB cuts that
+   // ~64x while staying small enough for any thread stack and exception-safe
+   // (no heap buffer to leak if block_error throws).
+   char buf[16384];
 
    hx::EnterGCFreeZone();
    while( true )
    {
       POSIX_LABEL(read_again);
-      int len = recv(sock,buf,256,MSG_NOSIGNAL);
+      int len = recv(sock,buf,sizeof(buf),MSG_NOSIGNAL);
       if( len == SOCKET_ERROR ) {
          HANDLE_EINTR(read_again);
          block_error();

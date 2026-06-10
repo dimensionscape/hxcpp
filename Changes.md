@@ -17,6 +17,7 @@
 * Applied the same hash mixing to Int64 and object map keys (fixes ~168x slower lookups for strided Int64 keys; modest gain for object keys)
 * Reduced large-map build time ~24-36% by switching hash table growth from 2x to 4x once a map is large (small maps keep 2x, so their memory is unchanged)
 * Improved array slice/splice by skipping the generational GC write barrier for arrays of primitive (non-pointer) types
+* Increased Socket.read() chunk buffer from 256 bytes to 16KB, cutting recv() syscalls ~64x when reading a stream to EOF
 
 * Updated mbedtls to 2.28.2
 * Updated sqlite to 3.40.1
