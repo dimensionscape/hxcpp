@@ -1503,6 +1503,9 @@ int String::lastIndexOf(const String &inValue, Dynamic inStart) const
    }
    if (l>length) return -1;
    if (s+l>length) s = length-l;
+   // A negative start clamps to 0 (search back from the beginning), matching
+   // other targets - e.g. "hello".lastIndexOf("h",-100) is 0, not -1.
+   if (s<0) s = 0;
 
    #ifdef HX_SMART_STRINGS
    bool s016 = isUTF16Encoded();
