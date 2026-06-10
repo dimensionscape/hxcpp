@@ -96,6 +96,18 @@ double __hxcpp_time_stamp()
  */
 void __internal_localtime(double inSeconds, struct tm* time)
 {
+   // Date field getters (getHours, getMinutes, getFullYear, ...) each call this
+   // on the SAME timestamp, so formatting one date would do N localtime() calls.
+   // localtime is expensive (timezone lookup, CRT lock on Windows); a 1-entry
+   // per-thread cache collapses the repeated calls for one date into one.
+   static thread_local double sLastSeconds = 0;
+   static thread_local struct tm sLastTm;
+   static thread_local bool sValid = false;
+   if (sValid && sLastSeconds==inSeconds)
+   {
+      *time = sLastTm;
+      return;
+   }
    time_t t = (time_t) inSeconds;
    #ifdef USE_TIME_R
    localtime_r(&t, time);
@@ -106,6 +118,9 @@ void __internal_localtime(double inSeconds, struct tm* time)
    else
       memset(time, 0, sizeof(*time) );
    #endif
+   sLastSeconds = inSeconds;
+   sLastTm = *time;
+   sValid = true;
 }
 
 /*
@@ -113,12 +128,25 @@ void __internal_localtime(double inSeconds, struct tm* time)
  */
 void __internal_gmtime(double inSeconds, struct tm* time)
 {
+   // Same rationale as __internal_localtime: cache the last conversion so the
+   // UTC field getters don't each re-run gmtime for one timestamp.
+   static thread_local double sLastSeconds = 0;
+   static thread_local struct tm sLastTm;
+   static thread_local bool sValid = false;
+   if (sValid && sLastSeconds==inSeconds)
+   {
+      *time = sLastTm;
+      return;
+   }
    time_t t = (time_t) inSeconds;
    #ifdef USE_TIME_R
    gmtime_r(&t, time);
    #else
    *time = *gmtime(&t);
    #endif
+   sLastSeconds = inSeconds;
+   sLastTm = *time;
+   sValid = true;
 }
 
 /*
