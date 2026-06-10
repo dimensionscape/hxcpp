@@ -13,6 +13,7 @@
 * Added optional detaching of main thread
 
 * Improved Map/StringMap/IntMap lookup performance by ~16-26% by lowering the default hash table load factor
+* Fixed catastrophic IntMap collisions for keys with low-bit structure (pointers, aligned/strided ids) by mixing integer hashes; up to ~280x faster lookups for such keys with no regression for dense keys
 * Improved array slice/splice by skipping the generational GC write barrier for arrays of primitive (non-pointer) types
 
 * Updated mbedtls to 2.28.2
