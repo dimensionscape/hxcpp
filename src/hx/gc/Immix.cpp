@@ -3117,6 +3117,8 @@ public:
       memset((void *)mNextFreeBlockOfSize,0,sizeof(mNextFreeBlockOfSize));
       mRowsInUse = 0;
       mLargeAllocated = 0;
+      mLargeMin = (size_t)-1;
+      mLargeMax = 0;
       mLargeAllocSpace = 40 << 20;
       mLargeAllocForceRefresh = mLargeAllocSpace;
       // Start at 1 Meg...
@@ -3304,6 +3306,15 @@ public:
 
       mLargeList.push(result);
       mLargeAllocated += inSize;
+
+      // Grow-only object-pointer bounds, used to reject conservative-mark
+      // candidates without scanning the list.  Stale-wide after frees is
+      // fine - the bounds only ever skip definite non-members.
+      size_t objPtr = (size_t)(result+2);
+      if (objPtr < mLargeMin)
+         mLargeMin = objPtr;
+      if (objPtr > mLargeMax)
+         mLargeMax = objPtr;
 
       if (do_lock)
          mLargeListLock.unlock();
@@ -5581,6 +5592,12 @@ public:
       if (isBlock)
          return memBlock;
 
+      // Most stack words are nowhere near the large allocations - reject on
+      // the cached bounds before paying for the full list scan
+      size_t p = (size_t)inPtr;
+      if (p < mLargeMin || p > mLargeMax)
+         return memUnmanaged;
+
       for(int i=0;i<mLargeList.size();i++)
       {
          unsigned int *blob = mLargeList[i] + 2;
@@ -5597,6 +5614,8 @@ public:
    size_t mLargeAllocSpace;
    size_t mLargeAllocForceRefresh;
    size_t mLargeAllocated;
+   size_t mLargeMin;
+   size_t mLargeMax;
    size_t mTotalAfterLastCollect;
    size_t mAllBlocksCount;
    double mGenerationalRetainEstimate;
@@ -5684,6 +5703,10 @@ void MarkConservative(int *inBottom, int *inTop,hx::MarkContext *__inCtx)
 
       if (vptr && !((size_t)vptr & validObjectMask) && vptr!=prev && vptr!=lastPin)
       {
+         // Last-value cache - adjacent stack slots often hold the same
+         // pointer (spills, argument copies), and without this assignment
+         // the prev test above never fires
+         prev = vptr;
 
          #ifdef PROFILE_COLLECT
          hx::localCount++;

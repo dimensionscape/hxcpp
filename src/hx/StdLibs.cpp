@@ -225,22 +225,77 @@ namespace hx
 // --- System ---------------------------------------------------------------------
 
 // --- Maths ---------------------------------------------------------
-static double rand_scale = 1.0 / (1<<16) / (1<<16);
+// Thread-local xoshiro256++ generator.  The old C rand() backing took a
+// global libc lock per call on glibc (three calls per Math.random()),
+// produced the same default-seeded sequence on every Windows worker
+// thread (MSVC rand state is per-thread but only the booting thread was
+// seeded), and had only 32 bits of state.
+namespace
+{
+   inline unsigned long long hxRotl64(unsigned long long x, int k)
+   {
+      return (x << k) | (x >> (64 - k));
+   }
+
+   struct HxRandState
+   {
+      unsigned long long s[4];
+      bool seeded;
+
+      void seed()
+      {
+         // The TLS address is distinct per live thread, the counters are
+         // distinct per run - splitmix64 whitens them into a full state
+         unsigned long long mix = (unsigned long long)(size_t)this;
+         mix ^= ((unsigned long long)time(0)) << 24;
+         mix ^= (unsigned long long)clock();
+         #ifdef HX_WINDOWS
+         LARGE_INTEGER now;
+         QueryPerformanceCounter(&now);
+         mix ^= (unsigned long long)now.QuadPart;
+         #endif
+         for(int i=0;i<4;i++)
+         {
+            mix += 0x9e3779b97f4a7c15ULL;
+            unsigned long long z = mix;
+            z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+            z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+            s[i] = z ^ (z >> 31);
+         }
+         seeded = true;
+      }
+
+      inline unsigned long long next()
+      {
+         if (!seeded)
+            seed();
+         unsigned long long result = hxRotl64(s[0] + s[3], 23) + s[0];
+         unsigned long long t = s[1] << 17;
+         s[2] ^= s[0];
+         s[3] ^= s[1];
+         s[1] ^= s[2];
+         s[0] ^= s[3];
+         s[2] ^= t;
+         s[3] = hxRotl64(s[3], 45);
+         return result;
+      }
+   };
+
+   thread_local HxRandState sHxRand;
+}
+
 double __hxcpp_drand()
 {
-   unsigned int lo = rand() & 0xfff;
-   unsigned int mid = rand() & 0xfff;
-   unsigned int hi = rand() & 0xff;
-   double result = (lo | (mid<<12) | (hi<<24) ) * rand_scale;
-   return result;
+   // 53 random mantissa bits in [0,1)
+   return (sHxRand.next() >> 11) * (1.0/9007199254740992.0);
 }
 
 int __hxcpp_irand(int inMax)
 {
-   unsigned int lo = rand() & 0xfff;
-   unsigned int mid = rand() & 0xfff;
-   unsigned int hi = rand() & 0xff;
-   return (lo | (mid<<12) | (hi<<24) ) % inMax;
+   if (inMax<=0)
+      return 0;
+   // Multiply-shift bounding - cheaper than modulo and avoids its bias
+   return (int)(( (sHxRand.next()>>32) * (unsigned long long)(unsigned int)inMax ) >> 32);
 }
 
 #ifdef HX_WINDOWS

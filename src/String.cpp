@@ -1651,33 +1651,19 @@ void __hxcpp_bytes_of_string(Array<unsigned char> &outBytes,const String &inStri
    #ifdef HX_SMART_STRINGS
    if (inString.isUTF16Encoded())
    {
+      // Two-pass encode: size the output once, then write directly into the
+      // buffer instead of paying a bounds-checked push per byte
       const char16_t *src = inString.raw_wptr();
       const char16_t *end = src + inString.length;
+      int bytes = 0;
       while(src<end)
-      {
-         int c = Char16Advance(src);
+         bytes += UTF8Bytes( Char16Advance(src) );
 
-         if( c <= 0x7F )
-            outBytes->push(c);
-         else if( c <= 0x7FF )
-         {
-            outBytes->push( 0xC0 | (c >> 6) );
-            outBytes->push( 0x80 | (c & 63) );
-         }
-         else if( c <= 0xFFFF )
-         {
-            outBytes->push( 0xE0 | (c >> 12) );
-            outBytes->push( 0x80 | ((c >> 6) & 63) );
-            outBytes->push( 0x80 | (c & 63) );
-         }
-         else
-         {
-            outBytes->push( 0xF0 | (c >> 18) );
-            outBytes->push( 0x80 | ((c >> 12) & 63) );
-            outBytes->push( 0x80 | ((c >> 6) & 63) );
-            outBytes->push( 0x80 | (c & 63) );
-         }
-      }
+      outBytes->__SetSize(bytes);
+      char *ptr = outBytes->GetBase();
+      src = inString.raw_wptr();
+      while(src<end)
+         UTF8EncodeAdvance(ptr, Char16Advance(src));
    }
    else
    #endif
@@ -2211,8 +2197,16 @@ Array<String> String::split(const String &inDelimiter) const
    {
       if (s0 && s1)
       {
+         // Skip to candidate positions on the first unit before paying for
+         // the full compare
+         char16_t c0 = inDelimiter.__w[0];
          while(pos+len <=length )
-            if (!memcmp(__w+pos,inDelimiter.__w,len*2))
+         {
+            while(pos+len<=length && __w[pos]!=c0)
+               pos++;
+            if (pos+len>length)
+               break;
+            if (len==1 || !memcmp(__w+pos+1,inDelimiter.__w+1,(len-1)*2))
             {
                result->push( substr(last,pos-last) );
                pos += len;
@@ -2220,6 +2214,7 @@ Array<String> String::split(const String &inDelimiter) const
             }
             else
                pos++;
+         }
       }
       else if (s0)
          while(pos+len <=length )
@@ -2245,8 +2240,19 @@ Array<String> String::split(const String &inDelimiter) const
    else
    #endif
    {
+      // memchr candidate scan, like indexOf - far faster than a libc call
+      // per byte position, and memcmp does not stop at embedded NULs the
+      // way strncmp does (a delimiter containing \0 matched any \0)
+      const char *base = __s;
+      const char *del = inDelimiter.__s;
+      char c0 = del[0];
       while(pos+len <=length )
-         if (!strncmp(__s+pos,inDelimiter.__s,len))
+      {
+         const char *found = (const char *)memchr(base+pos, c0, length-len-pos+1);
+         if (!found)
+            break;
+         pos = (int)(found-base);
+         if (len==1 || !memcmp(found+1,del+1,len-1))
          {
             result->push( substr(last,pos-last) );
             pos += len;
@@ -2254,6 +2260,7 @@ Array<String> String::split(const String &inDelimiter) const
          }
          else
             pos++;
+      }
    }
 
    result->push( substr(last,null()) );
