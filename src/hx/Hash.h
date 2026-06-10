@@ -507,12 +507,17 @@ struct Hash : public HashBase< typename ELEMENT::Key >
       enum { LOG_ELEMS_PER_BUCKET = 0 };
       if ( inSize > (bucketCount<<LOG_ELEMS_PER_BUCKET) )
       {
+         // Grow 2x while small (keeps the common small-map case memory-tight),
+         // then 4x once large. Large maps are where rehashing dominates build
+         // cost; quadrupling halves the number of expensive late rehashes, at
+         // the price of a little more bucket-array slack on the few big maps.
+         enum { QUAD_GROW_BUCKETS = 4096 };
          int newCount = bucketCount;
          if (newCount==0)
             newCount = 2;
          else
             while( inSize > (newCount<<LOG_ELEMS_PER_BUCKET) )
-               newCount<<=1;
+               newCount <<= (newCount < QUAD_GROW_BUCKETS ? 1 : 2);
          if (newCount!=bucketCount)
             rebucket(newCount);
       }
