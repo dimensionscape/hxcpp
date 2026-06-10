@@ -88,6 +88,11 @@ struct vprocess : public hx::Object
             if (iwrite!=-1)
                do_close(iwrite);
          #endif
+         // Reset the stale values - the OS recycles handles/fds, so a later
+         // stdin/stdout close on this object must not close someone else's
+         eread = HANDLE_INIT;
+         oread = HANDLE_INIT;
+         iwrite = HANDLE_INIT;
          open = false;
       }
    }

@@ -101,9 +101,15 @@ struct Deque : public Array_obj<Dynamic>
 			lock.Lock();
 		}
 		hx::ExitGCFreeZone();
-		if (length==1)
+		// Re-signal while items remain, like the posix branch below -
+		// otherwise two pushes whose Set calls coalesce on the auto-reset
+		// event leave a second blocked consumer asleep with the item queued
+		Dynamic result = shift();
+		if (length)
+			mSemaphore.Set();
+		else
 			mSemaphore.Reset();
-		return shift();
+		return result;
 	}
 	#else
 	void PushBack(Dynamic inValue)

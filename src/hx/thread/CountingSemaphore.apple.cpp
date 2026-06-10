@@ -8,7 +8,13 @@ struct hx::thread::CountingSemaphore_obj::Impl
 
 	static void finalise(hx::Object* obj)
 	{
-		delete reinterpret_cast<hx::thread::CountingSemaphore_obj*>(obj)->impl;
+		auto impl = reinterpret_cast<hx::thread::CountingSemaphore_obj*>(obj)->impl;
+
+		// dispatch objects are reference counted - without the release the
+		// kernel object leaks
+		dispatch_release(impl->semaphore);
+
+		delete impl;
 	}
 };
 
@@ -41,8 +47,11 @@ bool hx::thread::CountingSemaphore_obj::tryAcquire(Null<double> timeout)
 {
 	hx::AutoGCFreeZone zone;
 
+	// Convert to nanoseconds before truncating - casting the seconds value
+	// first discards the fractional part, so tryAcquire(0.5) returned
+	// immediately instead of waiting 500ms
 	return
 		(0 == dispatch_semaphore_wait(
 			impl->semaphore,
-			dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(timeout.Default(0)) * 1000 * 1000 * 1000)));
+			dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(timeout.Default(0) * 1e9))));
 }

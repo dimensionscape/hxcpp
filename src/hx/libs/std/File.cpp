@@ -152,37 +152,67 @@ int _hx_std_file_write( Dynamic handle, Array<unsigned char> s, int p, int n )
    if (_isatty(_fileno(f->io))) {
       fflush(f->io);
       HANDLE win_handle = (HANDLE)_get_osfhandle(_fileno(f->io));
-      static const int MAX_BUFFER_SIZE = 8192;
-      wchar_t buf[MAX_BUFFER_SIZE / 2];
-      int result = MultiByteToWideChar(CP_UTF8, 0, (char *)&s[p], len, buf, MAX_BUFFER_SIZE / 2);
-      DWORD written = 0;
-      if(!WriteConsoleW(win_handle, buf, result, &written, NULL)) {
-         file_error("file_write", f->name);
-      }
-      if (written == result) {
-         return len;
-      } else {
-         auto first_code_unit_remaining = buf[written];
-         if (first_code_unit_remaining > 0xDCEE && first_code_unit_remaining <= 0xDFF) {
-            DWORD tmp;
-            WriteConsoleW(win_handle, &buf[written], 1, &tmp, NULL);
-            written += 1;
+      static const int MAX_CHARS = 4096;
+      wchar_t buf[MAX_CHARS];
+      int done = 0;
+      bool convertOk = true;
+      while (done < len) {
+         // Convert in bounded chunks - a single oversized conversion fails
+         // outright and previously reported the whole write as successful
+         // while printing nothing.  Each utf8 byte yields at most one utf16
+         // unit, so a chunk of MAX_CHARS bytes always fits the buffer.
+         int chunk = len - done;
+         if (chunk > MAX_CHARS) {
+            chunk = MAX_CHARS;
+            // Do not split a multi-byte utf8 sequence between chunks
+            while (chunk > 0 && (s[p + done + chunk] & 0xC0) == 0x80)
+               chunk--;
+            if (chunk == 0)
+               chunk = MAX_CHARS;
          }
-         int count = 0;
-         for (int i = 0; i < written; i++) {
-            wchar_t ch = buf[i];
-            if (ch >= 0 && ch <= 0x7F) {
-               count += 1;
-            } else if (ch >= 0x0080 && ch <= 0x07FF) {
-               count += 2;
-            } else if (ch >= 0xDCEE && ch <= 0xDFF) {
-               count += 1;
-            } else {
-               count += 3;
+         int result = MultiByteToWideChar(CP_UTF8, 0, (char *)&s[p + done], chunk, buf, MAX_CHARS);
+         if (result == 0) {
+            // Not convertible - write the remainder as raw bytes below
+            convertOk = false;
+            break;
+         }
+         DWORD written = 0;
+         if(!WriteConsoleW(win_handle, buf, result, &written, NULL)) {
+            file_error("file_write", f->name);
+         }
+         if ((int)written == result) {
+            done += chunk;
+            continue;
+         }
+         // Partial console write - report how many utf8 bytes were consumed
+         // so the caller can retry the rest
+         if (written < (DWORD)result) {
+            wchar_t next = buf[written];
+            if (next >= 0xDC00 && next <= 0xDFFF) {
+               // Do not leave a surrogate pair half-written
+               DWORD tmp;
+               WriteConsoleW(win_handle, &buf[written], 1, &tmp, NULL);
+               written += 1;
             }
          }
-         return count;
+         int count = 0;
+         for (DWORD i = 0; i < written; i++) {
+            wchar_t ch = buf[i];
+            if (ch <= 0x7F)
+               count += 1;
+            else if (ch <= 0x07FF)
+               count += 2;
+            else if (ch >= 0xD800 && ch <= 0xDFFF)
+               count += 2;   // 2 utf8 bytes per half: a full pair is 4
+            else
+               count += 3;
+         }
+         return done + count;
       }
+      if (convertOk)
+         return len;
+      p += done;
+      len -= done;
    }
 #endif
    while( len > 0 )

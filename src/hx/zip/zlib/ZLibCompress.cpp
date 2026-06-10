@@ -29,6 +29,13 @@ Array<uint8_t> hx::zip::Compress_obj::run(cpp::marshal::View<uint8_t> src, int l
 		hx::Throw(HX_CSTRING("ZLib Error"));
 	}
 
+	// Release zlib's internal state on every exit, including throws
+	struct Closer
+	{
+		z_stream *stream;
+		~Closer() { deflateEnd(stream); }
+	} closer = { handle.get() };
+
 	auto bounds = deflateBound(handle.get(), src.length);
 	if (bounds > std::numeric_limits<int32_t>::max()) {
 		hx::Throw(HX_CSTRING("Size Error"));
@@ -49,8 +56,6 @@ Array<uint8_t> hx::zip::Compress_obj::run(cpp::marshal::View<uint8_t> src, int l
 	if (Z_STREAM_END != error) {
 		hx::Throw(HX_CSTRING("Compression failed"));
 	}
-
-	deflateEnd(handle.get());
 
 	return output->slice(0, static_cast<int>(handle->total_out));
 }
@@ -81,11 +86,13 @@ hx::zip::Result hx::zip::zlib::ZLibCompress::execute(cpp::marshal::View<uint8_t>
 		hx::Throw(HX_CSTRING("ZLib Error"));
 	}
 
+	// Per-call counts - total_in/total_out are cumulative across the whole
+	// stream, which breaks the haxe.zip streaming loops on the second call
 	return
 		Result(
 			error == Z_STREAM_END,
-			static_cast<int>(handle->total_in),
-			static_cast<int>(handle->total_out));
+			static_cast<int>(src.length - handle->avail_in),
+			static_cast<int>(dst.length - handle->avail_out));
 }
 
 void hx::zip::zlib::ZLibCompress::setFlushMode(Flush mode)
@@ -137,6 +144,8 @@ void hx::zip::zlib::ZLibCompress::close()
 	}
 
 	deflateEnd(handle);
+
+	delete handle;
 
 	handle = nullptr;
 

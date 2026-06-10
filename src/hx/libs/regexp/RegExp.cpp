@@ -73,6 +73,19 @@ struct pcredata : public hx::Object
    }
    #endif
 
+   // A negative pcre2_match result is only "no match" for NOMATCH itself -
+   // the other codes (match limit exceeded, invalid utf, ...) are genuine
+   // errors and silently treating them as no-match returns wrong answers
+   static bool checkMatch(int n)
+   {
+      if (n>=0)
+         return true;
+      if (n==PCRE2_ERROR_NOMATCH)
+         return false;
+      hx::Throw( HX_CSTRING("Regexp match error ") + String(n) );
+      return false;
+   }
+
    bool run(String string,int pos,int len)
    {
       #ifdef HX_SMART_STRINGS
@@ -92,8 +105,11 @@ struct pcredata : public hx::Object
             match_data16 = pcre2_match_data_create_from_pattern_16(rUtf16, NULL);
          }
 
-         int n = pcre2_match_16(rUtf16,(PCRE2_SPTR16)string.raw_wptr(),pos+len,pos,PCRE2_NO_UTF_CHECK,match_data16,NULL);
-         return n>=0;
+         // No PCRE2_NO_UTF_CHECK here - the subject is the raw utf16 buffer,
+         // which Haxe strings allow to contain lone surrogates, and skipping
+         // validation on invalid utf is documented undefined behaviour
+         int n = pcre2_match_16(rUtf16,(PCRE2_SPTR16)string.raw_wptr(),pos+len,pos,0,match_data16,NULL);
+         return checkMatch(n);
       }
 
       if (!rUtf8)
@@ -110,7 +126,9 @@ struct pcredata : public hx::Object
       }
 
       #endif
-      return pcre2_match_8(rUtf8,(PCRE2_SPTR8)string.utf8_str(),pos+len,pos,PCRE2_NO_UTF_CHECK,match_data8,NULL) >= 0;
+      // The 8-bit subject comes from utf8_str(), which validates, so
+      // PCRE2_NO_UTF_CHECK is safe here
+      return checkMatch( pcre2_match_8(rUtf8,(PCRE2_SPTR8)string.utf8_str(),pos+len,pos,PCRE2_NO_UTF_CHECK,match_data8,NULL) );
    }
 
    size_t* get_matches() {
@@ -221,7 +239,8 @@ Dynamic _hx_regexp_new_options(String s, String opt)
 
 bool _hx_regexp_match(Dynamic handle, String string, int pos, int len)
 {
-   if( pos < 0 || len < 0 || pos > string.length || pos + len > string.length )
+   // Overflow-safe bounds - pos+len can wrap for huge len
+   if( pos < 0 || len < 0 || pos > string.length || len > string.length - pos )
       return false;
 
    pcredata *d = PCRE(handle);

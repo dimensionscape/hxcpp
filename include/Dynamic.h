@@ -246,10 +246,10 @@ public:
 
    double operator%(const Dynamic &inRHS) const;
    double operator-() const { return mPtr ? - mPtr->__ToDouble() : 0.0; }
-   double operator++() { double val = mPtr->__ToDouble() + 1; *this = val; return val; }
-   double operator++(int) {double val = mPtr->__ToDouble(); *this = val+1; return val; }
-   double operator--() { double val = mPtr->__ToDouble() - 1; *this = val; return val; }
-   double operator--(int) {double val = mPtr->__ToDouble(); *this = val-1; return val; }
+   double operator++() { double val = (mPtr ? mPtr->__ToDouble() : 0.0) + 1; *this = val; return val; }
+   double operator++(int) {double val = mPtr ? mPtr->__ToDouble() : 0.0; *this = val+1; return val; }
+   double operator--() { double val = (mPtr ? mPtr->__ToDouble() : 0.0) - 1; *this = val; return val; }
+   double operator--(int) {double val = mPtr ? mPtr->__ToDouble() : 0.0; *this = val-1; return val; }
 
 
    double operator / (const cpp::Variant &inRHS) const { return (double)(*this) / (double)inRHS; } \
@@ -258,33 +258,35 @@ public:
    double operator / (const float &inRHS) const { return (double)(*this) / (double)inRHS; } \
    double operator / (const int &inRHS) const { return (double)(*this) / (double)inRHS; }
 
+   // The type tests must guard mPtr - null operands take the double path,
+   // where the numeric casts yield 0, matching operator+ / / / %
    #define DYNAMIC_ARITH( op ) \
       ::Dynamic operator op (const ::cpp::Variant &inRHS) const \
-        { return mPtr->__GetType()==vtInt && inRHS.isInt() ? \
+        { return mPtr && mPtr->__GetType()==vtInt && inRHS.isInt() ? \
               ::Dynamic((int)(*this) op (int)inRHS) : \
               ::Dynamic( (double)(*this) op (double)inRHS); } \
       ::Dynamic operator op (const ::Dynamic &inRHS) const \
-        { return mPtr->__GetType()==vtInt && inRHS.mPtr->__GetType()==vtInt ? \
+        { return mPtr && mPtr->__GetType()==vtInt && inRHS.mPtr && inRHS.mPtr->__GetType()==vtInt ? \
               ::Dynamic((int)(*this) op (int)inRHS) : \
               ::Dynamic( (double)(*this) op (double)inRHS); } \
       double operator op (const double &inRHS) const { return (double)(*this) op (double)inRHS; } \
       double operator op (const float &inRHS) const { return (double)(*this) op (double)inRHS; } \
       ::Dynamic operator op (const int &inRHS) const \
-        { return mPtr->__GetType()==vtInt ?  ::Dynamic((int)(*this) op inRHS) : ::Dynamic((double)(*this) op inRHS); } \
+        { return mPtr && mPtr->__GetType()==vtInt ?  ::Dynamic((int)(*this) op inRHS) : ::Dynamic((double)(*this) op inRHS); } \
       ::Dynamic operator op (const unsigned int &inRHS) const \
-        { return mPtr->__GetType()==vtInt ?  ::Dynamic((int)(*this) op inRHS) : ::Dynamic((double)(*this) op inRHS); } \
+        { return mPtr && mPtr->__GetType()==vtInt ?  ::Dynamic((int)(*this) op inRHS) : ::Dynamic((double)(*this) op inRHS); } \
       ::Dynamic operator op (const short &inRHS) const \
-        { return mPtr->__GetType()==vtInt ?  ::Dynamic((int)(*this) op inRHS) : ::Dynamic((double)(*this) op inRHS); } \
+        { return mPtr && mPtr->__GetType()==vtInt ?  ::Dynamic((int)(*this) op inRHS) : ::Dynamic((double)(*this) op inRHS); } \
       ::Dynamic operator op (const unsigned short &inRHS) const \
-        { return mPtr->__GetType()==vtInt ?  ::Dynamic((int)(*this) op inRHS) : ::Dynamic((double)(*this) op inRHS); } \
+        { return mPtr && mPtr->__GetType()==vtInt ?  ::Dynamic((int)(*this) op inRHS) : ::Dynamic((double)(*this) op inRHS); } \
       ::Dynamic operator op (const signed char &inRHS) const \
-        { return mPtr->__GetType()==vtInt ?  ::Dynamic((int)(*this) op inRHS) : ::Dynamic((double)(*this) op inRHS); } \
+        { return mPtr && mPtr->__GetType()==vtInt ?  ::Dynamic((int)(*this) op inRHS) : ::Dynamic((double)(*this) op inRHS); } \
       ::Dynamic operator op (const unsigned char &inRHS) const \
-        { return mPtr->__GetType()==vtInt ?  ::Dynamic((int)(*this) op inRHS) : ::Dynamic((double)(*this) op inRHS); } \
+        { return mPtr && mPtr->__GetType()==vtInt ?  ::Dynamic((int)(*this) op inRHS) : ::Dynamic((double)(*this) op inRHS); } \
       ::Dynamic operator op (const char16_t &inRHS) const \
-        { return mPtr->__GetType()==vtInt ?  ::Dynamic((int)(*this) op inRHS) : ::Dynamic((double)(*this) op inRHS); } \
+        { return mPtr && mPtr->__GetType()==vtInt ?  ::Dynamic((int)(*this) op inRHS) : ::Dynamic((double)(*this) op inRHS); } \
       ::Dynamic operator op (const char32_t &inRHS) const \
-        { return mPtr->__GetType()==vtInt ?  ::Dynamic((int)(*this) op inRHS) : ::Dynamic((double)(*this) op inRHS); } \
+        { return mPtr && mPtr->__GetType()==vtInt ?  ::Dynamic((int)(*this) op inRHS) : ::Dynamic((double)(*this) op inRHS); } \
       ::Dynamic operator op (const ::cpp::Int64 &inRHS) const \
         { return ::Dynamic((double)(*this) op inRHS); } \
       ::Dynamic operator op (const ::cpp::UInt64 &inRHS) const \

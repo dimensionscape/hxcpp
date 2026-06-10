@@ -729,20 +729,32 @@ Dynamic __hxcpp_parse_int(const String &inString)
    hx::strbuf buf;
    const char *str = inString.utf8_str(&buf);
 
-   // On the first non space char check to see if we've got a hex string
-   while (isspace(*str)) ++str;
+   // On the first non space char check to see if we've got a hex string.
+   // isspace requires an unsigned char value - a negative char (any
+   // non-ASCII utf8 byte) is undefined behaviour
+   while (isspace((unsigned char)*str)) ++str;
    bool isHex = is_hex_string(str, strlen(str));
    char *end = 0;
-   long result;
+   // Parse at a fixed 64-bit width so the overflow behaviour does not
+   // depend on the platform's long size (32-bit on Windows, 64-bit on
+   // most others)
+   long long result;
    if (isHex)
    {
       bool neg = str[0] == '-';
       if (neg) str++;
-      result = strtoul(str,&end,16);
+      result = (long long)strtoull(str,&end,16);
       if (neg) result = -result;
    }
-   else 
-      result = strtol(str,&end,10);
+   else
+   {
+      result = strtoll(str,&end,10);
+      // Saturate decimal values to the Int range on every platform
+      if (result > 0x7fffffffLL)
+         result = 0x7fffffffLL;
+      else if (result < -0x80000000LL)
+         result = -0x80000000LL;
+   }
    #ifdef HX_WINDOWS
    if (str==end && !isHex)
    #else

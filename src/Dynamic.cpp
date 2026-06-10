@@ -184,7 +184,9 @@ public:
 
    int __Compare(const hx::Object *inRHS) const
    {
-      double rval = inRHS->__ToInt64();
+      // Compare as Int64 - going through double loses precision above 2^53,
+      // making distinct large values compare equal
+      cpp::Int64 rval = inRHS->__ToInt64();
       if (rval==mValue)
          return 0;
 
