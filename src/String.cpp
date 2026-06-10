@@ -1127,12 +1127,21 @@ String String::toUpperCase() const
       }
       return String(result,length);
    }
-   #endif
-
+   // Byte strings are ASCII in smart-strings mode: a branchless transform is
+   // correct and vectorizable, avoiding the per-char locale-dependent toupper.
+   char *result = hx::NewString(length);
+   for(int i=0;i<length;i++)
+   {
+      char c = __s[i];
+      result[i] = (c>='a' && c<='z') ? (char)(c - ('a'-'A')) : c;
+   }
+   return String(result,length);
+   #else
    char *result = hx::NewString(length);
    for(int i=0;i<length;i++)
       result[i] = toupper( __s[i] );
    return String(result,length);
+   #endif
 }
 
 String String::toLowerCase() const
@@ -1147,11 +1156,20 @@ String String::toLowerCase() const
       }
       return String(result,length);
    }
-   #endif
+   // Byte strings are ASCII in smart-strings mode: branchless, vectorizable.
+   char *result = hx::NewString(length);
+   for(int i=0;i<length;i++)
+   {
+      char c = __s[i];
+      result[i] = (c>='A' && c<='Z') ? (char)(c + ('a'-'A')) : c;
+   }
+   return String(result,length);
+   #else
    char *result = hx::NewString(length);
    for(int i=0;i<length;i++)
       result[i] = tolower( __s[i] );
    return String(result,length);
+   #endif
 }
 
 
