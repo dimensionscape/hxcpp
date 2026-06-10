@@ -839,10 +839,21 @@ String::String(const Dynamic &inRHS)
 
 void String::fromInt(int inIdx)
 {
-   char buf[100];
-   SPRINTF(buf,100,HX_INT_PATTERN,inIdx);
-   buf[99]='\0';
-   __s = GCStringDup(buf,-1,&length);
+   // Write digits directly instead of going through snprintf("%d"), which pays
+   // format-string parsing on every call. Int->String is extremely common
+   // (logging, interpolation), so this is a worthwhile hot-path win.
+   char buf[12]; // "-2147483648" is 11 chars
+   char *p = buf + sizeof(buf);
+   unsigned int u = (unsigned int)inIdx;
+   if (inIdx < 0)
+      u = (unsigned int)0 - u; // magnitude, well-defined even for INT_MIN
+   do {
+      *--p = (char)('0' + (u % 10));
+      u /= 10;
+   } while (u);
+   if (inIdx < 0)
+      *--p = '-';
+   __s = GCStringDup(p, (int)(buf + sizeof(buf) - p), &length);
 }
 
 String::String(const int &inRHS)

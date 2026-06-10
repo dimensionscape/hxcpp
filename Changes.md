@@ -21,6 +21,7 @@
 * Sped up String.indexOf on byte strings using memchr: ~58x faster for sparse/absent single-char search (the common contains check) and ~2.5x faster for multi-char search
 * Sped up String.toUpperCase/toLowerCase ~2.3x for ASCII strings with a branchless transform instead of per-char locale-dependent toupper/tolower
 * Sped up Date field access ~3.7x by caching the last localtime/gmtime conversion per thread (getHours/getMinutes/getFullYear/... on one date no longer each call localtime)
+* Sped up Int->String conversion ~2.5x by writing digits directly instead of snprintf (affects Std.string of ints, string interpolation, etc.)
 
 * Updated mbedtls to 2.28.2
 * Updated sqlite to 3.40.1
