@@ -59,6 +59,28 @@ template<> struct ArrayTraits<Dynamic> { enum { StoreType = arrayObject }; };
 template<> struct ArrayTraits<String> { enum { StoreType = arrayString }; };
 template<> struct ArrayTraits< ::cpp::Int64> { enum { StoreType = arrayInt64 }; };
 
+// Element types that are plain values, with no GC pointers, can be sorted
+// in place.  Everything else must go through the index-based safeSort so
+// references are not hidden inside the sorter's working buffers.  Note this
+// is broader than the ArrayTraits StoreType: bool, the small int types and
+// the char types all store as arrayObject for boxing purposes, but their
+// buffers hold values, not object pointers.
+template<typename T> struct ArrayValueSortable { enum { Yes = 0 }; };
+template<> struct ArrayValueSortable<bool> { enum { Yes = 1 }; };
+template<> struct ArrayValueSortable<char> { enum { Yes = 1 }; };
+template<> struct ArrayValueSortable<signed char> { enum { Yes = 1 }; };
+template<> struct ArrayValueSortable<unsigned char> { enum { Yes = 1 }; };
+template<> struct ArrayValueSortable<char16_t> { enum { Yes = 1 }; };
+template<> struct ArrayValueSortable<char32_t> { enum { Yes = 1 }; };
+template<> struct ArrayValueSortable<short> { enum { Yes = 1 }; };
+template<> struct ArrayValueSortable<unsigned short> { enum { Yes = 1 }; };
+template<> struct ArrayValueSortable<int> { enum { Yes = 1 }; };
+template<> struct ArrayValueSortable<unsigned int> { enum { Yes = 1 }; };
+template<> struct ArrayValueSortable<float> { enum { Yes = 1 }; };
+template<> struct ArrayValueSortable<double> { enum { Yes = 1 }; };
+template<> struct ArrayValueSortable< ::cpp::Int64> { enum { Yes = 1 }; };
+template<> struct ArrayValueSortable< ::cpp::UInt64> { enum { Yes = 1 }; };
+
 template<class ELEM>
 class SafeSorter
 {
@@ -306,6 +328,8 @@ public:
 
    inline void resize(int inSize)
    {
+      if (inSize<0)
+         inSize = 0;
       if (inSize<length)
       {
          int s = GetElementSize();
@@ -970,16 +994,18 @@ public:
 
    void sort(SorterFunc inSorter)
    {
-      if ( (int)hx::ArrayTraits<ELEM_>::StoreType==(int)hx::arrayObject ||
-          (int)hx::ArrayTraits<ELEM_>::StoreType==(int)hx::arrayString)
+      if (hx::ArrayValueSortable<ELEM_>::Yes)
       {
-         // Keep references from being hidden inside sorters buffers
-         safeSort(inSorter, (int)hx::ArrayTraits<ELEM_>::StoreType==(int)hx::arrayString);
+         // Plain values - sort in place.  Dispatching on the StoreType here
+         // would send bool/byte/short arrays through safeSort, which
+         // reinterprets the buffer as Dynamic[] and reads out of bounds.
+         ELEM_ *e = (ELEM_ *)mBase;
+         std::stable_sort(e, e+length, Sorter(inSorter) );
       }
       else
       {
-         ELEM_ *e = (ELEM_ *)mBase;
-         std::stable_sort(e, e+length, Sorter(inSorter) );
+         // Keep references from being hidden inside sorters buffers
+         safeSort(inSorter, (int)hx::ArrayTraits<ELEM_>::StoreType==(int)hx::arrayString);
       }
    }
 

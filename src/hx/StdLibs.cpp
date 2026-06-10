@@ -928,9 +928,16 @@ unsigned char *__hxcpp_memory = 0;
 
 void  __hxcpp_memory_memset(Array<unsigned char> &inBuffer ,int pos, int len, int value)
 {
+   // Clamp the start - a negative pos would write before the buffer
+   if (pos<0)
+   {
+      len += pos;
+      pos = 0;
+   }
    if (pos<inBuffer->length)
    {
-      if (pos+len>inBuffer->length)
+      // Overflow-safe upper clamp
+      if (len > inBuffer->length - pos)
          len = inBuffer->length - pos;
       if (len>0)
          memset( inBuffer->Pointer() + pos, value, len);

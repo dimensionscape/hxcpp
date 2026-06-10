@@ -75,6 +75,7 @@ static String *sCharToString[1088] = { 0 };
 typedef Hash<TNonGcStringSet> StringSet;
 static StringSet *sPermanentStringSet = 0;
 static volatile int sPermanentStringSetMutex = 0;
+static volatile int sCharToStringMutex = 0;
 
 #ifdef HXCPP_COMBINE_STRINGS
 static bool sIsIdent[256];
@@ -221,15 +222,20 @@ inline int Char16Advance(const char16_t *&ioStr,bool throwOnErr=true)
          return 0xFFFD;
       }
 
-      int peek = *ioStr++;
-      if (IsUtf16HighSurrogate(peek))
+      // Only a low surrogate may complete the pair.  Peek before consuming -
+      // swallowing an ordinary char here would drop it, and swallowing the
+      // NUL terminator would send the callers' scan loops off the end of
+      // the buffer.
+      int peek = *ioStr;
+      if (!IsUtf16LowSurrogate(peek))
       {
          if (throwOnErr)
             hx::Throw(HX_CSTRING("Invalid UTF16"));
          return 0xFFFD;
       }
+      ioStr++;
 
-      ch = 0x10000 + ((ch-0xd800)  << 10) | (peek-0xdc00);
+      ch = 0x10000 + ( ((ch-0xd800) << 10) | (peek-0xdc00) );
    }
    return ch;
 }
@@ -1562,44 +1568,62 @@ String String::fromCharCode( int c )
       #endif
 
       int group = c>>10;
-      if (group>=1088)
+      // A negative code would index before the table - reject it like the
+      // codes past the end
+      if (c<0 || group>=1088)
          hx::Throw(HX_CSTRING("Invalid char code"));
-      if (!sCharToString[group])
-      {
-         String *ptr = (String *)malloc( sizeof(String)*1024 );
-         memset(ptr, 0, sizeof(String)*1024 );
-         sCharToString[group] = ptr;
-      }
-      String *ptr = sCharToString[group];
       int cid = c & ((1<<10)-1);
-      if (!ptr[cid].__s)
+      String *ptr = sCharToString[group];
+      if (!ptr || !ptr[cid].__s)
       {
-         #ifdef HX_SMART_STRINGS
-         int l = UTF16BytesCheck(c);
-         char16_t *p = (char16_t *)InternalCreateConstBuffer(0,(l+1)*2,true);
-         ((unsigned int *)p)[-1] |= HX_GC_STRING_CHAR16_T;
-         if (c>=0x10000)
+         // Serialize table/entry creation so concurrent first uses do not
+         // leak a table or publish a partially-built entry
+         while(_hx_atomic_compare_exchange(&sCharToStringMutex, 0, 1) != 0)
          {
-            int over = (c-0x10000);
-            p[0] = (over>>10) + 0xd800;
-            p[1] = (over&0x3ff) + 0xdc00;
+            // Spin
          }
-         else
-            p[0] = c;
+         ptr = sCharToString[group];
+         if (!ptr)
+         {
+            ptr = (String *)malloc( sizeof(String)*1024 );
+            memset(ptr, 0, sizeof(String)*1024 );
+            sCharToString[group] = ptr;
+         }
+         if (!ptr[cid].__s)
+         {
+            #ifdef HX_SMART_STRINGS
+            int l = UTF16BytesCheck(c);
+            char16_t *p = (char16_t *)InternalCreateConstBuffer(0,(l+1)*2,true);
+            ((unsigned int *)p)[-1] |= HX_GC_STRING_CHAR16_T;
+            if (c>=0x10000)
+            {
+               int over = (c-0x10000);
+               p[0] = (over>>10) + 0xd800;
+               p[1] = (over&0x3ff) + 0xdc00;
+            }
+            else
+               p[0] = c;
 
-         ptr[cid].length = l;
-         ptr[cid].__w = p;
-         fixHashPerm16(ptr[cid]);
-         #else
-         char buf[5];
-         int  utf8Len = UTF8Bytes(c);
-         char *p = buf;
-         UTF8EncodeAdvance(p,c);
-         buf[utf8Len] = '\0';
-         const char *s = (char *)InternalCreateConstBuffer(buf,utf8Len+1,true);
-         ptr[cid].length = utf8Len;
-         ptr[cid].__s = s;
-         #endif
+            // Hash the buffer before the entry becomes visible to the
+            // lock-free fast path, then store the string pointer last
+            String tmp;
+            tmp.length = l;
+            tmp.__w = p;
+            fixHashPerm16(tmp);
+            ptr[cid].length = l;
+            ptr[cid].__w = p;
+            #else
+            char buf[5];
+            int  utf8Len = UTF8Bytes(c);
+            char *p = buf;
+            UTF8EncodeAdvance(p,c);
+            buf[utf8Len] = '\0';
+            const char *s = (char *)InternalCreateConstBuffer(buf,utf8Len+1,true);
+            ptr[cid].length = utf8Len;
+            ptr[cid].__s = s;
+            #endif
+         }
+         sCharToStringMutex = 0;
       }
       return ptr[cid];
    }
@@ -1614,7 +1638,9 @@ String String::charAt( int at ) const
    if (isUTF16Encoded())
       return fromCharCode(__w[at]);
    #endif
-   return fromCharCode(__s[at]);
+   // char is signed on most targets - a byte >= 0x80 must not become a
+   // negative char code
+   return fromCharCode(((const unsigned char *)__s)[at]);
 }
 
 void __hxcpp_bytes_of_string(Array<unsigned char> &outBytes,const String &inString)
@@ -2160,7 +2186,7 @@ Array<String> String::split(const String &inDelimiter) const
       else
       {
          for(int i=0;i<chars;i++)
-            result[i] = String::fromCharCode( __s[i] );
+            result[i] = String::fromCharCode( ((const unsigned char *)__s)[i] );
       }
       #else
       for(int i=0;i<chars; )
@@ -2274,7 +2300,7 @@ String String::substr(int inFirst, Dynamic inLen) const
    #endif
 
    if (len==1)
-      return String::fromCharCode(__s[inFirst]);
+      return String::fromCharCode(((const unsigned char *)__s)[inFirst]);
 
    return String( GCStringDup(__s+inFirst, len, 0), len );
 }

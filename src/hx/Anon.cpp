@@ -136,6 +136,10 @@ inline int Anon_obj::findFixed(const ::String &inKey, bool inSkip5)
    */
 
    int min = inSkip5 ? 5 : 0;
+   // With exactly 5 fixed fields the skip5 path would read one past the
+   // allocated VariantKey array
+   if (min>=mFixedFields)
+      return -1;
    if (fixed[min].hash>sought)
       return -1;
    if (fixed[min].hash!=sought)
@@ -152,6 +156,12 @@ inline int Anon_obj::findFixed(const ::String &inKey, bool inSkip5)
          else
             max = mid;
       }
+
+      // The search converges on the last entry with this hash - back up to
+      // the first one so the scan below sees the whole run of duplicates
+      int base = inSkip5 ? 5 : 0;
+      while(min>base && fixed[min-1].hash==sought)
+         min--;
    }
 
    while(fixed[min].hash==sought)
