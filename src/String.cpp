@@ -864,18 +864,22 @@ String::String(const int &inRHS)
 
 String::String(const unsigned int &inRHS)
 {
-   char buf[100];
-   SPRINTF(buf,100,HX_UINT_PATTERN,inRHS);
-   buf[99]='\0';
-   __s = GCStringDup(buf,-1,&length);
+   // Direct digit writing; also fixes the old HX_UINT_PATTERN "%ud", which
+   // appended a literal 'd' (e.g. "42d") for any raw unsigned int formatted here.
+   char buf[12]; // 10-digit max for unsigned 32-bit
+   char *p = buf + sizeof(buf);
+   unsigned int u = inRHS;
+   do {
+      *--p = (char)('0' + (u % 10));
+      u /= 10;
+   } while (u);
+   __s = GCStringDup(p, (int)(buf + sizeof(buf) - p), &length);
 }
 
 
 String::String(const cpp::CppInt32__ &inRHS)
 {
-   char buf[100];
-   SPRINTF(buf,100,HX_INT_PATTERN,inRHS.mValue);
-   __s = GCStringDup(buf,-1,&length);
+   fromInt(inRHS.mValue);
 }
 
 

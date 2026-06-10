@@ -43,6 +43,7 @@
 * Fixed behaviour of indexOf and lastIndexOf on empty strings not aligning with other targets
 * Fixed behaviour of directory reading function not aligning with other targets
 * Fixed haxelib not being invoked with the current working directory
+* Fixed String(unsigned int) appending a literal "d" (from a "%ud" format) for raw unsigned ints formatted via the runtime
 * Fixed Std.string of NaN/Infinity to match other targets ("NaN", "Infinity", "-Infinity") instead of platform printf output ("-nan(ind)", "inf")
 * Fixed Std.string(Float) losing precision: now emits the shortest representation that round-trips (e.g. 0.1+0.2 prints "0.30000000000000004"), so String<->parseFloat is lossless and matches other targets
 * Normalized float exponent formatting to minimal digits ("1e-7" instead of "1e-07"), matching other targets
