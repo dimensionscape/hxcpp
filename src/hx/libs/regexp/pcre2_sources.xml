@@ -1,7 +1,21 @@
 <xml>
+  <!-- The sljit-based JIT needs writable+executable memory at runtime, which
+       these platforms forbid.  Without SUPPORT_JIT pcre2_jit_compile is a
+       stub and matching falls back to the interpreter, so this is purely a
+       build gate.  Opt out anywhere with -D HXCPP_PCRE_NO_JIT. -->
+  <set name="HXCPP_PCRE_NO_JIT" value="1" if="emscripten" />
+  <set name="HXCPP_PCRE_NO_JIT" value="1" if="iphoneos" />
+  <set name="HXCPP_PCRE_NO_JIT" value="1" if="iphonesim" />
+  <set name="HXCPP_PCRE_NO_JIT" value="1" if="appletvos" />
+  <set name="HXCPP_PCRE_NO_JIT" value="1" if="appletvsim" />
+  <set name="HXCPP_PCRE_NO_JIT" value="1" if="watchos" />
+  <set name="HXCPP_PCRE_NO_JIT" value="1" if="watchsimulator" />
+  <set name="HXCPP_PCRE_NO_JIT" value="1" if="winrt" />
+
   <compilerflag value="-DHAVE_CONFIG_H" />
   <compilerflag value="-DPCRE2_STATIC" />
   <compilerflag value="-DSUPPORT_UNICODE" />
+  <compilerflag value="-DSUPPORT_JIT" unless="HXCPP_PCRE_NO_JIT" />
   <compilerflag value="-I${PCRE_DIR}" />
   <compilerflag value="-std=c99" unless="MSVC_VER" />
 

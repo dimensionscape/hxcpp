@@ -102,6 +102,9 @@ struct pcredata : public hx::Object
             if (!rUtf16) {
                regexp_compilation_error(expr,error_code,error_offset);
             }
+            // Best effort - pcre2_match falls back to the interpreter when
+            // jit compilation is unavailable or fails
+            pcre2_jit_compile_16(rUtf16, PCRE2_JIT_COMPLETE);
             match_data16 = pcre2_match_data_create_from_pattern_16(rUtf16, NULL);
          }
 
@@ -122,6 +125,7 @@ struct pcredata : public hx::Object
          if (!rUtf8) {
             regexp_compilation_error(expr,error_code,error_offset);
          }
+         pcre2_jit_compile_8(rUtf8, PCRE2_JIT_COMPLETE);
          match_data8 = pcre2_match_data_create_from_pattern_8(rUtf8, NULL);
       }
 
@@ -216,6 +220,7 @@ Dynamic _hx_regexp_new_options(String s, String opt)
       if( !p ) {
          regexp_compilation_error(s,error_code,error_offset);
       }
+      pcre2_jit_compile_16(p, PCRE2_JIT_COMPLETE);
 
       pcredata *pdata = new pcredata;
       pdata->create16(p,s,options);
@@ -230,6 +235,7 @@ Dynamic _hx_regexp_new_options(String s, String opt)
       if( !p ) {
          regexp_compilation_error(s,error_code,error_offset);
       }
+      pcre2_jit_compile_8(p, PCRE2_JIT_COMPLETE);
 
       pcredata *pdata = new pcredata;
       pdata->create8(p,s,options);
