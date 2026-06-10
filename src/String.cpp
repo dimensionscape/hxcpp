@@ -906,6 +906,20 @@ String::String(const double &inRHS)
          if (strtod(buf,0)==inRHS)
             break;
       }
+      buf[99]='\0';
+      // Normalize the exponent to minimal digits: C printf emits at least two
+      // ("1e-07", or "1e-007" on old MSVC), whereas other Haxe targets emit
+      // "1e-7". Strip leading zeros from the exponent (value is unchanged).
+      char *e = strchr(buf,'e');
+      if (e)
+      {
+         char *p = e+1;
+         if (*p=='+' || *p=='-') p++;
+         char *q = p;
+         while (q[0]=='0' && q[1]>='0' && q[1]<='9') q++;
+         if (q!=p)
+            memmove(p,q,strlen(q)+1);
+      }
    }
    buf[99]='\0';
    __s = GCStringDup(buf,-1,&length);
