@@ -311,11 +311,19 @@ void _hx_ssl_send_char( Dynamic hssl, int c ) {
 int _hx_ssl_send( Dynamic hssl, Array<unsigned char> buf, int p, int l ) {
 	sslctx *ssl = val_ssl(hssl);
 	int dlen = buf->length;
-	if( p < 0 || l < 0 || p > dlen || p + l > dlen )
+	// l > dlen - p, not p + l > dlen: the addition can overflow and skip the check
+	if( p < 0 || l < 0 || p > dlen || l > dlen - p )
 		hx::Throw( HX_CSTRING("ssl_send") );
+	// Stage through a stack buffer: mbedtls drives the socket BIO inside a
+	// GC free zone mid-call, so a pointer into the movable Array must not
+	// be held across the call.  One TLS record carries at most 16K, so a
+	// short write just reports fewer bytes and the caller continues
+	unsigned char tmp[16384];
+	if( l > (int)sizeof(tmp) )
+		l = (int)sizeof(tmp);
+	memcpy( tmp, &buf[0] + p, l );
 	POSIX_LABEL(send_again);
-	const unsigned char *base = (const unsigned char *)&buf[0];
-	dlen = mbedtls_ssl_write( ssl->s, base + p, l );
+	dlen = mbedtls_ssl_write( ssl->s, tmp, l );
 	if ( is_ssl_blocking(dlen) ) {
 		HANDLE_EINTR(send_again);
 		hx::Throw(HX_CSTRING("Blocking"));
@@ -329,10 +337,15 @@ int _hx_ssl_send( Dynamic hssl, Array<unsigned char> buf, int p, int l ) {
 void _hx_ssl_write( Dynamic hssl, Array<unsigned char> buf ) {
 	sslctx *ssl = val_ssl(hssl);
 	int len = buf->length;
-	unsigned char *cdata = &buf[0];
+	int pos = 0;
+	unsigned char tmp[16384];
 	while( len > 0 ) {
+		// Re-fetch the array data each chunk and copy to the stack - see
+		// _hx_ssl_send: no GC pointer may live across the mbedtls call
+		int chunk = len > (int)sizeof(tmp) ? (int)sizeof(tmp) : len;
+		memcpy( tmp, &buf[0] + pos, chunk );
 		POSIX_LABEL( write_again );
-		int slen = mbedtls_ssl_write( ssl->s, cdata, len );
+		int slen = mbedtls_ssl_write( ssl->s, tmp, chunk );
 		if ( is_ssl_blocking(slen) ) {
 			HANDLE_EINTR( write_again );
 			hx::Throw(HX_CSTRING("Blocking"));
@@ -340,7 +353,7 @@ void _hx_ssl_write( Dynamic hssl, Array<unsigned char> buf ) {
 			HANDLE_EINTR( write_again );
 			hx::Throw(HX_CSTRING("ssl network error"));
 		}
-		cdata += slen;
+		pos += slen;
 		len -= slen;
 	}
 }
@@ -364,12 +377,17 @@ int _hx_ssl_recv_char( Dynamic hssl ) {
 int _hx_ssl_recv( Dynamic hssl, Array<unsigned char> buf, int p, int l ) {
 	sslctx *ssl = val_ssl(hssl);
 	int dlen = buf->length;
-	if( p < 0 || l < 0 || p > dlen || p + l > dlen )
+	if( p < 0 || l < 0 || p > dlen || l > dlen - p )
 		hx::Throw( HX_CSTRING("ssl_recv") );
 
-	unsigned char *base = &buf[0];
+	// Decrypt into a stack buffer - see _hx_ssl_send: mbedtls enters a GC
+	// free zone mid-call, so no pointer into the movable Array may be
+	// held across it.  One record is at most 16K; a short read is fine
+	unsigned char tmp[16384];
+	if( l > (int)sizeof(tmp) )
+		l = (int)sizeof(tmp);
 	POSIX_LABEL(recv_again);
-	dlen = mbedtls_ssl_read( ssl->s, base + p, l );
+	dlen = mbedtls_ssl_read( ssl->s, tmp, l );
 	if ( is_ssl_blocking(dlen) ) {
 		HANDLE_EINTR(recv_again);
 		hx::Throw(HX_CSTRING("Blocking"));
@@ -377,13 +395,15 @@ int _hx_ssl_recv( Dynamic hssl, Array<unsigned char> buf, int p, int l ) {
 		HANDLE_EINTR(recv_again);
 		hx::Throw(HX_CSTRING("ssl network error"));
 	}
-	if( dlen < 0 ) {  
+	if( dlen < 0 ) {
                 if( dlen == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY ) {
                   mbedtls_ssl_close_notify( ssl->s );
 	  	  return 0;
                 }
-		hx::Throw( HX_CSTRING("ssl_recv") ); 
+		hx::Throw( HX_CSTRING("ssl_recv") );
 	}
+	if( dlen > 0 )
+		memcpy( &buf[0] + p, tmp, dlen );
 	return dlen;
 }
 
@@ -472,6 +492,8 @@ Dynamic _hx_ssl_conf_new( bool server ) {
 #ifdef NEKO_WINDOWS
 	mbedtls_ssl_conf_verify(conf->c, verify_callback, NULL);
 #endif
+	// The 2.28 preset still negotiates TLS 1.0/1.1 - floor at TLS 1.2
+	mbedtls_ssl_conf_min_version( conf->c, MBEDTLS_SSL_MAJOR_VERSION_3, MBEDTLS_SSL_MINOR_VERSION_3 );
 	mbedtls_ssl_conf_rng( conf->c, mbedtls_ctr_drbg_random, &ctr_drbg );
 	return conf;
 }
@@ -483,7 +505,9 @@ void _hx_ssl_conf_close( Dynamic hconf ) {
 
 void _hx_ssl_conf_set_ca( Dynamic hconf, Dynamic hcert ) {
 	sslconf *conf = val_conf(hconf);
-	if( hconf.mPtr ){
+	// Branch on the cert, not the config - testing hconf (always non-null
+	// here) made the null-CA branch dead and a null cert a crash
+	if( hcert.mPtr ){
 		sslcert *cert = val_cert(hcert);
 		mbedtls_ssl_conf_ca_chain( conf->c, cert->c, NULL );
 	}else{
@@ -824,7 +848,7 @@ Array<unsigned char> _hx_ssl_dgst_make( Array<unsigned char> buf, String alg ){
 		hx::Throw( HX_CSTRING("Invalid hash algorithm") );
 
 	int size = mbedtls_md_get_size(md);
-	Array<unsigned char> out = Array_obj<int>::__new(size,size);
+	Array<unsigned char> out = Array_obj<unsigned char>::__new(size,size);
 	int r = -1;
 	if( (r = mbedtls_md( md, &buf[0], buf->length, &out[0] )) != 0 )
 		ssl_error(r);
