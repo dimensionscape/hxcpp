@@ -207,6 +207,8 @@ StackContext::StackContext()
 
    #ifdef HXCPP_SCRIPTABLE
    stack = new unsigned char[128*1024];
+   // Leave a 16K margin - argument pushes precede the callee's frame check
+   stackEnd = stack + 128*1024 - 16*1024;
    pointer = &stack[0];
    push((hx::Object *)0);
    frame = pointer;

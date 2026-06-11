@@ -352,7 +352,9 @@ void ScriptCallable::genArgs(CppiaCompiler *compiler, CppiaExpr *inThis, Express
                break;
             default: ;
          }
-         compiler->addFrame(var.argType);
+         // The unconditional addFrame below covers this slot - advancing
+         // here as well pushed every subsequent omitted optional arg one
+         // slot past where the callee reads it
       }
       else
       {
@@ -518,6 +520,10 @@ void ScriptCallable::runFunction(CppiaCtx *ctx)
    {
       if (stackSize)
       {
+         // Unchecked, deep script recursion otherwise memsets straight
+         // past the fixed script stack into the heap
+         if (ctx->pointer + stackSize > ctx->stackEnd)
+            hx::Throw( HX_CSTRING("Stack Overflow") );
          memset(ctx->pointer, 0 , stackSize );
          ctx->pointer += stackSize;
       }
@@ -569,6 +575,8 @@ void ScriptCallable::addStackVarsSpace(CppiaCtx *ctx)
 {
    if (stackSize)
    {
+      if (ctx->pointer + stackSize > ctx->stackEnd)
+         hx::Throw( HX_CSTRING("Stack Overflow") );
       memset(ctx->pointer, 0 , stackSize );
       ctx->pointer += stackSize;
    }

@@ -549,6 +549,10 @@ struct StackContext : public hx::ImmixAllocator
    unsigned char *stack;
    unsigned char *pointer;
    unsigned char *frame;
+   // Overflow limit for the script stack - the true end minus a margin
+   // that covers one frame's argument pushes, which happen before the
+   // callee's stack-size check runs
+   unsigned char *stackEnd;
    class Object  *exception;
 
    unsigned int breakContReturn;
