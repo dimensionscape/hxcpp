@@ -4810,6 +4810,14 @@ struct DataVal : public CppiaExprWithValue
 
    ExprType getType() { return (ExprType)ExprTypeOf<T>::value; }
 
+   bool getConstantInt(int &outValue)
+   {
+      if (getType()!=etInt)
+         return false;
+      outValue = ValToInt(data);
+      return true;
+   }
+
    void        runVoid(CppiaCtx *ctx) {  }
    int runInt(CppiaCtx *ctx) { return ValToInt(data); }
    Float       runFloat(CppiaCtx *ctx) { return ValToFloat(data); }
@@ -6151,10 +6159,16 @@ struct SwitchExpr : public CppiaExpr
    CppiaExpr *condition;
    std::vector<Case> cases;
    CppiaExpr *defaultCase;
+   // Constant dispatch - when every case condition is a literal int, the
+   // body is found with one hash probe instead of re-running every
+   // condition expression linearly
+   std::unordered_map<int,CppiaExpr *> constIntCases;
+   bool useConstIntCases;
 
- 
+
    SwitchExpr(CppiaStream &stream)
    {
+      useConstIntCases = false;
       caseCount = stream.getInt();
       bool hasDefault = stream.getInt();
       condition = createCppiaExpr(stream);
@@ -6179,6 +6193,28 @@ struct SwitchExpr : public CppiaExpr
       }
       if (defaultCase)
          defaultCase = defaultCase->link(inModule);
+
+      // Also worthwhile for float conditions (eg, the int-typed OpMod
+      // reports etFloat) - an exact int-equality check keeps the float
+      // comparison semantics
+      ExprType condType = condition->getType();
+      if (condType==etInt || condType==etFloat)
+      {
+         useConstIntCases = true;
+         for(int i=0;i<caseCount && useConstIntCases;i++)
+            for(int j=0;j<cases[i].conditions.size() && useConstIntCases;j++)
+            {
+               int val = 0;
+               if (cases[i].conditions[j]->getConstantInt(val))
+                  // insert() keeps the first entry, matching the
+                  // first-match-wins order of the linear scan
+                  constIntCases.insert( std::make_pair(val,cases[i].body) );
+               else
+                  useConstIntCases = false;
+            }
+         if (!useConstIntCases)
+            constIntCases.clear();
+      }
       return this;
    }
 
@@ -6207,10 +6243,30 @@ struct SwitchExpr : public CppiaExpr
       switch(condition->getType())
       {
          case etInt :
-             // todo - int/map ?
+             if (useConstIntCases)
+             {
+                std::unordered_map<int,CppiaExpr *>::iterator match =
+                   constIntCases.find( condition->runInt(ctx) );
+                return match!=constIntCases.end() ? match->second : defaultCase;
+             }
              return TGetBody<int>(ctx);
          case etString : return TGetBody<String>(ctx);
-         case etFloat : return TGetBody<Float>(ctx);
+         case etFloat :
+             if (useConstIntCases)
+             {
+                // The cases are all int constants, so only an exactly
+                // integral value can match one (NaN matches nothing)
+                Float fval = condition->runFloat(ctx);
+                int ival = (int)fval;
+                if ( fval==(Float)ival )
+                {
+                   std::unordered_map<int,CppiaExpr *>::iterator match =
+                      constIntCases.find(ival);
+                   return match!=constIntCases.end() ? match->second : defaultCase;
+                }
+                return defaultCase;
+             }
+             return TGetBody<Float>(ctx);
          // Enum
          case etObject : return TGetBody<Dynamic>(ctx);
          default: ;
@@ -7626,12 +7682,32 @@ struct OpMod : public BinOp
 
    int runInt(CppiaCtx *ctx)
    {
+      if (left->getType()==etInt && right->getType()==etInt)
+      {
+         int lval = left->runInt(ctx);
+         BCR_CHECK;
+         int rval = right->runInt(ctx);
+         // 0 gives NaN and INT_MIN % -1 traps - the double path keeps
+         // the old behaviour for both
+         if (rval!=0 && rval!=-1)
+            return lval % rval;
+         return hx::DoubleMod(lval,rval);
+      }
       double lval = left->runFloat(ctx);
       BCR_CHECK;
       return hx::DoubleMod(lval,right->runFloat(ctx));
    }
    Float runFloat(CppiaCtx *ctx)
    {
+      if (left->getType()==etInt && right->getType()==etInt)
+      {
+         int lval = left->runInt(ctx);
+         BCR_CHECK;
+         int rval = right->runInt(ctx);
+         if (rval!=0 && rval!=-1)
+            return (Float)(lval % rval);
+         return hx::DoubleMod(lval,rval);
+      }
       Float lval = left->runFloat(ctx);
       BCR_CHECK;
       return hx::DoubleMod(lval,right->runFloat(ctx));

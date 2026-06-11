@@ -503,33 +503,18 @@ bool CppiaClassInfo::getField(hx::Object *inThis, String inName, hx::PropertyAcc
       }
    }
 
-   ScriptCallable *closure = findFunction(false,inName);
-   if (closure)
+   MemberFieldLookup::iterator field = memberFieldLookup.find(inName);
+   if (field!=memberFieldLookup.end())
    {
-      outValue.mPtr = createMemberClosure(inThis,closure);
-      return true;
-   }
-
-   // Look for dynamic function (variable)
-   for(int i=0;i<dynamicFunctions.size();i++)
-   {
-      if (cppia.strings[ dynamicFunctions[i]->nameId  ]==inName)
+      switch(field->second.kind)
       {
-         CppiaVar *d = dynamicFunctions[i];
-
-         outValue = d->getValue(inThis);
-
-         return true;
-      }
-   }
-
-   for(int i=0;i<memberVars.size();i++)
-   {
-      CppiaVar &var = *memberVars[i];
-      if (var.name==inName)
-      {
-         outValue = var.getValue(inThis);
-         return true;
+         case mfFunction:
+            outValue.mPtr = createMemberClosure(inThis,(ScriptCallable *)field->second.ptr);
+            return true;
+         case mfDynamicFunction:
+         case mfVar:
+            outValue = ((CppiaVar *)field->second.ptr)->getValue(inThis);
+            return true;
       }
    }
 
@@ -564,25 +549,12 @@ bool CppiaClassInfo::setField(hx::Object *inThis, String inName, Dynamic inValue
    }
 
 
-   // Look for dynamic function (variable)
-   for(int i=0;i<dynamicFunctions.size();i++)
+   MemberFieldLookup::iterator field = memberFieldLookup.find(inName);
+   if (field!=memberFieldLookup.end() && field->second.kind!=mfFunction)
    {
-      if (cppia.strings[ dynamicFunctions[i]->nameId  ]==inName)
-      {
-         CppiaVar *d = dynamicFunctions[i];
-         outValue = d->setValue(inThis,inValue);
-         return true;
-      }
-   }
-
-   for(int i=0;i<memberVars.size();i++)
-   {
-      CppiaVar &var = *memberVars[i];
-      if (var.name==inName)
-      {
-         outValue = var.setValue(inThis, inValue);
-         return true;
-      }
+      // Functions fall through to the field map, matching the old scans
+      outValue = ((CppiaVar *)field->second.ptr)->setValue(inThis, inValue);
+      return true;
    }
 
    hx::FieldMap *map = dynamicMapOffset ? (hx::FieldMap *)( (char *)inThis + dynamicMapOffset ) :
@@ -1343,6 +1315,26 @@ void CppiaClassInfo::link()
 
    if (enumMeta)
       enumMeta = enumMeta->link(cppia);
+
+   // Build the one-probe member lookup.  Insert in reverse getField
+   // priority (vars, dynamic functions, then functions) so the highest
+   // priority wins any name collision.
+   memberFieldLookup.clear();
+   for(int i=0;i<memberVars.size();i++)
+   {
+      MemberFieldEntry entry = { mfVar, memberVars[i] };
+      memberFieldLookup[ memberVars[i]->name ] = entry;
+   }
+   for(int i=0;i<dynamicFunctions.size();i++)
+   {
+      MemberFieldEntry entry = { mfDynamicFunction, dynamicFunctions[i] };
+      memberFieldLookup[ cppia.strings[dynamicFunctions[i]->nameId] ] = entry;
+   }
+   for(int i=0;i<memberFunctions.size();i++)
+   {
+      MemberFieldEntry entry = { mfFunction, memberFunctions[i]->funExpr };
+      memberFieldLookup[ cppia.strings[memberFunctions[i]->nameId] ] = entry;
+   }
 
    //printf("Found haxeBase %s = %p / %d\n", cppia.types[typeId]->name.out_str(), haxeBase, dataSize );
 }

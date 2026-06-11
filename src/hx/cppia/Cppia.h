@@ -8,6 +8,7 @@
 #include <vector>
 #include <string>
 #include <map>
+#include <unordered_map>
 #include <set>
 
 #ifdef HX_ANDROID
@@ -184,6 +185,10 @@ struct CppiaExpr
    virtual void mark(hx::MarkContext *ctx) { };
    virtual void visit(hx::VisitContext *ctx) { };
    virtual bool isBoolInt() { return false; }
+
+   // Constant-folding query - lets containers (eg, switch) build dispatch
+   // tables at link time when every alternative is a literal int
+   virtual bool getConstantInt(int &outValue) { return false; }
 
 
    virtual ExprType    getType() { return etObject; }
@@ -665,6 +670,17 @@ public:
    FunctionMap memberSetters;
    std::vector<CppiaVar *> memberVars;
    std::vector<CppiaVar *> dynamicFunctions;
+
+   // One-probe member lookup built at link time - getField/setField
+   // previously scanned functions, dynamic functions and vars linearly
+   // with a string compare per entry on every dynamic access.  Keys are
+   // the module's permanent strings, so they are GC-safe to hold here.
+   enum MemberFieldKind { mfFunction, mfDynamicFunction, mfVar };
+   struct MemberFieldEntry { int kind; void *ptr; };
+   struct MemberNameHash { size_t operator()(const String &inS) const { return inS.hash(); } };
+   struct MemberNameEq { bool operator()(const String &inA, const String &inB) const { return inA==inB; } };
+   typedef std::unordered_map<String,MemberFieldEntry,MemberNameHash,MemberNameEq> MemberFieldLookup;
+   MemberFieldLookup memberFieldLookup;
 
    Functions staticFunctions;
    FunctionMap staticGetters;
