@@ -7645,6 +7645,39 @@ struct OpMod : public BinOp
          left->genCode(compiler,JitVal(),etVoid);
          right->genCode(compiler,JitVal(),etVoid);
       }
+      else if (left->getType()==etInt && right->getType()==etInt)
+      {
+         
+         // Integer modulo with a real division instead of two int->double
+         // conversions plus a native fmod call.  Divisors 0 and -1 bail to
+         // the double path (division traps: by zero, and INT_MIN % -1).
+         JitTemp leftVal(compiler,etInt);
+         left->genCode(compiler, leftVal, etInt);
+         JitTemp rightVal(compiler,etInt);
+         right->genCode(compiler, rightVal, etInt);
+
+         compiler->move(sJitTemp0.as(jtInt), leftVal);
+         compiler->move(sJitTemp1.as(jtInt), rightVal);
+
+         // unsigned (divisor+1) <= 1 catches exactly 0 and -1
+         compiler->add(sJitTemp2.as(jtInt), sJitTemp1.as(jtInt), (int)1);
+         JumpId bail = compiler->compare(cmpI_LESS_EQUAL, sJitTemp2.as(jtInt), (int)1, 0);
+
+         // quotient -> R0, remainder -> R1
+         compiler->divmod();
+         compiler->convert(sJitTemp1.as(jtInt), etInt, inDest, destType);
+         JumpId done = compiler->jump();
+
+         compiler->comeFrom(bail);
+         JitTemp leftRightVal(compiler,etFloat, sizeof(Float)*2 );
+         compiler->convert(leftVal, etInt, leftRightVal, etFloat);
+         compiler->convert(rightVal, etInt, leftRightVal + sizeof(Float), etFloat);
+         compiler->add(sJitArg0, leftRightVal.getReg(), leftRightVal.offset );
+         compiler->callNative((void *)double_mod, sJitArg0 );
+         compiler->convert(leftRightVal,etFloat,inDest,destType);
+
+         compiler->comeFrom(done);
+      }
       else
       {
          JitTemp leftRightVal(compiler,etFloat, sizeof(Float)*2 );

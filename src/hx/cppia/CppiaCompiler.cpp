@@ -189,10 +189,12 @@ int sCtxReg = SLJIT_S0;
 int sFrameReg = SLJIT_S1;
 int sThisReg = SLJIT_S2;
 
-// Called from jitted prologues when the script stack limit is hit
+// Called from jitted prologues when the script stack limit is hit.  Jitted
+// code cannot unwind C++ exceptions, so follow the runtime convention:
+// store the exception and let the emitted checkException route it.
 static void cppiaJitStackOverflow(CppiaCtx *inCtx)
 {
-   hx::Throw( HX_CSTRING("Stack Overflow") );
+   inCtx->exception = Dynamic(HX_CSTRING("Stack Overflow")).mPtr;
 }
 
 JitReg sJitCtx(SLJIT_S0,jtPointer);
@@ -331,13 +333,7 @@ public:
       {
          move( sJitFrame, sJitCtxFrame );
          if (makesNativeCalls)
-         {
              add( sJitCtxPointer, sJitFrame, maxFrameSize );
-             // Deep jit-to-jit recursion bypasses the interpreter's check
-             JumpId stackOk = compare( cmpP_LESS, sJitCtxPointer, sJitCtxStackEnd, 0 );
-             callNative( (void *)cppiaJitStackOverflow, sJitCtx.as(jtPointer) );
-             comeFrom(stackOk);
-         }
       }
 
       if (usesThis)
@@ -346,6 +342,16 @@ public:
       frameSize = baseFrameSize;
       uncaught.setSize(0);
       catching = 0;
+
+      if (usesFrame && makesNativeCalls)
+      {
+         // Deep jit-to-jit recursion bypasses the interpreter's stack check.
+         // Emitted after the throw lists reset so the exception jump binds.
+         JumpId stackOk = compare( cmpP_LESS, sJitCtxPointer, sJitCtxStackEnd, 0 );
+         callNative( (void *)cppiaJitStackOverflow, sJitCtx.as(jtPointer) );
+         checkException();
+         comeFrom(stackOk);
+      }
    }
 
    CppiaFunc finishGeneration()
@@ -823,6 +829,7 @@ public:
       add( sJitCtxPointer, sJitFrame, maxFrameSize );
       JumpId stackOk = compare( cmpP_LESS, sJitCtxPointer, sJitCtxStackEnd, 0 );
       callNative( (void *)cppiaJitStackOverflow, sJitCtx.as(jtPointer) );
+      checkException();
       comeFrom(stackOk);
    }
 
