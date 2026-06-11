@@ -31,13 +31,59 @@ static std::atomic_int g_nextThreadNumber(1);
 
 struct Deque : public Array_obj<Dynamic>
 {
-	Deque() : Array_obj<Dynamic>(0,0) { }
+	Deque() : Array_obj<Dynamic>(0,0), head(0) { }
 
 	static Deque *Create()
 	{
 		Deque *result = new Deque();
 		result->mFinalizer = new hx::InternalFinalizer(result,clean);
 		return result;
+	}
+
+	// Consumed prefix.  PopFront advances this instead of shift()ing,
+	// which memmoved the entire remaining queue per pop - draining an
+	// n-deep mailbox was O(n^2) bytes moved while holding the lock
+	int head;
+
+	inline bool hasItems() const { return length > head; }
+
+	Dynamic popHead()
+	{
+		if (length <= head)
+			return null();
+		Dynamic *items = (Dynamic *)mBase;
+		Dynamic result = items[head];
+		items[head] = null();
+		head++;
+		if (head == length)
+		{
+			// Drained - recycle the buffer from the start
+			length = 0;
+			head = 0;
+		}
+		else if (head > 64 && head >= length - head)
+		{
+			// Compact once the consumed prefix dominates - O(1) amortized
+			int remaining = length - head;
+			::memmove(items, items + head, remaining * sizeof(Dynamic));
+			::memset(items + remaining, 0, head * sizeof(Dynamic));
+			length = remaining;
+			head = 0;
+		}
+		return result;
+	}
+
+	void pushHead(Dynamic inValue)
+	{
+		if (head > 0)
+		{
+			Dynamic *items = (Dynamic *)mBase;
+			head--;
+			items[head] = inValue;
+			HX_OBJ_WB_GET(this, inValue.mPtr);
+		}
+		else
+			unshift(inValue);
 	}
 	static void clean(hx::Object *inObj)
 	{
@@ -61,85 +107,96 @@ struct Deque : public Array_obj<Dynamic>
    #endif
 
 
+	// Try-lock first: the uncontended case skips two fence-bearing
+	// GC-free-zone transitions per message (the same fast path the
+	// sys.thread primitives use)
+	template<typename LOCKABLE>
+	inline void lockFor(LOCKABLE &inMutex)
+	{
+		if (!inMutex.TryLock())
+		{
+			hx::EnterGCFreeZone();
+			inMutex.Lock();
+			hx::ExitGCFreeZone();
+		}
+	}
+
 	#ifndef HX_THREAD_SEMAPHORE_LOCKABLE
 	HxMutex     mMutex;
 	void PushBack(Dynamic inValue)
 	{
-		hx::EnterGCFreeZone();
-		AutoLock lock(mMutex);
-		hx::ExitGCFreeZone();
-
+		lockFor(mMutex);
 		push(inValue);
 		mSemaphore.Set();
+		mMutex.Unlock();
 	}
 	void PushFront(Dynamic inValue)
 	{
-		hx::EnterGCFreeZone();
-		AutoLock lock(mMutex);
-		hx::ExitGCFreeZone();
-
-		unshift(inValue);
+		lockFor(mMutex);
+		pushHead(inValue);
 		mSemaphore.Set();
+		mMutex.Unlock();
 	}
 
-	
+
 	Dynamic PopFront(bool inBlock)
 	{
-		hx::EnterGCFreeZone();
-		AutoLock lock(mMutex);
-		if (!inBlock)
+		lockFor(mMutex);
+		if (inBlock)
 		{
-			hx::ExitGCFreeZone();
-			return shift();
+			// Ok - wait for something on stack...
+			while(!hasItems())
+			{
+				mSemaphore.Reset();
+				mMutex.Unlock();
+				hx::EnterGCFreeZone();
+				mSemaphore.Wait();
+				hx::ExitGCFreeZone();
+				lockFor(mMutex);
+			}
 		}
-		// Ok - wait for something on stack...
-		while(!length)
-		{
-			mSemaphore.Reset();
-			lock.Unlock();
-			mSemaphore.Wait();
-			lock.Lock();
-		}
-		hx::ExitGCFreeZone();
 		// Re-signal while items remain, like the posix branch below -
 		// otherwise two pushes whose Set calls coalesce on the auto-reset
 		// event leave a second blocked consumer asleep with the item queued
-		Dynamic result = shift();
-		if (length)
+		Dynamic result = popHead();
+		if (hasItems())
 			mSemaphore.Set();
-		else
+		else if (inBlock)
 			mSemaphore.Reset();
+		mMutex.Unlock();
 		return result;
 	}
 	#else
 	void PushBack(Dynamic inValue)
 	{
-		hx::EnterGCFreeZone();
-		AutoLock lock(mSemaphore);
-		hx::ExitGCFreeZone();
+		lockFor(mSemaphore.mMutex);
 		push(inValue);
 		mSemaphore.QSet();
+		mSemaphore.mMutex.Unlock();
 	}
 	void PushFront(Dynamic inValue)
 	{
-		hx::EnterGCFreeZone();
-		AutoLock lock(mSemaphore);
-		hx::ExitGCFreeZone();
-		unshift(inValue);
+		lockFor(mSemaphore.mMutex);
+		pushHead(inValue);
 		mSemaphore.QSet();
+		mSemaphore.mMutex.Unlock();
 	}
 
-	
+
 	Dynamic PopFront(bool inBlock)
 	{
-		hx::EnterGCFreeZone();
-		AutoLock lock(mSemaphore);
-		while(inBlock && !length)
-			mSemaphore.QWait();
-		hx::ExitGCFreeZone();
-		Dynamic result =  shift();
-		if (length)
+		lockFor(mSemaphore.mMutex);
+		if (inBlock && !hasItems())
+		{
+			hx::EnterGCFreeZone();
+			while(!hasItems())
+				mSemaphore.QWait();
+			hx::ExitGCFreeZone();
+		}
+		Dynamic result = popHead();
+		if (hasItems())
 			mSemaphore.QSet();
+		mSemaphore.mMutex.Unlock();
 		return result;
 	}
 	#endif
