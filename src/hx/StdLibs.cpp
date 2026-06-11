@@ -782,6 +782,11 @@ bool __instanceof(const Dynamic &inValue, const Dynamic &inType)
 
 int __int__(double x)
 {
+   // NaN slips past both range comparisons into an undefined (int) cast -
+   // MSVC x64 yields INT_MIN, ARM yields 0, so Math.floor(NaN) differed
+   // across platforms of the same target
+   if (x != x)
+      return 0;
    #ifndef EMSCRIPTEN
    if (x < -0x7fffffff || x>0x7fffffff )
    {

@@ -7,17 +7,15 @@ namespace
 {
     bool isAsciiBuffer(const View<uint8_t>& buffer)
     {
-        auto i = int64_t{ 0 };
-        while (i < buffer.length)
+        // A UTF-8 buffer is ASCII iff no byte has the high bit set - the
+        // old per-codepoint decode here tripled the work of every decode
+        // for the common all-ASCII case
+        for (int64_t i = 0; i < buffer.length; i++)
         {
-            auto p = cpp::encoding::Utf8::codepoint(buffer.slice(i));
-
-            if (p > 127)
+            if (buffer.ptr.ptr[i] & 0x80)
             {
                 return false;
             }
-
-            i += cpp::encoding::Utf8::getByteCount(p);
         }
 
         return true;
@@ -254,9 +252,12 @@ String cpp::encoding::Utf8::decode(const cpp::marshal::View<uint8_t>& buffer)
         
     return String(backing.ptr.ptr, chars);
 #else
-    auto backing = View<char>(hx::InternalNew(buffer.length, false), buffer.length);
+    // +1 for the terminator - the allocation is not zeroed and hxcpp
+    // strings are assumed NUL-terminated by native consumers
+    auto backing = View<char>(hx::InternalNew(buffer.length + 1, false), buffer.length + 1);
 
     std::memcpy(backing.ptr.ptr, buffer.ptr.ptr, buffer.length);
+    backing.ptr.ptr[buffer.length] = 0;
 
     return String(backing.ptr.ptr, static_cast<int>(buffer.length));
 #endif
@@ -264,6 +265,10 @@ String cpp::encoding::Utf8::decode(const cpp::marshal::View<uint8_t>& buffer)
 
 char32_t cpp::encoding::Utf8::codepoint(const cpp::marshal::View<uint8_t>& buffer)
 {
+    // Strict decoding.  Unvalidated continuation bytes silently produced
+    // mojibake from malformed input (and consumed a valid following
+    // character), and accepting overlong forms desynchronized the decode
+    // loops, which advance by the re-encoded length of the value
     auto b0 = static_cast<char32_t>(buffer[0]);
 
     if ((b0 & 0x80) == 0)
@@ -272,7 +277,17 @@ char32_t cpp::encoding::Utf8::codepoint(const cpp::marshal::View<uint8_t>& buffe
     }
     else if ((b0 & 0xE0) == 0xC0)
     {
-        return (static_cast<char32_t>(b0 & 0x1F) << 6) | static_cast<char32_t>(buffer.slice(1)[0] & 0x3F);
+        auto b1 = static_cast<char32_t>(buffer.slice(1)[0]);
+        if ((b1 & 0xC0) != 0x80)
+        {
+            return int{ hx::Throw(HX_CSTRING("Failed to read codepoint")) };
+        }
+        auto p = (static_cast<char32_t>(b0 & 0x1F) << 6) | (b1 & 0x3F);
+        if (p < 0x80) // overlong
+        {
+            return int{ hx::Throw(HX_CSTRING("Failed to read codepoint")) };
+        }
+        return p;
     }
     else if ((b0 & 0xF0) == 0xE0)
     {
@@ -281,7 +296,16 @@ char32_t cpp::encoding::Utf8::codepoint(const cpp::marshal::View<uint8_t>& buffe
 
         buffer.slice(1, staging.size()).copyTo(dst);
 
-        return (static_cast<char32_t>(b0 & 0x0F) << 12) | (static_cast<char32_t>(staging[0] & 0x3F) << 6) | static_cast<char32_t>(staging[1] & 0x3F);
+        if ((staging[0] & 0xC0) != 0x80 || (staging[1] & 0xC0) != 0x80)
+        {
+            return int{ hx::Throw(HX_CSTRING("Failed to read codepoint")) };
+        }
+        auto p = (static_cast<char32_t>(b0 & 0x0F) << 12) | (static_cast<char32_t>(staging[0] & 0x3F) << 6) | static_cast<char32_t>(staging[1] & 0x3F);
+        if (p < 0x800) // overlong
+        {
+            return int{ hx::Throw(HX_CSTRING("Failed to read codepoint")) };
+        }
+        return p;
     }
     else if ((b0 & 0xF8) == 0xF0)
     {
@@ -290,11 +314,23 @@ char32_t cpp::encoding::Utf8::codepoint(const cpp::marshal::View<uint8_t>& buffe
 
         buffer.slice(1, staging.size()).copyTo(dst);
 
-        return
+        if ((staging[0] & 0xC0) != 0x80 || (staging[1] & 0xC0) != 0x80 || (staging[2] & 0xC0) != 0x80)
+        {
+            return int{ hx::Throw(HX_CSTRING("Failed to read codepoint")) };
+        }
+        auto p =
             (static_cast<char32_t>(b0 & 0x07) << 18) |
             (static_cast<char32_t>(staging[0] & 0x3F) << 12) |
             (static_cast<char32_t>(staging[1] & 0x3F) << 6) |
             static_cast<char32_t>(staging[2] & 0x3F);
+        // Overlong or beyond U+10FFFF (out-of-range values leaked
+        // uninitialized memory into the decoded String via the silent
+        // Utf16::encode failure)
+        if (p < 0x10000 || p > 0x10FFFF)
+        {
+            return int{ hx::Throw(HX_CSTRING("Failed to read codepoint")) };
+        }
+        return p;
     }
     else
     {

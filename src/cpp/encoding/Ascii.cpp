@@ -38,29 +38,22 @@ int64_t cpp::encoding::Ascii::encode(const String& string, View<uint8_t> buffer)
 
 String cpp::encoding::Ascii::decode(View<uint8_t> view)
 {
+	// Consistent with the Utf8/Utf16 decoders - empty input is ""
 	if (view.isEmpty())
-	{
-		return hx::Throw(HX_CSTRING("View is empty"));
-	}
-
-	auto bytes = int64_t{ 0 };
-	auto i     = int64_t{ 0 };
-	auto chars = view.reinterpret<char>();
-
-	while (i < chars.length && 0 != chars.ptr[i])
-	{
-		bytes += sizeof(char);
-		i++;
-	}
-
-	if (0 == bytes)
 	{
 		return String::emptyString;
 	}
 
+	// The view length is authoritative: scanning for a NUL silently
+	// truncated binary-ish payloads ("a\0b" decoded as "a"), and Haxe
+	// strings legally contain NULs
+	auto bytes = view.length;
+
 	auto backing = hx::NewGCPrivate(0, bytes + sizeof(char));
 
 	std::memcpy(backing, view.ptr.ptr, bytes);
+	// NewGCPrivate does not zero - the terminator must be written
+	static_cast<char*>(backing)[bytes] = 0;
 
-	return String(static_cast<const char*>(backing), bytes / sizeof(char));
+	return String(static_cast<const char*>(backing), (int)bytes);
 }

@@ -53,7 +53,10 @@ namespace
 
 			i += cpp::encoding::Utf16::getByteCount(p);
 		}
-		
+
+		// The allocation is not zeroed - the terminator must be written
+		chars.ptr.ptr[k] = 0;
+
 		return String(chars.ptr.ptr, chars.length);
 	}
 }
@@ -95,7 +98,9 @@ int64_t cpp::encoding::Utf16::getByteCount(const String& string)
 		auto bytes = int64_t{ 0 };
 		for (auto i = 0; i < string.length; i++)
 		{
-			bytes += getByteCount(static_cast<char32_t>(string.raw_ptr()[i]));
+			// Through unsigned char: raw_ptr() is signed, so a byte >= 0x80
+			// sign-extended to a huge "codepoint" and miscounted as 4 bytes
+			bytes += getByteCount(static_cast<char32_t>(static_cast<unsigned char>(string.raw_ptr()[i])));
 		}
 
 		return bytes;
@@ -161,7 +166,8 @@ int64_t cpp::encoding::Utf16::encode(const String& string, const cpp::marshal::V
 		auto bytes = int64_t{ 0 };
 		for (auto i = 0; i < string.length; i++)
 		{
-			bytes += getByteCount(static_cast<char32_t>(string.raw_ptr()[i]));
+			// See getByteCount - avoid signed-char sign extension
+			bytes += getByteCount(static_cast<char32_t>(static_cast<unsigned char>(string.raw_ptr()[i])));
 		}
 
 		if (bytes > buffer.length)
@@ -172,7 +178,7 @@ int64_t cpp::encoding::Utf16::encode(const String& string, const cpp::marshal::V
 		auto i = int64_t{ 0 };
 		for (auto k = 0; k < string.length; k++)
 		{
-			i += encode(static_cast<char32_t>(string.raw_ptr()[k]), buffer.slice(i));
+			i += encode(static_cast<char32_t>(static_cast<unsigned char>(string.raw_ptr()[k])), buffer.slice(i));
 		}
 
 		return bytes;
@@ -214,7 +220,10 @@ int cpp::encoding::Utf16::encode(const char32_t& codepoint, const cpp::marshal::
 		return 4;
 	}
 
-	return 0;
+	// Beyond U+10FFFF is not representable - the silent return 0 left the
+	// caller's buffer tail unwritten (uninitialized memory in the decoded
+	// String) while counts assumed it was filled
+	return hx::Throw(HX_CSTRING("Invalid codepoint"));
 }
 
 String cpp::encoding::Utf16::decode(const cpp::marshal::View<uint8_t>& buffer)
@@ -264,6 +273,13 @@ char32_t cpp::encoding::Utf16::codepoint(const cpp::marshal::View<uint8_t>& buff
 
 	if (0xD800 <= first && first < 0xDc00)
 	{
+		// A lone trailing high surrogate (trivially produced by substr
+		// splitting a pair) used to surface as a confusing internal
+		// "View too small" from the read past the end
+		if (buffer.length < 4)
+		{
+			return int{ hx::Throw(HX_CSTRING("Invalid UTF16")) };
+		}
 		auto second = static_cast<char16_t>(Marshal::readUInt16(buffer.slice(2)));
 		if (0xDC00 <= second && second < 0xE000)
 		{
