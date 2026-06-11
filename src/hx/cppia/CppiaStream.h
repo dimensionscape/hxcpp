@@ -147,6 +147,11 @@ struct CppiaStream
 
    int getByte()
    {
+      // Guard like skipChar/readBytes - a truncated cppia file otherwise
+      // drives the loader off the end of the buffer and the garbage bytes
+      // become counts and ids
+      if (data>=max)
+         throw "EOF";
       int result = *(unsigned char *)data;
       data++;
       pos++;

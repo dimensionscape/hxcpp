@@ -169,7 +169,10 @@ namespace hx
 #endif
             };
 
-            super::mPtr = new AdapterCallable(inCallable);
+            // Converting a null function must stay null - wrapping it made
+            // `callback != null` pass and the call then throw
+            if (inCallable.GetPtr())
+                super::mPtr = new AdapterCallable(inCallable);
         }
 
         template<class... TOtherArgs>
@@ -209,7 +212,10 @@ namespace hx
 #endif
             };
 
-            super::mPtr = new AdapterCallable(inCallable);
+            // Converting a null function must stay null - wrapping it made
+            // `callback != null` pass and the call then throw
+            if (inCallable.GetPtr())
+                super::mPtr = new AdapterCallable(inCallable);
         }
 
         Callable(const Dynamic& inDynamic)
@@ -349,7 +355,10 @@ namespace hx
 #endif
             };
 
-            super::mPtr = new AdapterCallable(inCallable);
+            // Converting a null function must stay null - wrapping it made
+            // `callback != null` pass and the call then throw
+            if (inCallable.GetPtr())
+                super::mPtr = new AdapterCallable(inCallable);
         }
 
         Callable(const Dynamic& inDynamic)

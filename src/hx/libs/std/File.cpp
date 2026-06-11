@@ -384,8 +384,6 @@ static long long file_length64(FILE *file)
 
 String _hx_std_file_contents_string( String name )
 {
-   std::vector<char> buffer;
-
    hx::strbuf buf;
 #ifdef NEKO_WINDOWS
    hx::EnterGCFreeZone();
@@ -412,12 +410,17 @@ String _hx_std_file_contents_string( String name )
    }
 
    fseek(file,0,SEEK_SET);
-   buffer.resize(len);
+   // Read straight into the GC string buffer - the old std::vector staging
+   // copy doubled peak memory and added a full extra memcpy
+   hx::ExitGCFreeZone();
+   char *dest = hx::NewString(len);
+   hx::EnterGCFreeZone();
+   int total = len;
    int p = 0;
    while( len > 0 )
    {
       POSIX_LABEL(file_contents);
-      int d = (int)fread(&buffer[p],1,len,file);
+      int d = (int)fread(dest+p,1,len,file);
       if( d <= 0 )
       {
          HANDLE_FINTR(file,file_contents);
@@ -430,7 +433,15 @@ String _hx_std_file_contents_string( String name )
    fclose(file);
    hx::ExitGCFreeZone();
 
-   return String::create(&buffer[0], buffer.size());
+   // dest is already a GC string buffer - wrap it without re-copying.
+   // Non-ASCII content still needs the utf16 conversion pass.
+   #ifdef HX_SMART_STRINGS
+   const unsigned char *c = (const unsigned char *)dest;
+   for(int i=0;i<total;i++)
+      if (c[i]>127)
+         return _hx_utf8_to_utf16(c, total, false);
+   #endif
+   return String(dest, total);
 }
 
 

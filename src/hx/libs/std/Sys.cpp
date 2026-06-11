@@ -1,5 +1,6 @@
 #include <hxcpp.h>
 #include <hx/OS.h>
+#include <hx/Thread.h>
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -75,11 +76,21 @@
    <doc>Get some environment variable if exists</doc>
 **/
 
+// The environment is shared mutable state: putenv/setenv may free or move
+// the storage a concurrent getenv result points into.  Serialize access and
+// copy under the lock.
+static HxMutex &hxEnvMutex()
+{
+   static HxMutex sMutex;
+   return sMutex;
+}
+
 String _hx_std_get_env( String v )
 {
    #ifdef HX_WINRT
       return String();
    #else
+      AutoLock lock(hxEnvMutex());
       #if defined(NEKO_WINDOWS) && defined(HX_SMART_STRINGS)
          hx::strbuf wbuf;
          return String::create( _wgetenv( v.wchar_str(&wbuf) ) );
@@ -101,6 +112,7 @@ void _hx_std_put_env( String e, String v )
 #elif defined(NEKO_WINDOWS)
    String set = e + HX_CSTRING("=") + (v != null()?v:"");
 
+   AutoLock lock(hxEnvMutex());
    #ifdef HX_SMART_STRINGS
    if (set.isUTF16Encoded())
       _wputenv(set.wchar_str());
@@ -108,6 +120,7 @@ void _hx_std_put_env( String e, String v )
    #endif
       putenv(set.utf8_str());
 #else
+   AutoLock lock(hxEnvMutex());
    if (v == null())
       unsetenv(e.utf8_str());
    else
@@ -617,14 +630,19 @@ double _hx_std_sys_time()
 {
 #ifdef NEKO_WINDOWS
 #define EPOCH_DIFF   (134774*24*60*60.0)
-   SYSTEMTIME t;
+   // GetSystemTime only updates at the ~15.6ms timer tick; the precise
+   // variant (Win8+) has sub-microsecond resolution at the same epoch
+   typedef VOID (WINAPI *GetTimeFunc)(LPFILETIME);
+   static GetTimeFunc sGetTime = (GetTimeFunc)GetProcAddress(
+         GetModuleHandleA("kernel32"), "GetSystemTimePreciseAsFileTime");
    FILETIME ft;
-    ULARGE_INTEGER ui;
-   GetSystemTime(&t);
-   if( !SystemTimeToFileTime(&t,&ft) )
-      return 0;
-    ui.LowPart = ft.dwLowDateTime;
-    ui.HighPart = ft.dwHighDateTime;
+   ULARGE_INTEGER ui;
+   if( sGetTime )
+      sGetTime(&ft);
+   else
+      GetSystemTimeAsFileTime(&ft);
+   ui.LowPart = ft.dwLowDateTime;
+   ui.HighPart = ft.dwHighDateTime;
    return ( ((double)ui.QuadPart) / 10000000.0 - EPOCH_DIFF );
 #elif defined(EPPC)
    time_t tod;
@@ -834,6 +852,7 @@ Array<String> _hx_std_sys_env()
 {
    Array<String> result = Array_obj<String>::__new();
    #ifndef HX_WINRT
+   AutoLock lock(hxEnvMutex());
    char **e = environ;
    while( *e )
    {

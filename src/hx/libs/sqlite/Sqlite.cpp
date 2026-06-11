@@ -222,7 +222,12 @@ void _hx_sqlite_close(Dynamic handle)
 int     _hx_sqlite_last_insert_id(Dynamic handle)
 {
    database *db = getDatabase(handle);
-   return sqlite3_last_insert_rowid(db->db);
+   // The glue signature is Int (matching the haxe std extern) - saturate
+   // instead of silently wrapping a 64-bit rowid
+   sqlite3_int64 id = sqlite3_last_insert_rowid(db->db);
+   if( id > 0x7fffffff )
+      return 0x7fffffff;
+   return (int)id;
 }
 
 /**
@@ -313,7 +318,17 @@ Dynamic _hx_sqlite_result_next(Dynamic handle)
                if( r->bools[i] )
                   f = bool(sqlite3_column_int(r->r,i));
                else
-                  f = int(sqlite3_column_int(r->r,i));
+               {
+                  // SQLite INTEGER is 64-bit - timestamps, snowflake ids and
+                  // SUM() aggregates routinely exceed 2^31 and were silently
+                  // wrapped.  Stay an Int when it fits, widen to Float
+                  // (53-bit exact) otherwise.
+                  sqlite3_int64 v = sqlite3_column_int64(r->r,i);
+                  if( v == (sqlite3_int64)(int)v )
+                     f = int(v);
+                  else
+                     f = Float(v);
+               }
                break;
             case SQLITE_FLOAT:
                f = Float(sqlite3_column_double(r->r,i));

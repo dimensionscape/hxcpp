@@ -246,10 +246,24 @@ public:
 
    double operator%(const Dynamic &inRHS) const;
    double operator-() const { return mPtr ? - mPtr->__ToDouble() : 0.0; }
-   double operator++() { double val = (mPtr ? mPtr->__ToDouble() : 0.0) + 1; *this = val; return val; }
-   double operator++(int) {double val = mPtr ? mPtr->__ToDouble() : 0.0; *this = val+1; return val; }
-   double operator--() { double val = (mPtr ? mPtr->__ToDouble() : 0.0) - 1; *this = val; return val; }
-   double operator--(int) {double val = mPtr ? mPtr->__ToDouble() : 0.0; *this = val-1; return val; }
+   // Increment/decrement keep a vtInt value Int instead of reboxing as
+   // Float (which also disabled the int fast paths downstream)
+   inline double crement(int inDelta, bool inPost)
+   {
+      if (mPtr && mPtr->__GetType()==vtInt)
+      {
+         int i = mPtr->__ToInt();
+         *this = i+inDelta;
+         return inPost ? i : i+inDelta;
+      }
+      double val = mPtr ? mPtr->__ToDouble() : 0.0;
+      *this = val+inDelta;
+      return inPost ? val : val+inDelta;
+   }
+   double operator++() { return crement(1,false); }
+   double operator++(int) { return crement(1,true); }
+   double operator--() { return crement(-1,false); }
+   double operator--(int) { return crement(-1,true); }
 
 
    double operator / (const cpp::Variant &inRHS) const { return (double)(*this) / (double)inRHS; } \

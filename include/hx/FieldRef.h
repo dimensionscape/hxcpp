@@ -51,34 +51,30 @@ public:
    inline operator cpp::Int64() const { return mObject->__Field(mName, HX_PROP_DYNAMIC); }
 
 
+   // Increment/decrement keep an Int-typed field Int - going through
+   // double rewrote it as Float, disabling the runtime's vtInt fast paths
+   // and boxing a fresh double per iteration
+   inline double crement(int inDelta, bool inPost)
+   {
+      Dynamic value = mObject->__Field(mName, HX_PROP_DYNAMIC);
+      if (value.mPtr && value.mPtr->__GetType()==vtInt)
+      {
+         int i = value.mPtr->__ToInt();
+         mObject->__SetField(mName, i+inDelta, HX_PROP_DYNAMIC);
+         return inPost ? i : i+inDelta;
+      }
+      double d = value.mPtr ? value.mPtr->__ToDouble() : 0.0;
+      mObject->__SetField(mName, d+inDelta, HX_PROP_DYNAMIC);
+      return inPost ? d : d+inDelta;
+   }
    // post-increment
-   inline double operator++(int)
-   {
-      double d = mObject->__Field(mName, HX_PROP_DYNAMIC);
-      mObject->__SetField(mName,d+1, HX_PROP_DYNAMIC);
-      return d;
-   }
+   inline double operator++(int) { return crement(1,true); }
    // pre-increment
-   inline double operator++()
-   {
-      double d = ((double)mObject->__Field(mName, HX_PROP_DYNAMIC)) + 1;
-      mObject->__SetField(mName,d, HX_PROP_DYNAMIC);
-      return d;
-   }
+   inline double operator++() { return crement(1,false); }
    // post-decrement
-   inline double operator--(int)
-   {
-      double d = mObject->__Field(mName, HX_PROP_DYNAMIC);
-      mObject->__SetField(mName,d-1, HX_PROP_DYNAMIC);
-      return d;
-   }
+   inline double operator--(int) { return crement(-1,true); }
    // pre-decrement
-   inline double operator--()
-   {
-      double d = (double)(mObject->__Field(mName, HX_PROP_DYNAMIC)) - 1;
-      mObject->__SetField(mName,d,  HX_PROP_DYNAMIC);
-      return d;
-   }
+   inline double operator--() { return crement(-1,false); }
    bool operator !() { return ! ((int)(mObject->__Field(mName,  HX_PROP_DYNAMIC))); }
    int operator ~() { return ~ ((int)mObject->__Field(mName,  HX_PROP_DYNAMIC)); }
 
@@ -164,34 +160,28 @@ public:
    inline operator double() const { return mObject->__GetItem(mIndex); }
    inline operator int() const { return mObject->__GetItem(mIndex); }
 
+   // Keep Int elements Int - see FieldRef::crement
+   inline double crement(int inDelta, bool inPost)
+   {
+      Dynamic value = mObject->__GetItem(mIndex);
+      if (value.mPtr && value.mPtr->__GetType()==vtInt)
+      {
+         int i = value.mPtr->__ToInt();
+         mObject->__SetItem(mIndex, i+inDelta);
+         return inPost ? i : i+inDelta;
+      }
+      double d = value.mPtr ? value.mPtr->__ToDouble() : 0.0;
+      mObject->__SetItem(mIndex, d+inDelta);
+      return inPost ? d : d+inDelta;
+   }
    // post-increment
-   inline double operator++(int)
-   {
-      double d = mObject->__GetItem(mIndex)->__ToDouble();
-      mObject->__SetItem(mIndex,d+1);
-      return d;
-   }
+   inline double operator++(int) { return crement(1,true); }
    // pre-increment
-   inline double operator++()
-   {
-      double d = mObject->__GetItem(mIndex)->__ToDouble() + 1;
-      mObject->__SetItem(mIndex,d);
-      return d;
-   }
+   inline double operator++() { return crement(1,false); }
    // post-decrement
-   inline double operator--(int)
-   {
-      double d = mObject->__GetItem(mIndex)->__ToDouble();
-      mObject->__SetItem(mIndex,d-1);
-      return d;
-   }
+   inline double operator--(int) { return crement(-1,true); }
    // pre-decrement
-   inline double operator--()
-   {
-      double d = mObject->__GetItem(mIndex)->__ToDouble() - 1;
-      mObject->__SetItem(mIndex,d);
-      return d;
-   }
+   inline double operator--() { return crement(-1,false); }
    bool operator !() { return ! mObject->__GetItem(mIndex)->__ToInt(); }
    int operator ~() { return ~ mObject->__GetItem(mIndex)->__ToInt(); }
    double operator -() { return - mObject->__GetItem(mIndex)->__ToDouble(); }
