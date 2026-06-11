@@ -974,7 +974,17 @@ Dynamic __hxcpp_create_var_args(Dynamic &inArrayFunc)
 
 static std::mutex sgFieldMapMutex;
 
-typedef std::map<std::string,int> StringToField;
+// Transparent comparator: lets find() take the raw char* without
+// constructing a std::string (a heap allocation) per lookup - val_id is
+// called from native extensions inside per-frame callbacks
+struct FieldNameLess
+{
+   typedef void is_transparent;
+   bool operator()(const std::string &a, const std::string &b) const { return a < b; }
+   bool operator()(const std::string &a, const char *b) const { return a.compare(b) < 0; }
+   bool operator()(const char *a, const std::string &b) const { return b.compare(a) > 0; }
+};
+typedef std::map<std::string,int,FieldNameLess> StringToField;
 
 // These need to be pointers because of the unknown order of static object construction.
 String *sgFieldToString=0;
@@ -1006,13 +1016,12 @@ int  __hxcpp_field_to_id( const char *inFieldName )
       sgStringToField = new StringToField;
    }
 
-   std::string f(inFieldName);
-   StringToField::iterator i = sgStringToField->find(f);
+   StringToField::iterator i = sgStringToField->find(inFieldName);
    if (i!=sgStringToField->end())
       return i->second;
 
    int result = sgFieldToStringSize;
-   (*sgStringToField)[f] = result;
+   (*sgStringToField)[std::string(inFieldName)] = result;
    String str(inFieldName,strlen(inFieldName));
 
    // Make into "const" string that will not get collected...

@@ -193,6 +193,10 @@ public:
    #endif
    Array<String>      mStatics;
    Array<String>      mMembers;
+   // Lazily-built full instance-field list (class metadata is immutable
+   // after registration).  GC-allocated, so MarkStatics/VisitStatics must
+   // include it - Class_obj itself is a const allocation.
+   Array<String>      mInstanceFieldsCache;
 
    #ifdef HXCPP_SCRIPTABLE
    const hx::StorageInfo*    mMemberStorageInfo;

@@ -62,6 +62,10 @@
 * Fixed the cppia JIT writing before the array buffer for stores with a negative index (heap corruption; the write is now dropped, matching compiled code)
 * Fixed jitted calls that omit two or more optional arguments corrupting the callee frame (each omitted argument advanced the frame twice)
 * Fixed swapped register-class tags in jitted int/float conversions, which miscounted scratch registers
+* Sped up Type.resolveClass ~3.7x by replacing the class registry's ordered map (full string comparisons per tree level) with a hash map keyed on the precomputed permanent-string hashes, and fixed runtime cppia class registration racing unsynchronized against concurrent Type.resolveClass
+* Sped up Type.getInstanceFields ~5.7x by caching the computed field list per class (metadata is immutable after registration; callers receive copies)
+* CFFI val_id field lookups no longer allocate a std::string per call (transparent comparator)
+* Type.resolveClass no longer crashes when called by a native host before any class has booted
 
 * Updated mbedtls to 2.28.2
 * Updated sqlite to 3.40.1
