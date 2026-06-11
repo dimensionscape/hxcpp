@@ -475,7 +475,19 @@ Dynamic Dynamic::operator+(const Dynamic &inRHS) const
    int t1 = mPtr ? mPtr->__GetType() : vtNull;
    int t2 = inRHS.mPtr ? inRHS.mPtr->__GetType() : vtNull;
 
-   if ( (t1==vtInt || t1==vtFloat)  &&  (t2==vtInt || t2==vtFloat) )
+   if (t1==vtInt && t2==vtInt)
+   {
+      // Keep the result typed vtInt with 32-bit wrap, consistent with
+      // operator- and operator* (DYNAMIC_ARITH), and avoid boxing a double
+      return Dynamic( mPtr->__ToInt() + inRHS.mPtr->__ToInt() );
+   }
+   if ( (t1==vtInt64 || t1==vtInt)  &&  (t2==vtInt64 || t2==vtInt) )
+   {
+      // Boxed Int64 is numeric - previously it fell through to string
+      // concatenation, so adding two Int64 Dynamics produced a string
+      return Dynamic( mPtr->__ToInt64() + inRHS.mPtr->__ToInt64() );
+   }
+   if ( (t1==vtInt || t1==vtFloat || t1==vtInt64)  &&  (t2==vtInt || t2==vtFloat || t2==vtInt64) )
    {
       return mPtr->__ToDouble() + inRHS.mPtr->__ToDouble();
    }
@@ -496,24 +508,52 @@ Dynamic Dynamic::operator+(const TYPE &i) const \
    return Cast<double>() + i; \
 }
 
+// Int-ish scalars take the same vtInt fast path as DYNAMIC_ARITH, and a
+// vtInt64 lhs stays in 64-bit math instead of losing precision via double
+#define DYN_OP_ADD_INT(TYPE) \
+Dynamic Dynamic::operator+(const TYPE &i) const \
+{ \
+   int t = mPtr ? mPtr->__GetType() : vtNull; \
+   if (t==vtString) \
+      return Cast<String>() + String(i); \
+   if (t==vtInt) \
+      return Dynamic( (int)(*this) + i ); \
+   if (t==vtInt64) \
+      return Dynamic( mPtr->__ToInt64() + (cpp::Int64)i ); \
+   return Cast<double>() + i; \
+}
+
+#define DYN_OP_ADD_INT64(TYPE) \
+Dynamic Dynamic::operator+(const TYPE &i) const \
+{ \
+   int t = mPtr ? mPtr->__GetType() : vtNull; \
+   if (t==vtString) \
+      return Cast<String>() + String(i); \
+   if (t==vtInt || t==vtInt64) \
+      return Dynamic( (cpp::Int64)(mPtr->__ToInt64() + (cpp::Int64)i) ); \
+   return Cast<double>() + i; \
+}
+
 DYN_OP_ADD(double)
 DYN_OP_ADD(float)
-DYN_OP_ADD(int)
-DYN_OP_ADD(unsigned int)
-DYN_OP_ADD(short)
-DYN_OP_ADD(unsigned short)
-DYN_OP_ADD(signed char)
-DYN_OP_ADD(unsigned char)
-DYN_OP_ADD(char16_t)
-DYN_OP_ADD(char32_t)
-DYN_OP_ADD(cpp::Int64)
-DYN_OP_ADD(cpp::UInt64)
+DYN_OP_ADD_INT(int)
+DYN_OP_ADD_INT(unsigned int)
+DYN_OP_ADD_INT(short)
+DYN_OP_ADD_INT(unsigned short)
+DYN_OP_ADD_INT(signed char)
+DYN_OP_ADD_INT(unsigned char)
+DYN_OP_ADD_INT(char16_t)
+DYN_OP_ADD_INT(char32_t)
+DYN_OP_ADD_INT64(cpp::Int64)
+DYN_OP_ADD_INT64(cpp::UInt64)
 
 Dynamic Dynamic::operator+(const cpp::Variant &v) const
 {
    int t = mPtr ? mPtr->__GetType() : vtNull;
    if (t==vtString || v.type == cpp::Variant::typeString)
       return Cast<String>() + v.asString();
+   if (t==vtInt && v.isInt())
+      return Dynamic( mPtr->__ToInt() + (int)v );
    return Cast<double>() + v.asDouble();
 }
 

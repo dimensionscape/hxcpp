@@ -45,6 +45,68 @@ using namespace std;
 #include "hx/Unicase.h"
 #endif
 
+// ---- Locale-independent numeric conversion --------------------------------
+// The process locale is global mutable state that host frameworks (GUI
+// toolkits, audio libraries, JNI containers) change after boot.  A
+// comma-decimal locale flips strtod/printf's separator, breaking float
+// parsing and printing.  Parse and print through an explicit "C" numeric
+// locale where the platform provides one.
+#ifndef HX_WINDOWS
+#include <locale.h>
+#ifdef __APPLE__
+#include <xlocale.h>
+#endif
+#endif
+
+#if defined(HX_WINDOWS) && !defined(HX_WINRT)
+
+static _locale_t hxCNumericLocale()
+{
+   static _locale_t cLoc = _create_locale(LC_NUMERIC, "C");
+   return cLoc;
+}
+static double hxStrtodC(const char *inStr, char **outEnd)
+{
+   return _strtod_l(inStr, outEnd, hxCNumericLocale());
+}
+struct HxCNumericScope { };
+#define HX_SNPRINTF_C(buf,len,fmt,...) _snprintf_l(buf,len,fmt,hxCNumericLocale(),__VA_ARGS__)
+
+#elif defined(__APPLE__) || defined(__GLIBC__) || (defined(__ANDROID_API__) && __ANDROID_API__>=21)
+
+static locale_t hxCNumericLocale()
+{
+   static locale_t cLoc = newlocale(LC_NUMERIC_MASK, "C", (locale_t)0);
+   return cLoc;
+}
+static double hxStrtodC(const char *inStr, char **outEnd)
+{
+   locale_t old = uselocale(hxCNumericLocale());
+   double result = strtod(inStr, outEnd);
+   uselocale(old);
+   return result;
+}
+// Switches this thread to the "C" numeric locale for the printf calls in
+// its scope
+struct HxCNumericScope
+{
+   locale_t old;
+   HxCNumericScope() { old = uselocale(hxCNumericLocale()); }
+   ~HxCNumericScope() { uselocale(old); }
+};
+#define HX_SNPRINTF_C SPRINTF
+
+#else
+
+static double hxStrtodC(const char *inStr, char **outEnd)
+{
+   return strtod(inStr, outEnd);
+}
+struct HxCNumericScope { };
+#define HX_SNPRINTF_C SPRINTF
+
+#endif
+
 namespace hx
 {
 char HX_DOUBLE_PATTERN[20] = "%.15g";
@@ -910,9 +972,10 @@ String::String(const double &inRHS)
       return;
    }
    char buf[100];
+   HxCNumericScope cNumeric;
    if (HX_DOUBLE_PATTERN_CUSTOM)
    {
-      SPRINTF(buf,100,HX_DOUBLE_PATTERN,inRHS);
+      HX_SNPRINTF_C(buf,100,HX_DOUBLE_PATTERN,inRHS);
    }
    else
    {
@@ -923,8 +986,8 @@ String::String(const double &inRHS)
       // previous fixed "%.15g" did not (e.g. 0.1+0.2 printed "0.3").
       for(int prec=15; prec<=17; prec++)
       {
-         SPRINTF(buf,100,"%.*g",prec,inRHS);
-         if (strtod(buf,0)==inRHS)
+         HX_SNPRINTF_C(buf,100,"%.*g",prec,inRHS);
+         if (hxStrtodC(buf,0)==inRHS)
             break;
       }
       buf[99]='\0';
@@ -987,7 +1050,8 @@ String::String(const float &inRHS)
       return;
    }
    char buf[100];
-   SPRINTF(buf,100,HX_DOUBLE_PATTERN,inRHS);
+   HxCNumericScope cNumeric;
+   HX_SNPRINTF_C(buf,100,HX_DOUBLE_PATTERN,inRHS);
    buf[99]='\0';
    __s = GCStringDup(buf,-1,&length);
 }
@@ -2732,11 +2796,7 @@ public:
    {
       if (!mValue.raw_ptr()) return 0;
 
-      #ifdef HX_ANDROID
-      return strtod(mValue.utf8_str(),0);
-      #else
-      return atof(mValue.utf8_str());
-      #endif
+      return hxStrtodC(mValue.utf8_str(),0);
    }
    int __length() const { return mValue.length; }
 

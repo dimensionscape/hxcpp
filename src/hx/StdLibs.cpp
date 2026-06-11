@@ -777,6 +777,34 @@ static inline bool is_hex_string(const char *c, int len)
       || (len > 3 && (c[0] == '-' || c[0] == '+') && c[1] == '0' && (c[2] == 'x' || c[2] == 'X'));
 }
 
+// Locale-independent strtod - the process locale is global mutable state
+// that host frameworks change after boot, which flips the decimal separator
+// and silently breaks parseFloat (see the matching helper in String.cpp)
+#if defined(HX_WINDOWS) && !defined(HX_WINRT)
+static double hxStrtodC(const char *inStr, char **outEnd)
+{
+   static _locale_t cLoc = _create_locale(LC_NUMERIC, "C");
+   return _strtod_l(inStr, outEnd, cLoc);
+}
+#elif defined(__APPLE__) || defined(__GLIBC__) || (defined(__ANDROID_API__) && __ANDROID_API__>=21)
+#ifdef __APPLE__
+#include <xlocale.h>
+#endif
+static double hxStrtodC(const char *inStr, char **outEnd)
+{
+   static locale_t cLoc = newlocale(LC_NUMERIC_MASK, "C", (locale_t)0);
+   locale_t old = uselocale(cLoc);
+   double result = strtod(inStr, outEnd);
+   uselocale(old);
+   return result;
+}
+#else
+static double hxStrtodC(const char *inStr, char **outEnd)
+{
+   return strtod(inStr, outEnd);
+}
+#endif
+
 Dynamic __hxcpp_parse_int(const String &inString)
 {
    if (!inString.raw_ptr())
@@ -828,7 +856,7 @@ double __hxcpp_parse_substr_float(const String &inString,int start, int length)
    hx::strbuf buf;
    const char *str = inString.ascii_substr(&buf,start,length);
    char *end = (char *)str;
-   double result = str ? strtod(str,&end) : 0;
+   double result = str ? hxStrtodC(str,&end) : 0;
 
    if (end==str)
       return Math_obj::NaN;
@@ -845,7 +873,7 @@ double __hxcpp_parse_float(const String &inString)
    hx::strbuf buf;
    const char *str = inString.utf8_str(&buf);
    char *end = (char *)str;
-   double result = str ? strtod(str,&end) : 0;
+   double result = str ? hxStrtodC(str,&end) : 0;
 
    if (end==str)
       return Math_obj::NaN;
