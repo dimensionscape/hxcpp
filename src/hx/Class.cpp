@@ -25,6 +25,31 @@ struct ClassNameEq
 typedef std::unordered_map<String,Class,ClassNameHash,ClassNameEq> ClassMap;
 static ClassMap *sClassMap = 0;
 
+// Dense registration-order list for the GC walks - iterating the hash map
+// chases a bucket chain per class every collect.  Must stay in sync with
+// the map: a class only here would root its statics forever (cppia reload
+// replaces classes), one only in the map would miss marking.
+static std::vector<Class> *sAllClasses = 0;
+
+// Called with the lock held.  Replaces inOld's slot when a name is
+// re-registered so the previous class does not stay rooted.
+static void sAddClass(const Class &inOld, const Class &inNew)
+{
+   if (sAllClasses==0)
+      sAllClasses = new std::vector<Class>;
+   if (inOld.mPtr)
+   {
+      for(int i=(int)sAllClasses->size()-1; i>=0; i--)
+         if ((*sAllClasses)[i].mPtr==inOld.mPtr)
+         {
+            (*sAllClasses)[i] = inNew;
+            return;
+         }
+   }
+   if (inNew.mPtr)
+      sAllClasses->push_back(inNew);
+}
+
 // Registration is single-threaded at boot, but cppia/scriptable modules can
 // register classes at any time while other threads call Type.resolveClass -
 // an unsynchronized map mutation is a torn-read crash.  Writes are rare, so
@@ -74,7 +99,9 @@ Class _hx_RegisterClass(const String &inClassName, CanCastFunc inCanCast,
    ClassMapLock lock;
    if (sClassMap==0)
       sClassMap = new ClassMap;
-   (*sClassMap)[inClassName] = c;
+   Class &slot = (*sClassMap)[inClassName];
+   sAddClass(slot, c);
+   slot = c;
    return c;
 }
 
@@ -83,7 +110,9 @@ void _hx_RegisterClass(const String &inClassName, Class inClass)
    ClassMapLock lock;
    if (sClassMap==0)
       sClassMap = new ClassMap;
-   (*sClassMap)[inClassName] = inClass;
+   Class &slot = (*sClassMap)[inClassName];
+   sAddClass(slot, inClass);
+   slot = inClass;
 }
 
 
@@ -152,9 +181,11 @@ bool Class_obj::SetNoStaticField(const String &inString, Dynamic &ioValue, hx::P
 void Class_obj::registerScriptable(bool inOverwrite)
 {
    ClassMapLock lock;
-   if (!inOverwrite && sClassMap->find(mName)!=sClassMap->end())
+   Class &slot = (*sClassMap)[ mName ];
+   if (!inOverwrite && slot.mPtr)
       return;
-   (*sClassMap)[ mName ] = this;
+   sAddClass(slot, Class(this));
+   slot = this;
 }
 
 Class Class_obj::GetSuper()
@@ -366,22 +397,25 @@ void MarkClassStatics(hx::MarkContext *__inCtx)
    #ifdef HXCPP_DEBUG
    MarkPushClass("MarkClassStatics",__inCtx);
    #endif
-   ClassMap::iterator end = sClassMap->end();
-   for(ClassMap::iterator i = sClassMap->begin(); i!=end; ++i)
+   if (sAllClasses)
    {
-      Class c = i->second;
-      if (c->__meta__.mPtr || c->mMarkFunc || c->mInstanceFieldsCache.mPtr)
+      size_t count = sAllClasses->size();
+      for(size_t i=0; i<count; i++)
       {
-         #ifdef HXCPP_DEBUG
-         hx::MarkPushClass(i->first.raw_ptr(),__inCtx);
-         hx::MarkSetMember("statics",__inCtx);
-         #endif
-      
-         c->MarkStatics(__inCtx);
+         Class_obj *c = (*sAllClasses)[i].mPtr;
+         if (c->__meta__.mPtr || c->mMarkFunc || c->mInstanceFieldsCache.mPtr)
+         {
+            #ifdef HXCPP_DEBUG
+            hx::MarkPushClass(c->mName.raw_ptr(),__inCtx);
+            hx::MarkSetMember("statics",__inCtx);
+            #endif
 
-         #ifdef HXCPP_DEBUG
-         hx::MarkPopClass(__inCtx);
-         #endif
+            c->MarkStatics(__inCtx);
+
+            #ifdef HXCPP_DEBUG
+            hx::MarkPopClass(__inCtx);
+            #endif
+         }
       }
    }
    #ifdef HXCPP_DEBUG
@@ -394,9 +428,15 @@ void MarkClassStatics(hx::MarkContext *__inCtx)
 void VisitClassStatics(hx::VisitContext *__inCtx)
 {
    HX_VISIT_MEMBER(Class_obj__mClass);
-   ClassMap::iterator end = sClassMap->end();
-   for(ClassMap::iterator i = sClassMap->begin(); i!=end; ++i)
-         i->second->VisitStatics(__inCtx);
+   // Must walk the same set MarkClassStatics marks - an object kept alive by
+   // the mark but missed by the visit would not have its pointers updated
+   // when the heap moves
+   if (sAllClasses)
+   {
+      size_t count = sAllClasses->size();
+      for(size_t i=0; i<count; i++)
+         (*sAllClasses)[i]->VisitStatics(__inCtx);
+   }
 }
 
 #endif
