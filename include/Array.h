@@ -992,15 +992,66 @@ public:
       std::sort(e, e+length, Sorter(inSorter) );
    }
 
+   struct BoxedSorter
+   {
+      Dynamic    *mBoxed;
+      SorterFunc  mFunc;
+
+      BoxedSorter(Dynamic *inBoxed, SorterFunc inFunc) : mBoxed(inBoxed), mFunc(inFunc) { }
+      bool operator()(int inA, int inB)
+      {
+#if (HXCPP_API_LEVEL>=500)
+         return mFunc(mBoxed[inA], mBoxed[inB]) < 0;
+#else
+         return mFunc(mBoxed[inA], mBoxed[inB])->__ToInt() < 0;
+#endif
+      }
+   };
+
    void sort(SorterFunc inSorter)
    {
       if (hx::ArrayValueSortable<ELEM_>::Yes)
       {
-         // Plain values - sort in place.  Dispatching on the StoreType here
-         // would send bool/byte/short arrays through safeSort, which
-         // reinterprets the buffer as Dynamic[] and reads out of bounds.
+         // Plain values.  (Dispatching on the StoreType here would send
+         // bool/byte/short arrays through safeSort, which reinterprets the
+         // buffer as Dynamic[] and reads out of bounds.)
+         //
+         // The comparator takes Dynamic arguments, so comparing raw values
+         // directly boxes two of them per comparison - n log n boxes.  Box
+         // each element once, sort an index through the boxed values, then
+         // permute the raw values into place.  The boxed array is reachable
+         // from this frame for the whole sort, so its buffer stays valid
+         // even if the comparator triggers a collection.
+         if (length<2)
+            return;
+         Array<Dynamic> boxed(length, length);
+         {
+            ELEM_ *e = (ELEM_ *)mBase;
+            for(int i=0;i<length;i++)
+               boxed->init(i, Dynamic(e[i]));
+         }
+
+         auto index = std::vector<int>(length);
+         for(int i=0;i<length;i++)
+            index[i] = i;
+
+         std::stable_sort(index.begin(), index.end(),
+                          BoxedSorter((Dynamic *)boxed->GetBase(), inSorter));
+
+         // Apply the permutation with cycle-following swaps (see SafeSorter).
+         // Re-read mBase - the comparator may have run user code.
          ELEM_ *e = (ELEM_ *)mBase;
-         std::stable_sort(e, e+length, Sorter(inSorter) );
+         for(int i=0;i<length;i++)
+         {
+            int from = index[i];
+            while (from < i)
+               from = index[from];
+            if (from != i)
+            {
+               std::swap(e[i], e[from]);
+               index[i] = from;
+            }
+         }
       }
       else
       {
