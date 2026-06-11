@@ -79,7 +79,14 @@ struct HxMutex
 
 inline bool HxCreateDetachedThread(DWORD (WINAPI *func)(void *), void *param)
 {
-	return (CreateThread(NULL, 0, func, param, 0, 0) != 0);
+	// Close the handle immediately (the Windows detach idiom) - keeping it
+	// leaked one kernel thread object per Thread.create for the process
+	// lifetime
+	HANDLE h = CreateThread(NULL, 0, func, param, 0, 0);
+	if (!h)
+		return false;
+	CloseHandle(h);
+	return true;
 }
 
 #else
@@ -131,13 +138,17 @@ inline bool HxCreateDetachedThread(void *(*func)(void *), void *param)
 		return false;
 #ifdef PTHREAD_CREATE_DETACHED
 	if (pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) != 0)
+	{
+		pthread_attr_destroy(&attr);
 		return false;
+	}
 #endif
-	if (pthread_create(&t, &attr, func, param) != 0 )
-		return false;
-	if (pthread_attr_destroy(&attr) != 0)
-		return false;
-	return true;
+	bool ok = pthread_create(&t, &attr, func, param) == 0;
+	// Destroy unconditionally and ignore the result: reporting failure
+	// after a successful create would make the caller tear down state
+	// the already-running thread is using
+	pthread_attr_destroy(&attr);
+	return ok;
 }
 
 #endif
@@ -184,10 +195,13 @@ struct HxSemaphore
     // Returns true on success, false on timeout
    bool WaitSeconds(double inSeconds)
    {
+      // double->DWORD is undefined past 2^32 (and 0xffffffff is INFINITE)
+      double ms = inSeconds*1000.0;
+      DWORD waitMs = ms >= 4294967294.0 ? 4294967294u : (DWORD)ms;
       #ifdef HX_WINRT
-      return WaitForSingleObjectEx(mSemaphore,inSeconds*1000.0,false) != WAIT_TIMEOUT;
+      return WaitForSingleObjectEx(mSemaphore,waitMs,false) != WAIT_TIMEOUT;
       #else
-      return WaitForSingleObject(mSemaphore,inSeconds*1000.0) != WAIT_TIMEOUT;
+      return WaitForSingleObject(mSemaphore,waitMs) != WAIT_TIMEOUT;
       #endif
    }
    void Reset() { ResetEvent(mSemaphore); }
@@ -260,6 +274,9 @@ struct HxSemaphore
       struct timeval tv;
       gettimeofday(&tv, 0);
 
+      // double->int is undefined past 2^31
+      if (inSeconds > 0x7fffffff)
+         inSeconds = 0x7fffffff;
       int isec = (int)inSeconds;
       int usec = (int)((inSeconds-isec)*1000000.0);
       timespec spec;

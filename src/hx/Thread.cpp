@@ -279,8 +279,25 @@ THREAD_FUNC_TYPE hxThreadFunc( void *inInfo )
 
 	if ( info[0]->mFunction.GetPtr() )
 	{
-		// Try ... catch
-		info[0]->mFunction();
+		// An exception escaping a raw thread proc is std::terminate - the
+		// whole process died with no diagnostic at all
+		try
+		{
+			info[0]->mFunction();
+		}
+		catch(Dynamic e)
+		{
+			hx::strbuf buf;
+			String err = e==null() ? HX_CSTRING("null") : e->toString();
+			fprintf(stderr, "Uncaught exception in thread: %s\n", err.utf8_str(&buf));
+		}
+		catch(...)
+		{
+			fprintf(stderr, "Uncaught native exception in thread\n");
+		}
+		// Release the closure and its captures - the Thread handle may
+		// outlive the run by a long time
+		info[0]->mFunction = null();
 	}
 
     // Call the debugger function to annouce that a thread has terminated
@@ -383,6 +400,10 @@ static hxThreadInfo *GetCurrentInfo(bool createNew = true)
       // New, non-haxe thread - might be the first thread, or might be a new
       //  foreign thread.
 		info = new hxThreadInfo(null(), 0);
+      // The creation-handshake semaphore is only used by thread_create;
+      // foreign-thread infos leaked it (a kernel event handle on Windows)
+      // every time a native thread first touched a Haxe thread API
+      info->CleanSemaphore();
       hx::Object **threadRoot = new hx::Object *;
       *threadRoot = info; 
 		hx::GCAddRoot(threadRoot);
@@ -537,6 +558,8 @@ public:
 
 	hxLock()
 	{
+		// Explicit rather than relying on GC allocations being zeroed
+		mAvailable = 0;
 		mFinalizer = new hx::InternalFinalizer(this);
 		mFinalizer->mFinalizer = clean;
 	}

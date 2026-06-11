@@ -11,6 +11,7 @@
 #   include <memory.h>
 #   include <errno.h>
 #   include <signal.h>
+#   include <fcntl.h>
 #   if defined(ANDROID) || defined(BLACKBERRY) || defined(EMSCRIPTEN)
 #      include <sys/wait.h>
 #   elif !defined(NEKO_MAC)
@@ -80,6 +81,9 @@ struct vprocess : public hx::Object
                CloseHandle(iwrite);
             CloseHandle(pinf.hProcess);
             CloseHandle(pinf.hThread);
+            // The OS recycles handle slots - kill/exitCode on a closed
+            // process must not target whatever now occupies them
+            memset(&pinf,0,sizeof(pinf));
          #else
             if (eread!=-1)
                do_close(eread);
@@ -87,6 +91,12 @@ struct vprocess : public hx::Object
                do_close(oread);
             if (iwrite!=-1)
                do_close(iwrite);
+            // Reap if the child already exited - a process the user never
+            // calls exitCode() on otherwise stays a zombie until the host
+            // exits (a still-running child is left for the OS to reparent)
+            if (pid > 0)
+               waitpid(pid, 0, WNOHANG);
+            pid = -1;
          #endif
          // Reset the stale values - the OS recycles handles/fds, so a later
          // stdin/stdout close on this object must not close someone else's
@@ -110,6 +120,17 @@ vprocess *getProcess(Dynamic handle)
    vprocess *p = dynamic_cast<vprocess *>(handle.mPtr);
    if (!p)
       hx::Throw(HX_CSTRING("Invalid process"));
+   return p;
+}
+
+// For operations that target the child process itself - after close() the
+// pid/handle values are stale and the OS recycles them, so kill() could
+// terminate an unrelated process and exitCode() hang forever
+vprocess *getOpenProcess(Dynamic handle)
+{
+   vprocess *p = getProcess(handle);
+   if (!p->open)
+      hx::Throw(HX_CSTRING("Process closed"));
    return p;
 }
 
@@ -219,6 +240,11 @@ Dynamic _hx_std_process_run( String cmd, Array<String> vargs, int inShowParam )
       }
       else
       {
+         // The arguments are escaped but cmd is concatenated raw - an
+         // embedded quote would close the program token early and smuggle
+         // extra arguments.  Quotes cannot appear in Win32 paths anyway
+         if (cmd.indexOf(HX_CSTRING("\""), null()) >= 0)
+            hx::Throw(HX_CSTRING("Invalid command name"));
          b = HX_CSTRING("\"") + cmd + HX_CSTRING("\"");
 
          for(int i=0;i<vargs->length;i++)
@@ -241,30 +267,43 @@ Dynamic _hx_std_process_run( String cmd, Array<String> vargs, int inShowParam )
       sinf.cb = sizeof(sinf);
       sinf.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
       sinf.wShowWindow = inShowParam;
-      CreatePipe(&oread,&sinf.hStdOutput,&sattr,0);
-      CreatePipe(&eread,&sinf.hStdError,&sattr,0);
-      CreatePipe(&sinf.hStdInput,&iwrite,&sattr,0);
 
-      HANDLE procOread,procEread,procIwrite;
+      // Checked and zero-initialized: a failed CreatePipe used to leave
+      // garbage stack HANDLEs that were duplicated and closed - closing
+      // an arbitrary live handle of this process
+      oread = eread = iwrite = 0;
+      HANDLE procOread = 0, procEread = 0, procIwrite = 0;
+      bool piped = CreatePipe(&oread,&sinf.hStdOutput,&sattr,0)
+                && CreatePipe(&eread,&sinf.hStdError,&sattr,0)
+                && CreatePipe(&sinf.hStdInput,&iwrite,&sattr,0);
 
-      DuplicateHandle(proc,oread,proc,&procOread,0,FALSE,DUPLICATE_SAME_ACCESS);
-      DuplicateHandle(proc,eread,proc,&procEread,0,FALSE,DUPLICATE_SAME_ACCESS);
-      DuplicateHandle(proc,iwrite,proc,&procIwrite,0,FALSE,DUPLICATE_SAME_ACCESS);
-      CloseHandle(oread);
-      CloseHandle(eread);
-      CloseHandle(iwrite);
-      //printf("Cmd %s\n",val_string(cmd));
+      bool dup = piped
+                && DuplicateHandle(proc,oread,proc,&procOread,0,FALSE,DUPLICATE_SAME_ACCESS)
+                && DuplicateHandle(proc,eread,proc,&procEread,0,FALSE,DUPLICATE_SAME_ACCESS)
+                && DuplicateHandle(proc,iwrite,proc,&procIwrite,0,FALSE,DUPLICATE_SAME_ACCESS);
+      if (oread) CloseHandle(oread);
+      if (eread) CloseHandle(eread);
+      if (iwrite) CloseHandle(iwrite);
+
       PROCESS_INFORMATION pinf;
       memset(&pinf,0,sizeof(pinf));
-      if( !CreateProcessW(NULL,(wchar_t *)name,NULL,NULL,TRUE,CREATE_NO_WINDOW,NULL,NULL,&sinf,&pinf) )
+      bool started = dup &&
+         CreateProcessW(NULL,(wchar_t *)name,NULL,NULL,TRUE,CREATE_NO_WINDOW,NULL,NULL,&sinf,&pinf);
+
+      // The child ends are always done with here; the parent ends too on
+      // failure.  The executable-not-found path used to leak all six
+      // handles per attempt
+      if (sinf.hStdOutput) CloseHandle(sinf.hStdOutput);
+      if (sinf.hStdError) CloseHandle(sinf.hStdError);
+      if (sinf.hStdInput) CloseHandle(sinf.hStdInput);
+      if (!started)
       {
+         if (procOread) CloseHandle(procOread);
+         if (procEread) CloseHandle(procEread);
+         if (procIwrite) CloseHandle(procIwrite);
          hx::ExitGCFreeZone();
          hx::Throw(HX_CSTRING("Could not start process"));
       }
-      // close unused pipes
-      CloseHandle(sinf.hStdOutput);
-      CloseHandle(sinf.hStdError);
-      CloseHandle(sinf.hStdInput);
       hx::ExitGCFreeZone();
 
       p = new vprocess;
@@ -276,9 +315,40 @@ Dynamic _hx_std_process_run( String cmd, Array<String> vargs, int inShowParam )
    }
    #else // not windows ...
    {
+   // Writing to a dead child's stdin must surface as an error, not raise
+   // SIGPIPE whose default action kills the whole host process
+   static bool sigpipeIgnored = false;
+   if (!sigpipeIgnored)
+   {
+      sigpipeIgnored = true;
+      signal(SIGPIPE, SIG_IGN);
+   }
+
    int input[2], output[2], error[2];
-   if( pipe(input) || pipe(output) || pipe(error) )
+   if( pipe(input) )
       return null();
+   if( pipe(output) )
+   {
+      do_close(input[0]); do_close(input[1]);
+      return null();
+   }
+   if( pipe(error) )
+   {
+      do_close(input[0]); do_close(input[1]);
+      do_close(output[0]); do_close(output[1]);
+      return null();
+   }
+
+   // Close-on-exec: without it a concurrent spawn's child inherits these
+   // descriptors, holding this child's stdout/stderr write ends open so
+   // its streams never deliver EOF until the unrelated child also exits.
+   // dup2 onto 0/1/2 in the child clears the flag on the std fds
+   for(int i=0;i<2;i++)
+   {
+      fcntl(input[i], F_SETFD, FD_CLOEXEC);
+      fcntl(output[i], F_SETFD, FD_CLOEXEC);
+      fcntl(error[i], F_SETFD, FD_CLOEXEC);
+   }
 
    hx::strbuf buf;
    std::vector< std::string > values;
@@ -302,9 +372,21 @@ Dynamic _hx_std_process_run( String cmd, Array<String> vargs, int inShowParam )
    for(int i=0;i<values.size();i++)
       argv[i] = values[i].c_str();
 
+   // Built before fork: the child of a multithreaded process may only use
+   // async-signal-safe calls - the old GC allocation here could deadlock
+   // on a lock some other thread held at fork time
+   std::string execFailed = "Command not found : ";
+   execFailed += values[isRaw ? 2 : 0];
+   execFailed += "\n";
+
    int pid = fork();
    if( pid == -1 )
+   {
+      do_close(input[0]); do_close(input[1]);
+      do_close(output[0]); do_close(output[1]);
+      do_close(error[0]); do_close(error[1]);
       return null();
+   }
 
    // child
    if( pid == 0 )
@@ -316,8 +398,12 @@ Dynamic _hx_std_process_run( String cmd, Array<String> vargs, int inShowParam )
       dup2(output[1],1);
       dup2(error[1],2);
       execvp(argv[0],(char* const*)&argv[0]);
-      fprintf(stderr,"Command not found : %S\n",cmd.wchar_str());
-      exit(1);
+      ssize_t unused = write(2, execFailed.c_str(), execFailed.size());
+      (void)unused;
+      // _exit: exit() would run the parent's atexit handlers and flush
+      // its duplicated stdio buffers; 127 is the shell convention for
+      // command-not-found, distinguishable from the program's own 1
+      _exit(127);
    }
 
    // parent
@@ -352,20 +438,26 @@ Dynamic _hx_std_process_run( String cmd, Array<String> vargs, int inShowParam )
 **/
 int _hx_std_process_stdout_read( Dynamic handle, Array<unsigned char> buf, int pos, int len )
 {
-   if( pos < 0 || len < 0 || pos + len > buf->length )
+   if( pos < 0 || len < 0 || pos > buf->length || len > buf->length - pos )
       return 0;
    vprocess *p = getProcess(handle);
 
-   unsigned char *dest = &buf[0];
+   unsigned char * volatile dest = &buf[0];
    hx::EnterGCFreeZone();
    #ifdef NEKO_WINDOWS
    DWORD nbytes = 0;
    if( !ReadFile(p->oread,dest+pos,len,&nbytes,0) )
       nbytes = 0;
    #else
+   POSIX_LABEL(stdout_read_again);
    int nbytes = read(p->oread,dest + pos,len);
-   if( nbytes <= 0 )
+   if( nbytes < 0 )
+   {
+      // A signal mid-read must retry, not report EOF and drop the rest
+      // of the child's output
+      HANDLE_EINTR(stdout_read_again);
       nbytes = 0;
+   }
    #endif
 
    hx::ExitGCFreeZone();
@@ -383,20 +475,24 @@ int _hx_std_process_stdout_read( Dynamic handle, Array<unsigned char> buf, int p
 **/
 int _hx_std_process_stderr_read( Dynamic handle, Array<unsigned char> buf, int pos, int len )
 {
-   if( pos < 0 || len < 0 || pos + len > buf->length )
+   if( pos < 0 || len < 0 || pos > buf->length || len > buf->length - pos )
       return 0;
    vprocess *p = getProcess(handle);
 
-   unsigned char *dest = &buf[0];
+   unsigned char * volatile dest = &buf[0];
    hx::EnterGCFreeZone();
    #ifdef NEKO_WINDOWS
    DWORD nbytes = 0;
    if( !ReadFile(p->eread,dest+pos,len,&nbytes,0) )
       nbytes = 0;
    #else
+   POSIX_LABEL(stderr_read_again);
    int nbytes = read(p->eread,dest + pos,len);
-   if( nbytes <= 0 )
+   if( nbytes < 0 )
+   {
+      HANDLE_EINTR(stderr_read_again);
       nbytes = 0;
+   }
    #endif
 
    hx::ExitGCFreeZone();
@@ -413,22 +509,33 @@ int _hx_std_process_stderr_read( Dynamic handle, Array<unsigned char> buf, int p
 **/
 int _hx_std_process_stdin_write( Dynamic handle, Array<unsigned char> buf, int pos, int len )
 {
-   if( pos < 0 || len < 0 || pos + len > buf->length )
+   if( pos < 0 || len < 0 || pos > buf->length || len > buf->length - pos )
       return 0;
    vprocess *p = getProcess(handle);
 
-   unsigned char *src = &buf[0];
+   unsigned char * volatile src = &buf[0];
 
 
    hx::EnterGCFreeZone();
    #ifdef NEKO_WINDOWS
    DWORD nbytes =0;
    if( !WriteFile(p->iwrite,src+pos,len,&nbytes,0) )
-      nbytes = 0;
+   {
+      hx::ExitGCFreeZone();
+      // Returning 0 forever makes haxe.io.Output.writeFullBytes spin -
+      // a broken pipe (child exited) must surface as an error
+      hx::Throw(HX_CSTRING("EOF"));
+   }
    #else
+   POSIX_LABEL(stdin_write_again);
    int nbytes = write(p->iwrite,src+pos,len);
-   if( nbytes == -1 )
-      nbytes = 0;
+   if( nbytes < 0 )
+   {
+      HANDLE_EINTR(stdin_write_again);
+      hx::ExitGCFreeZone();
+      // EPIPE arrives here now that SIGPIPE is ignored
+      hx::Throw(HX_CSTRING("EOF"));
+   }
    #endif
 
    hx::ExitGCFreeZone();
@@ -464,38 +571,42 @@ void _hx_std_process_stdin_close( Dynamic handle )
 #if (HXCPP_API_LEVEL > 420)
 Dynamic _hx_std_process_exit( Dynamic handle, bool block )
 {
-   vprocess *p = getProcess(handle);
+   vprocess *p = getOpenProcess(handle);
 
    hx::EnterGCFreeZone();
    #ifdef NEKO_WINDOWS
    {
-      DWORD rval;
+      DWORD rval = 0;
       DWORD wait = INFINITE;
       if (!block)
          wait = 0;
-      
-      WaitForSingleObject(p->pinf.hProcess,wait);
+
+      // The wait result is the authoritative liveness signal - inferring
+      // it from rval==STILL_ACTIVE (259) made a process that really
+      // exits with code 259 read as running forever
+      DWORD waitResult = WaitForSingleObject(p->pinf.hProcess,wait);
       hx::ExitGCFreeZone();
 
-      if( !GetExitCodeProcess(p->pinf.hProcess,&rval) && block)
-         return 0;
-      else if (!block && rval == STILL_ACTIVE)
+      if (!block && waitResult == WAIT_TIMEOUT)
          return null();
-      else
-         return rval;
+      if( !GetExitCodeProcess(p->pinf.hProcess,&rval) )
+         return block ? Dynamic(0) : Dynamic(null());
+      return (int)rval;
    }
    #else
    int options=0;
    if (!block)
       options = WNOHANG;
-   
+
    int rval=0;
    pid_t ret=-1;
    while( (ret = waitpid(p->pid,&rval,options)) != p->pid )
    {
-      if( errno == EINTR )
+      // errno is only meaningful when waitpid failed - a stale EINTR
+      // from an earlier syscall turned the WNOHANG poll into a busy spin
+      if( ret == -1 && errno == EINTR )
          continue;
-      
+
       if (!block && ret == 0)
       {
          hx::ExitGCFreeZone();
@@ -506,21 +617,24 @@ Dynamic _hx_std_process_exit( Dynamic handle, bool block )
       return 0;
    }
    hx::ExitGCFreeZone();
-   if( !WIFEXITED(rval) )
-      return 0;
-
-   return WEXITSTATUS(rval);
+   if( WIFEXITED(rval) )
+      return WEXITSTATUS(rval);
+   if( WIFSIGNALED(rval) )
+      // Shell convention - a crashed or killed child must not read as a
+      // clean exit 0
+      return 128 + WTERMSIG(rval);
+   return 0;
    #endif
 }
 #else
 int _hx_std_process_exit( Dynamic handle )
 {
-   vprocess *p = getProcess(handle);
+   vprocess *p = getOpenProcess(handle);
 
    hx::EnterGCFreeZone();
    #ifdef NEKO_WINDOWS
    {
-      DWORD rval;
+      DWORD rval = 0;
       WaitForSingleObject(p->pinf.hProcess,INFINITE);
       hx::ExitGCFreeZone();
 
@@ -530,18 +644,20 @@ int _hx_std_process_exit( Dynamic handle )
    }
    #else
    int rval=0;
-   while( waitpid(p->pid,&rval,0) != p->pid )
+   pid_t ret=-1;
+   while( (ret = waitpid(p->pid,&rval,0)) != p->pid )
    {
-      if( errno == EINTR )
+      if( ret == -1 && errno == EINTR )
          continue;
       hx::ExitGCFreeZone();
       return 0;
    }
    hx::ExitGCFreeZone();
-   if( !WIFEXITED(rval) )
-      return 0;
-
-   return WEXITSTATUS(rval);
+   if( WIFEXITED(rval) )
+      return WEXITSTATUS(rval);
+   if( WIFSIGNALED(rval) )
+      return 128 + WTERMSIG(rval);
+   return 0;
    #endif
 }
 #endif
@@ -554,7 +670,7 @@ int _hx_std_process_exit( Dynamic handle )
 **/
 int _hx_std_process_pid( Dynamic handle )
 {
-   vprocess *p = getProcess(handle);
+   vprocess *p = getOpenProcess(handle);
 
    #ifdef NEKO_WINDOWS
    return p->pinf.dwProcessId;
@@ -565,7 +681,9 @@ int _hx_std_process_pid( Dynamic handle )
 
 void _hx_std_process_kill( Dynamic handle )
 {
-   vprocess *p = getProcess(handle);
+   // After close() the handle/pid may have been recycled by the OS -
+   // TerminateProcess could kill an unrelated process
+   vprocess *p = getOpenProcess(handle);
 
    #ifdef NEKO_WINDOWS
    TerminateProcess(p->pinf.hProcess, -1);
