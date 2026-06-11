@@ -19,6 +19,11 @@ hx::thread::RecursiveMutex_obj::RecursiveMutex_obj() : impl(new Impl())
 
 void hx::thread::RecursiveMutex_obj::acquire()
 {
+	// Uncontended fast path - no need for the GC free zone (stack capture
+	// plus collector handshake) unless we are actually going to block
+	if (impl->mutex.try_lock())
+		return;
+
 	hx::AutoGCFreeZone zone;
 
 	impl->mutex.lock();

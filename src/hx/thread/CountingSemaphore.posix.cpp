@@ -28,6 +28,10 @@ hx::thread::CountingSemaphore_obj::CountingSemaphore_obj(int value) : impl(new I
 
 void hx::thread::CountingSemaphore_obj::acquire()
 {
+	// Uncontended fast path - skip the GC free zone unless we will block
+	if (0 == sem_trywait(&impl->semaphore))
+		return;
+
 	hx::EnterGCFreeZone();
 
 	// sem_wait is never restarted after a caught signal, regardless of

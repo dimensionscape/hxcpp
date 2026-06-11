@@ -8,6 +8,7 @@
 #include <hx/Unordered.h>
 #include <mutex>
 #include <condition_variable>
+#include <atomic>
 
 #ifdef EMSCRIPTEN
    #include <emscripten/stack.h>
@@ -5869,7 +5870,10 @@ class LocalAllocator : public hx::StackContext
    int                   mRegisterBufSize;
 
    #ifndef HXCPP_SINGLE_THREADED_APP
-   bool            mGCFreeZone;
+   volatile bool   mGCFreeZone;
+   // True while our mReadyForCollect event may be set - lets the zone exit
+   // clear it without taking the global state lock
+   bool            mReadySignalled;
    HxSemaphore     mReadyForCollect;
    HxSemaphore     mCollectDone;
    #endif
@@ -5929,6 +5933,7 @@ public:
       #ifndef HXCPP_SINGLE_THREADED_APP
       mGCFreeZone = true;
       mReadyForCollect.Set();
+      mReadySignalled = true;
       #endif
       sGlobalAlloc->AddLocal(this);
    }
@@ -6139,7 +6144,18 @@ public:
       #endif
 
       mGCFreeZone = true;
-      mReadyForCollect.Set();
+      // The collector announces itself by setting gPauseForCollect (a full
+      // atomic op) before it reads mGCFreeZone.  With the store-load fence
+      // here, at least one side observes the other: either the collector
+      // sees us safely in the zone, or we see the pending collection and
+      // signal.  When no collection is pending this skips the kernel-event
+      // call entirely.
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      if (*(volatile int *)&hx::gPauseForCollect)
+      {
+         mReadyForCollect.Set();
+         mReadySignalled = true;
+      }
       #endif
    }
 
@@ -6171,9 +6187,31 @@ public:
       if (!mGCFreeZone)
          CriticalGCError("GCFree Zone mismatch");
 
-      std::lock_guard<std::mutex> lock(*gThreadStateChangeLock);
-      mReadyForCollect.Reset();
+      // Clear any signal we own before leaving the zone, so a collector
+      // that observes us outside it cannot consume a stale event and scan
+      // while we run
+      if (mReadySignalled)
+      {
+         mReadyForCollect.Reset();
+         mReadySignalled = false;
+      }
+
       mGCFreeZone = false;
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      if (*(volatile int *)&hx::gPauseForCollect)
+      {
+         // A collection is pending or running.  The collector either saw us
+         // in the zone (and expects us to stay parked) or is waiting on our
+         // event - re-enter the zone, signal, and queue on the state lock,
+         // which the collector holds until the collect completes.
+         mGCFreeZone = true;
+         mReadyForCollect.Set();
+         mReadySignalled = true;
+         std::lock_guard<std::mutex> lock(*gThreadStateChangeLock);
+         mReadyForCollect.Reset();
+         mReadySignalled = false;
+         mGCFreeZone = false;
+      }
       #endif
    }
         // For when we already hold the lock
@@ -6181,6 +6219,7 @@ public:
    {
       #ifndef HXCPP_SINGLE_THREADED_APP
       mReadyForCollect.Reset();
+      mReadySignalled = false;
       mGCFreeZone = false;
       #endif
    }
