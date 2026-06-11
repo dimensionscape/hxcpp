@@ -5689,6 +5689,9 @@ struct ArrayAccessI : public CppiaDynamicExpr
             ctx->pushInt(i);
 
             AutoStack a(ctx,pointer);
+            // The getter was linked and validated but never invoked, so
+            // setResult read the raw argument frame back as the "result"
+            __get.execute(ctx);
             BCR_VCHECK;
             setResult(ctx,outValue);
          }
@@ -7907,7 +7910,9 @@ CppiaExpr *createCppiaExpr(CppiaStream &stream)
    else if (tok=="s")
       result = new StringVal(stream.getInt());
    else if (tok=="f")
-      result = new DataVal<Float>(atof( stream.module->strings[stream.getInt()].out_str() ));
+      // Locale-independent - a host setlocale must not change how cppia
+      // float constants parse
+      result = new DataVal<Float>(_hx_strtod_c_locale( stream.module->strings[stream.getInt()].out_str() ));
    else if (tok=="i")
       result = new DataVal<int>(stream.getInt());
    else if (tok=="POSINFO")

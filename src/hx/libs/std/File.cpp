@@ -365,6 +365,23 @@ void _hx_std_file_flush( Dynamic handle )
    file_contents : f:string -> string
    <doc>Read the content of the file [f] and return it.</doc>
 **/
+
+// 64-bit file length - plain ftell is 32-bit on Windows and the int cast
+// silently wrapped huge files elsewhere, returning truncated content with
+// no error.  Returns -1 on failure.
+static long long file_length64(FILE *file)
+{
+#ifdef NEKO_WINDOWS
+   if (_fseeki64(file,0,SEEK_END))
+      return -1;
+   return _ftelli64(file);
+#else
+   if (fseeko(file,0,SEEK_END))
+      return -1;
+   return ftello(file);
+#endif
+}
+
 String _hx_std_file_contents_string( String name )
 {
    std::vector<char> buffer;
@@ -380,10 +397,13 @@ String _hx_std_file_contents_string( String name )
    if(!file)
       file_error("file_contents",name);
 
-   fseek(file,0,SEEK_END);
-   int len = ftell(file);
-   if (len<0)
-      file_error("file_ftell",name);
+   long long len64 = file_length64(file);
+   if (len64<0 || len64>0x7ffffff0)
+   {
+      fclose(file);
+      file_error(len64<0 ? "file_ftell" : "file_too_large",name);
+   }
+   int len = (int)len64;
    if (len==0)
    {
       fclose(file);
@@ -432,10 +452,13 @@ Array<unsigned char> _hx_std_file_contents_bytes( String name )
    if(!file)
       file_error("file_contents",name);
 
-   fseek(file,0,SEEK_END);
-   int len = ftell(file);
-   if (len<0)
-      file_error("file_ftell",name);
+   long long len64 = file_length64(file);
+   if (len64<0 || len64>0x7ffffff0)
+   {
+      fclose(file);
+      file_error(len64<0 ? "file_ftell" : "file_too_large",name);
+   }
+   int len = (int)len64;
 
    fseek(file,0,SEEK_SET);
    hx::ExitGCFreeZone();

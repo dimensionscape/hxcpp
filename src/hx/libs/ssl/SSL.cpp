@@ -207,7 +207,7 @@ Dynamic _hx_ssl_new( Dynamic hconf ) {
 	sslctx *ssl = new sslctx();
 	ssl->create();
 	sslconf *conf = val_conf(hconf);
-	if( ret = mbedtls_ssl_setup(ssl->s, conf->c) != 0 ){
+	if( (ret = mbedtls_ssl_setup(ssl->s, conf->c)) != 0 ){
 		ssl->destroy();
 		ssl_error(ret);
 	}
@@ -266,7 +266,7 @@ void _hx_ssl_set_hostname( Dynamic hssl, String hostname ){
 	int ret;
 	sslctx *ssl = val_ssl(hssl);
 	hx::strbuf buf;
-	if( ret = mbedtls_ssl_set_hostname(ssl->s, hostname.utf8_str(&buf)) != 0 )
+	if( (ret = mbedtls_ssl_set_hostname(ssl->s, hostname.utf8_str(&buf))) != 0 )
 		ssl_error(ret);
 }
 
@@ -296,7 +296,16 @@ void _hx_ssl_send_char( Dynamic hssl, int c ) {
 		hx::Throw( HX_CSTRING("invalid char") );
 	sslctx *ssl = val_ssl(hssl);
 	const unsigned char cc = c;
-	mbedtls_ssl_write( ssl->s, &cc, 1 );
+	// Check the result like every other write path - dropping it loses the
+	// byte silently on would-block or error and desyncs the stream
+	POSIX_LABEL(send_char_again);
+	int r = mbedtls_ssl_write( ssl->s, &cc, 1 );
+	if( is_ssl_blocking(r) ) {
+		HANDLE_EINTR(send_char_again);
+		hx::Throw(HX_CSTRING("Blocking"));
+	}
+	if( r <= 0 )
+		hx::Throw( HX_CSTRING("ssl_send_char") );
 }
 
 int _hx_ssl_send( Dynamic hssl, Array<unsigned char> buf, int p, int l ) {
@@ -339,7 +348,14 @@ void _hx_ssl_write( Dynamic hssl, Array<unsigned char> buf ) {
 int _hx_ssl_recv_char( Dynamic hssl ) {
 	sslctx *ssl = val_ssl(hssl);
 	unsigned char cc;
+	// Mirror _hx_ssl_recv - a would-block read is "Blocking", not a fatal
+	// error that the input wrapper turns into a spurious Eof
+	POSIX_LABEL(recv_char_again);
 	int r = mbedtls_ssl_read( ssl->s, &cc, 1 );
+	if( is_ssl_blocking(r) ) {
+		HANDLE_EINTR(recv_char_again);
+		hx::Throw(HX_CSTRING("Blocking"));
+	}
 	if( r <= 0 )
 		hx::Throw( HX_CSTRING("ssl_recv_char") );
 	return (int)cc;
@@ -374,11 +390,13 @@ int _hx_ssl_recv( Dynamic hssl, Array<unsigned char> buf, int p, int l ) {
 Array<unsigned char> _hx_ssl_read( Dynamic hssl ) {
 	sslctx *ssl = val_ssl(hssl);
 	Array<unsigned char> result = Array_obj<unsigned char>::__new();
-	unsigned char buf[256];
+	// One TLS record is up to 16K - draining it through a 256-byte buffer
+	// paid 64 mbedtls calls and 64 array growths per record
+	unsigned char buf[16384];
 
 	while( true ) {
 		POSIX_LABEL(read_again);
-		int len = mbedtls_ssl_read( ssl->s, buf, 256 );
+		int len = mbedtls_ssl_read( ssl->s, buf, sizeof(buf) );
 		if ( is_ssl_blocking(len) ) {
 			HANDLE_EINTR(read_again);
 			hx::Throw(HX_CSTRING("Blocking"));
@@ -445,9 +463,9 @@ Dynamic _hx_ssl_conf_new( bool server ) {
 	int ret;
 	sslconf *conf = new sslconf();
 	conf->create();
-	if( ret = mbedtls_ssl_config_defaults( conf->c,
+	if( (ret = mbedtls_ssl_config_defaults( conf->c,
 		server ? MBEDTLS_SSL_IS_SERVER : MBEDTLS_SSL_IS_CLIENT,
-		MBEDTLS_SSL_TRANSPORT_STREAM, 0 ) != 0 ){
+		MBEDTLS_SSL_TRANSPORT_STREAM, 0 )) != 0 ){
 		conf->destroy();
 		ssl_error( ret );
 	}
@@ -489,7 +507,7 @@ void _hx_ssl_conf_set_cert( Dynamic hconf, Dynamic hcert, Dynamic hpkey ) {
 	sslcert *cert = val_cert(hcert);
 	sslpkey *pkey = val_pkey(hpkey);
 
-	if( r = mbedtls_ssl_conf_own_cert(conf->c, cert->c, pkey->k) != 0 )
+	if( (r = mbedtls_ssl_conf_own_cert(conf->c, cert->c, pkey->k)) != 0 )
 		ssl_error(r);
 }
 
@@ -592,7 +610,7 @@ Dynamic _hx_ssl_cert_load_file( String file ){
 	sslcert *cert = new sslcert();
 	cert->create( NULL );
    hx::strbuf buf;
-	if( r = mbedtls_x509_crt_parse_file(cert->c, file.utf8_str(&buf)) != 0 ){
+	if( (r = mbedtls_x509_crt_parse_file(cert->c, file.utf8_str(&buf))) != 0 ){
 		cert->destroy();
 		ssl_error(r);
 	}
@@ -604,7 +622,7 @@ Dynamic _hx_ssl_cert_load_path( String path ){
 	sslcert *cert = new sslcert();
 	cert->create( NULL );
    hx::strbuf buf;
-	if( r = mbedtls_x509_crt_parse_path(cert->c, path.utf8_str(&buf)) != 0 ){
+	if( (r = mbedtls_x509_crt_parse_path(cert->c, path.utf8_str(&buf))) != 0 ){
 		cert->destroy();
 		ssl_error(r);
 	}
@@ -808,7 +826,7 @@ Array<unsigned char> _hx_ssl_dgst_make( Array<unsigned char> buf, String alg ){
 	int size = mbedtls_md_get_size(md);
 	Array<unsigned char> out = Array_obj<int>::__new(size,size);
 	int r = -1;
-	if( r = mbedtls_md( md, &buf[0], buf->length, &out[0] ) != 0 )
+	if( (r = mbedtls_md( md, &buf[0], buf->length, &out[0] )) != 0 )
 		ssl_error(r);
 
 	return out;
@@ -825,11 +843,11 @@ Array<unsigned char> _hx_ssl_dgst_sign( Array<unsigned char> buf, Dynamic hpkey,
 	if( md == NULL )
 		hx::Throw( HX_CSTRING("Invalid hash algorithm") );
 
-	if( r = mbedtls_md( md, &buf[0], buf->length, hash ) != 0 )
+	if( (r = mbedtls_md( md, &buf[0], buf->length, hash )) != 0 )
 		ssl_error(r);
 
 	Array<unsigned char> result = Array_obj<unsigned char>::__new(MBEDTLS_MPI_MAX_SIZE,MBEDTLS_MPI_MAX_SIZE);
-	if( r = mbedtls_pk_sign( pk->k, mbedtls_md_get_type(md), hash, 0, &result[0], &olen, mbedtls_ctr_drbg_random, &ctr_drbg ) != 0 )
+	if( (r = mbedtls_pk_sign( pk->k, mbedtls_md_get_type(md), hash, 0, &result[0], &olen, mbedtls_ctr_drbg_random, &ctr_drbg )) != 0 )
 		ssl_error(r);
 
 	result[olen] = 0;
@@ -848,10 +866,10 @@ bool _hx_ssl_dgst_verify( Array<unsigned char> buf, Array<unsigned char> sign, D
 	if( md == NULL )
 		hx::Throw( HX_CSTRING("Invalid hash algorithm") );
 
-	if( r = mbedtls_md( md, &buf[0], buf->length, hash ) != 0 )
+	if( (r = mbedtls_md( md, &buf[0], buf->length, hash )) != 0 )
 		ssl_error(r);
 
-	if( r = mbedtls_pk_verify( pk->k, mbedtls_md_get_type(md), hash, 0, &sign[0], sign->length ) != 0 )
+	if( (r = mbedtls_pk_verify( pk->k, mbedtls_md_get_type(md), hash, 0, &sign[0], sign->length )) != 0 )
 		return false;
 
 	return true;

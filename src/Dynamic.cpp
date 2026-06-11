@@ -633,19 +633,21 @@ static bool IsInt(hx::Object *inPtr)
       return false;
    if (TCanCast<IntData>(inPtr))
       return true;
-   DoubleData *d = dynamic_cast<DoubleData *>(inPtr);
-   if (!d)
+   // Cheap virtual type probe instead of RTTI dynamic_cast - this runs for
+   // every Std.isOfType(x, Int)
+   int t = inPtr->__GetType();
+   if (t==vtFloat)
    {
-      Int64Data *i64 = dynamic_cast<Int64Data *>(inPtr);
-      if (i64)
-      {
-         int val = i64->mValue;
-         return val==i64->mValue;
-      }
-      return false;
+      double val = inPtr->__ToDouble();
+      return ((int)val == val);
    }
-   double val = d->__ToDouble();
-   return ((int)val == val);
+   if (t==vtInt64)
+   {
+      cpp::Int64 val64 = inPtr->__ToInt64();
+      int val = (int)val64;
+      return val==val64;
+   }
+   return false;
 }
 
 static Dynamic createEmptyInt64()

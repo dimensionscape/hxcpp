@@ -107,6 +107,13 @@ struct HxCNumericScope { };
 
 #endif
 
+// Locale-independent double parse for other runtime modules (cppia
+// constant loading etc)
+double _hx_strtod_c_locale(const char *inStr)
+{
+   return hxStrtodC(inStr, 0);
+}
+
 namespace hx
 {
 char HX_DOUBLE_PATTERN[20] = "%.15g";

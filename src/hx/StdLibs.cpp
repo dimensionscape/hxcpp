@@ -8,6 +8,7 @@
 #include <io.h>
 #elif defined(__unix__) || defined(__APPLE__)
 #include <sys/time.h>
+#include <unistd.h>
 #ifndef EMSCRIPTEN
 typedef int64_t __int64;
 #endif
@@ -705,12 +706,26 @@ Array<String> __get_args()
 }
 
 
+#ifdef HX_WINDOWS
+// stdout console state - GetConsoleMode is a kernel round-trip, so probing
+// it per print made every println pay a syscall even when redirected.
+// Cached once: a process's stdout handle does not change under us in any
+// supported configuration.
+static bool hxStdoutIsConsole(HANDLE &outHandle)
+{
+   static HANDLE sHandle = GetStdHandle(STD_OUTPUT_HANDLE);
+   static DWORD sMode = 0;
+   static bool sIsConsole = GetConsoleMode(sHandle, &sMode) != 0;
+   outHandle = sHandle;
+   return sIsConsole;
+}
+#endif
+
 void __hxcpp_print_string(const String &inV)
 {
 #ifdef HX_WINDOWS
-   HANDLE handle = GetStdHandle(STD_OUTPUT_HANDLE);
-   DWORD mode;
-   if (GetConsoleMode(handle, &mode) && inV.isUTF16Encoded())
+   HANDLE handle;
+   if (hxStdoutIsConsole(handle) && inV.isUTF16Encoded())
    {
       fflush(stdout);
       WriteConsoleAllW(handle, inV.__WCStr(), inV.length);
@@ -724,9 +739,9 @@ void __hxcpp_print_string(const String &inV)
 void __hxcpp_println_string(const String &inV)
 {
 #ifdef HX_WINDOWS
-   HANDLE handle = GetStdHandle(STD_OUTPUT_HANDLE);
-   DWORD mode;
-   if (GetConsoleMode(handle, &mode) && inV.isUTF16Encoded())
+   HANDLE handle;
+   bool isConsole = hxStdoutIsConsole(handle);
+   if (isConsole && inV.isUTF16Encoded())
    {
       fflush(stdout);
       WriteConsoleAllW(handle, inV.__WCStr(), inV.length);
@@ -737,7 +752,15 @@ void __hxcpp_println_string(const String &inV)
 #endif
    hx::strbuf convertBuf;
    PRINTF("%s\n", inV.out_str(&convertBuf));
-   fflush(stdout);
+   // An interactive console wants the line immediately; for a redirected
+   // stream a forced flush per line is a syscall per println
+#ifdef HX_WINDOWS
+   if (isConsole)
+      fflush(stdout);
+#else
+   if (isatty(1))
+      fflush(stdout);
+#endif
 }
 
 
