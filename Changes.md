@@ -31,6 +31,8 @@
 * Fixed sys.thread.Lock timed waits breaking after ~24.8 days of process uptime on Windows (was built on the 32-bit clock(); now uses the monotonic 64-bit tick count)
 * Reduced marker-thread cache-line contention by skipping redundant row-mark stores during the GC mark phase
 * Fixed a data race in the large-allocation recycle list: the lock-free probe now reads a dedicated counter instead of scanning the vector concurrently with mutation (also fixed a skipped-entry bug when the locked recheck failed)
+* Sped up freeing large allocations on the array/Bytes growth path ~36% in realloc-heavy benchmarks by searching the large-object list from the end, where the just-allocated buffer lives
+* Reduced Dynamic function call overhead at API level 500 (Haxe 5): arguments are written into a pre-sized array instead of pushed one at a time with per-element capacity checks
 
 * Updated mbedtls to 2.28.2
 * Updated sqlite to 3.40.1

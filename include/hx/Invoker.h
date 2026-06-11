@@ -157,10 +157,13 @@ namespace hx
         {
             using unused = int[];
 
-            auto arr = Array_obj<::Dynamic>::__new(0, sizeof...(args));
+            // Pre-sized with init, like the pre-500 fast paths - push pays a
+            // capacity check, length update and write-barrier setup per arg
+            auto arr = Array_obj<::Dynamic>::__new(sizeof...(args), sizeof...(args));
 
+            int idx = 0;
             (void)unused {
-                0, (arr->push(invoker::wrap::toDynamic(args)), 0)...
+                0, (arr->init(idx++, invoker::wrap::toDynamic(args)), 0)...
             };
 
             return obj->__Run(arr);

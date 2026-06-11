@@ -3215,8 +3215,16 @@ public:
          unsigned int size = *blob;
          mLargeListLock.lock();
          mLargeAllocated -= size;
-         // Could somehow keep it in the list, but mark as recycled?
-         mLargeList.qerase_val(blob);
+         // Search from the end - the realloc-growth path frees the buffer it
+         // just allocated, which is the most recently pushed entry, so the
+         // common case finds it immediately instead of scanning the whole
+         // list (qerase does not preserve order, so direction is free)
+         for(int i=mLargeList.size()-1;i>=0;i--)
+            if (mLargeList[i]==blob)
+            {
+               mLargeList.qerase(i);
+               break;
+            }
          // We could maybe free anyhow?
          if (!largeObjectRecycle.hasExtraCapacity(1))
          {
