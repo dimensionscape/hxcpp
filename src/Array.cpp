@@ -883,7 +883,7 @@ namespace cpp
     HX_VARRAY_FUNC(return, ::Dynamic, __unsafe_set, HX_VARRAY_ARG_LIST2(::Dynamic, ::Dynamic), HX_VARRAY_FUNC_LIST2(::Dynamic, ::Dynamic), HX_ARG_LIST2);
     HX_VARRAY_FUNC(, void, blit, HX_VARRAY_ARG_LIST4(int, ::cpp::VirtualArray, int, int), HX_VARRAY_FUNC_LIST4(int, ::cpp::VirtualArray, int, int), HX_ARG_LIST4);
     HX_VARRAY_FUNC(, void, zero, HX_VARRAY_ARG_LIST2(::Dynamic, ::Dynamic), HX_VARRAY_FUNC_LIST2(::Dynamic, ::Dynamic), HX_ARG_LIST2);
-    HX_VARRAY_FUNC(, void, memcmp, HX_VARRAY_ARG_LIST1(::cpp::VirtualArray), HX_VARRAY_FUNC_LIST1(::cpp::VirtualArray), HX_ARG_LIST1);
+    HX_VARRAY_FUNC(return, int, memcmp, HX_VARRAY_ARG_LIST1(::cpp::VirtualArray), HX_VARRAY_FUNC_LIST1(::cpp::VirtualArray), HX_ARG_LIST1);
     HX_VARRAY_FUNC(, void, resize, HX_VARRAY_ARG_LIST1(int), HX_VARRAY_FUNC_LIST1(int), HX_ARG_LIST1);
 
 #else
@@ -949,7 +949,7 @@ DEFINE_VARRAY_FUNC1(return,filter);
 DEFINE_VARRAY_FUNC1(,__SetSize);
 DEFINE_VARRAY_FUNC1(,__SetSizeExact);
 DEFINE_VARRAY_FUNC2(,zero);
-DEFINE_VARRAY_FUNC1(,memcmp);
+DEFINE_VARRAY_FUNC1(return,memcmp);
 DEFINE_VARRAY_FUNC1(return,__unsafe_get);
 DEFINE_VARRAY_FUNC2(return,__unsafe_set);
 DEFINE_VARRAY_FUNC4(,blit);
@@ -1079,7 +1079,9 @@ void VirtualArray_obj::EnsureArrayStorage(ArrayStore inStore)
          break;
 
       case arrayEmpty:
-         EnsureBase();
+         // Nothing to converge on - keep the receiver's storage.  This
+         // used to install EnsureBase's byte array labeled arrayInt,
+         // silently truncating every later int push to 8 bits
          break;
 
       case arrayBool:  EnsureBoolStorage(); break;
@@ -1223,6 +1225,12 @@ void VirtualArray_obj::MakeFloatArray()
 void VirtualArray_obj::CreateEmptyArray(int inLen)
 {
    base = new Array_obj<Dynamic>(inLen,inLen);
+   // The new elements are nulls, which only object storage represents.
+   // Leaving the store empty made the resized array report length 0,
+   // turned pop/shift/copy/concat into no-ops, and rewrote the nulls as
+   // 0/false on the first typed push
+   if (inLen > 0)
+      store = arrayObject;
    HX_OBJ_WB_GET(this,base);
 }
 

@@ -33,6 +33,13 @@ Dynamic _hx_deflate_init(int level)
 **/
 Dynamic _hx_deflate_buffer(Dynamic handle, Array<unsigned char> src, int srcPos, Array<unsigned char> dest, int destPos)
 {
+    // Keep the data buffers' allocation starts visible in this frame: zlib
+    // runs inside a GC free zone holding raw pointers into them, and the
+    // sliced views below are interior pointers, which do not pin a moving
+    // collection.  (The array heads pin only themselves, not their data.)
+    unsigned char * volatile pinSrc = (unsigned char *)src->getBase();
+    unsigned char * volatile pinDst = (unsigned char *)dest->getBase();
+
     auto srcView = View<uint8_t>(src->getBase(), src->length).slice(srcPos);
     auto dstView = View<uint8_t>(dest->getBase(), dest->length).slice(destPos);
     auto result  = handle.StaticCast<Compress>()->execute(srcView, dstView);
@@ -71,21 +78,27 @@ void _hx_zip_set_flush_mode(Dynamic handle, String flushMode)
     {
         flush = Flush::None;
     }
-    if (flushMode == HX_CSTRING("SYNC"))
+    else if (flushMode == HX_CSTRING("SYNC"))
     {
         flush = Flush::Sync;
     }
-    if (flushMode == HX_CSTRING("FULL"))
+    else if (flushMode == HX_CSTRING("FULL"))
     {
         flush = Flush::Full;
     }
-    if (flushMode == HX_CSTRING("FINISH"))
+    else if (flushMode == HX_CSTRING("FINISH"))
     {
         flush = Flush::Finish;
     }
-    if (flushMode == HX_CSTRING("BLOCK"))
+    else if (flushMode == HX_CSTRING("BLOCK"))
     {
         flush = Flush::Block;
+    }
+    else
+    {
+        // Was an uninitialized read; neko/hl throw here too
+        hx::Throw(HX_CSTRING("Bad flush mode : ") + flushMode);
+        return;
     }
 
     handle.StaticCast<Zip>()->setFlushMode(flush);
@@ -108,6 +121,10 @@ Dynamic _hx_inflate_init(Dynamic windowBits)
 **/
 Dynamic _hx_inflate_buffer(Dynamic handle, Array<unsigned char> src, int srcPos, Array<unsigned char> dest, int destPos)
 {
+    // See _hx_deflate_buffer - pin the data buffers for the free-zone call
+    unsigned char * volatile pinSrc = (unsigned char *)src->getBase();
+    unsigned char * volatile pinDst = (unsigned char *)dest->getBase();
+
     auto srcView = View<uint8_t>(src->getBase(), src->length).slice(srcPos);
     auto dstView = View<uint8_t>(dest->getBase(), dest->length).slice(destPos);
     auto result  = handle.StaticCast<Uncompress>()->execute(srcView, dstView);

@@ -3,8 +3,19 @@
 
 #include <memory>
 #include <vector>
+#include <limits>
 
-#define ZLIB_OBJ_CLOSED ::hx::Throw(HX_CSTRING("Compress closed"))
+#define ZLIB_OBJ_CLOSED ::hx::Throw(HX_CSTRING("Uncompress closed"))
+
+// Surface the zlib failure detail (code and msg) instead of a bare
+// "ZLib Error" - msg is valid until deflateEnd/inflateEnd runs
+static void zlibThrow(z_stream *stream, int code)
+{
+	String msg = HX_CSTRING("ZLib Error ") + String(code);
+	if (stream && stream->msg)
+		msg = msg + HX_CSTRING(" (") + String::create(stream->msg) + HX_CSTRING(")");
+	hx::Throw(msg);
+}
 
 hx::zip::Uncompress hx::zip::Uncompress_obj::create(int windowSize)
 {
@@ -13,7 +24,7 @@ hx::zip::Uncompress hx::zip::Uncompress_obj::create(int windowSize)
 
 	if (error != Z_OK)
 	{
-		hx::Throw(HX_CSTRING("ZLib Error"));
+		zlibThrow(handle.get(), error);
 	}
 
 	return new hx::zip::zlib::ZLibUncompress(handle.release());
@@ -26,7 +37,7 @@ Array<uint8_t> hx::zip::Uncompress_obj::run(cpp::marshal::View<uint8_t> src, int
 
 	if (error != Z_OK)
 	{
-		hx::Throw(HX_CSTRING("ZLib Error"));
+		zlibThrow(handle.get(), error);
 	}
 
 	// Release zlib's internal state on every exit, including throws
@@ -36,33 +47,53 @@ Array<uint8_t> hx::zip::Uncompress_obj::run(cpp::marshal::View<uint8_t> src, int
 		~Closer() { inflateEnd(stream); }
 	} closer = { handle.get() };
 
-	auto buffer    = std::vector<uint8_t>(bufferSize);
-	auto output    = Array<uint8_t>(0, 0);
-	auto srcCursor = 0;
+	// Pin the source data for the free-zone inflate calls (the per-chunk
+	// slices below are interior pointers, which do not pin a moving GC)
+	uint8_t * volatile pinSrc = src.ptr;
+
+	// Accumulate in non-GC memory with amortized growth - appending each
+	// chunk to the Array reallocated and copied the whole accumulated
+	// output every iteration (quadratic), and inflate can run against
+	// this buffer inside the free zone without GC concerns
+	auto accumulated = std::vector<uint8_t>();
+	size_t used      = 0;
+	auto srcCursor   = 0;
 
 	while (Z_STREAM_END != error)
 	{
 		auto srcView = src.slice(srcCursor);
 
+		accumulated.resize(used + bufferSize);
+
 		handle->next_in   = srcView.ptr;
-		handle->next_out  = buffer.data();
+		handle->next_out  = accumulated.data() + used;
 		handle->avail_in  = srcView.length;
-		handle->avail_out = buffer.size();
+		handle->avail_out = bufferSize;
 
 		EnterGCFreeZone();
 		error = inflate(handle.get(), Z_SYNC_FLUSH);
 		ExitGCFreeZone();
 
-		if (error < 0)
+		// Z_NEED_DICT (a stream built with a preset dictionary) repeats
+		// forever without consuming input - it must be an error here or
+		// this loop never terminates
+		if (error < 0 || error == Z_NEED_DICT)
 		{
-			hx::Throw(HX_CSTRING("ZLib Error"));
+			zlibThrow(handle.get(), error);
 		}
 
-		output->memcpy(output->length, buffer.data(), buffer.size() - handle->avail_out);
+		used += bufferSize - handle->avail_out;
 
 		srcCursor += srcView.length - handle->avail_in;
 	}
 
+	if (used > (size_t)std::numeric_limits<int32_t>::max())
+	{
+		hx::Throw(HX_CSTRING("Size Error"));
+	}
+
+	auto output = Array<uint8_t>(0, 0);
+	output->memcpy(0, accumulated.data(), (int)used);
 	return output;
 }
 
@@ -87,9 +118,11 @@ hx::zip::Result hx::zip::zlib::ZLibUncompress::execute(cpp::marshal::View<uint8_
 	auto error = inflate(handle, flush);
 	ExitGCFreeZone();
 
-	if (error < 0)
+	// Z_NEED_DICT repeats forever without consuming input - surfacing it
+	// as an error stops the haxe.zip streaming loop from spinning
+	if (error < 0 || error == Z_NEED_DICT)
 	{
-		hx::Throw(HX_CSTRING("ZLib Error"));
+		zlibThrow(handle, error);
 	}
 
 	// Per-call counts - total_in/total_out are cumulative across the whole

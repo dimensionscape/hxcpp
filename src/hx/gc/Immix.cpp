@@ -62,6 +62,7 @@ enum { gAlwaysMove = false };
 #endif
 
 #include <vector>
+#include <utility>
 #include <stdio.h>
 
 #include <hx/QuickVec.h>
@@ -2669,40 +2670,49 @@ void RunFinalizers()
          idx++;
    }
 
+   // Unregister dead entries before invoking their callbacks: a finalizer
+   // that itself calls val_gc/_hx_set_finalizer(obj,0) (eg, a close()
+   // shared with the manual-cleanup path) erases the node the loop is
+   // holding, and one that registers a new finalizer can rehash the map -
+   // either invalidates the iterators mid-walk
+   static std::vector< std::pair<hx::Object *,hx::finalizer> > sRunNativeFinalizers;
+   sRunNativeFinalizers.clear();
    for(FinalizerMap::iterator i=sFinalizerMap.begin(); i!=sFinalizerMap.end(); )
    {
       hx::Object *obj = i->first;
-      FinalizerMap::iterator next = i;
-      ++next;
-
       unsigned char mark = ((unsigned char *)obj)[HX_ENDIAN_MARK_ID_BYTE];
       if ( mark!=gByteMarkID )
       {
          finalizerCount++;
-         (*i->second)(obj);
-         sFinalizerMap.erase(i);
+         sRunNativeFinalizers.push_back( std::make_pair(obj, i->second) );
+         i = sFinalizerMap.erase(i);
       }
-
-      i = next;
+      else
+         ++i;
    }
+   for(size_t run=0; run<sRunNativeFinalizers.size(); run++)
+      (*sRunNativeFinalizers[run].second)(sRunNativeFinalizers[run].first);
+   sRunNativeFinalizers.clear();
 
 
+   static std::vector< std::pair<hx::Object *,HaxeFinalizer> > sRunHaxeFinalizers;
+   sRunHaxeFinalizers.clear();
    for(HaxeFinalizerMap::iterator i=sHaxeFinalizerMap.begin(); i!=sHaxeFinalizerMap.end(); )
    {
       hx::Object *obj = i->first;
-      HaxeFinalizerMap::iterator next = i;
-      ++next;
-
       unsigned char mark = ((unsigned char *)obj)[HX_ENDIAN_MARK_ID_BYTE];
       if ( mark!=gByteMarkID )
       {
          finalizerCount++;
-         (*i->second)(obj);
-         sHaxeFinalizerMap.erase(i);
+         sRunHaxeFinalizers.push_back( std::make_pair(obj, i->second) );
+         i = sHaxeFinalizerMap.erase(i);
       }
-
-      i = next;
+      else
+         ++i;
    }
+   for(size_t run=0; run<sRunHaxeFinalizers.size(); run++)
+      (*sRunHaxeFinalizers[run].second)(sRunHaxeFinalizers[run].first);
+   sRunHaxeFinalizers.clear();
 
    MEM_STAMP(hx::tFinalizers);
 
