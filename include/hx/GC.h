@@ -301,12 +301,17 @@ namespace hx
 
 // Indicates that __Mark must be called recursively
 #define IMMIX_ALLOC_IS_CONTAINER   0x00800000
+// String allocation reserved 4 bytes after the terminator for a memoized hash
+#define HX_GC_STRING_HASH_SLOT     0x00400000
 // String is char16_t type
 #define HX_GC_STRING_CHAR16_T      0x00200000
 // String has hash data at end
 #define HX_GC_STRING_HASH          0x00100000
 
 #define HX_GC_STRING_HASH_BIT      0x10
+#define HX_GC_STRING_HASH_SLOT_BIT 0x40
+// Shorter strings hash quickly anyway - not worth 4 bytes each
+#define HX_GC_STRING_HASH_SLOT_MIN_LEN 8
 
 #ifdef HXCPP_BIG_ENDIAN
    #define HX_GC_STRING_HASH_OFFSET        -3

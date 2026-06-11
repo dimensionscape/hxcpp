@@ -393,8 +393,10 @@ char *TConvertToUTF8(const char16_t *inStr, int *ioLen, hx::IStringAlloc *inBuff
 
 char16_t *String::allocChar16Ptr(int len)
 {
-   char16_t *result = (char16_t *)hx::InternalNew( (len+1)*2, false );
-   ((unsigned int *)result)[-1] |= HX_GC_STRING_CHAR16_T;
+   // See NewString - reserve a memoized-hash slot for longer strings
+   bool hashSlot = len >= HX_GC_STRING_HASH_SLOT_MIN_LEN;
+   char16_t *result = (char16_t *)hx::InternalNew( (len+1)*2 + (hashSlot ? 4 : 0), false );
+   ((unsigned int *)result)[-1] |= HX_GC_STRING_CHAR16_T | (hashSlot ? HX_GC_STRING_HASH_SLOT : 0);
    result[len] = 0;
    return result;
 }
@@ -1080,39 +1082,57 @@ void String::fromPointer(const void *p)
     result = result*223 + (int)(X)
 #endif
 
+#ifdef HX_SMART_STRINGS
+// Hash the utf8 encoding of the DECODED code points.  Hashing raw utf16
+// units encodes a surrogate pair as six virtual bytes where the real utf8
+// (and therefore the compile-time literal hashes and the narrow-string byte
+// hashes) has four - making equal strings hash differently.  Lone
+// surrogates hash as U+FFFD, matching the conversion routines.
+static unsigned int HashUtf16Range(const char16_t *ptr, const char16_t *end)
+{
+   unsigned int result = 0;
+   while(ptr<end)
+   {
+      int c = *ptr++;
+      if (IsUtf16HighSurrogate(c) && ptr<end && IsUtf16LowSurrogate(*ptr))
+         c = 0x10000 + ( ((c-0xd800)<<10) | ((*ptr++) - 0xdc00) );
+      else if (IsUtf16Surrogate(c))
+         c = 0xFFFD;
+
+      if( c <= 0x7F )
+      {
+         ADD_HASH(c);
+      }
+      else if( c <= 0x7FF )
+      {
+         ADD_HASH(0xC0 | (c >> 6));
+         ADD_HASH(0x80 | (c & 63));
+      }
+      else if( c <= 0xFFFF )
+      {
+         ADD_HASH(0xE0 | (c >> 12));
+         ADD_HASH(0x80 | ((c >> 6) & 63));
+         ADD_HASH(0x80 | (c & 63));
+      }
+      else
+      {
+         ADD_HASH(0xF0 | (c >> 18));
+         ADD_HASH(0x80 | ((c >> 12) & 63));
+         ADD_HASH(0x80 | ((c >> 6) & 63) );
+         ADD_HASH(0x80 | (c & 63) );
+      }
+   }
+   return result;
+}
+#endif
+
 unsigned int String::calcSubHash(int start, int inLen) const
 {
    unsigned int result = 0;
    #ifdef HX_SMART_STRINGS
    if (isUTF16Encoded())
    {
-      const char16_t *w = __w + start;
-      for(int i=0;i<inLen;i++)
-      {
-         int c = w[i];
-         if( c <= 0x7F )
-         {
-            ADD_HASH(c);
-         }
-         else if( c <= 0x7FF )
-         {
-            ADD_HASH(0xC0 | (c >> 6));
-            ADD_HASH(0x80 | (c & 63));
-         }
-         else if( c <= 0xFFFF )
-         {
-            ADD_HASH(0xE0 | (c >> 12));
-            ADD_HASH(0x80 | ((c >> 6) & 63));
-            ADD_HASH(0x80 | (c & 63));
-         }
-         else
-         {
-            ADD_HASH(0xF0 | (c >> 18));
-            ADD_HASH(0x80 | ((c >> 12) & 63));
-            ADD_HASH(0x80 | ((c >> 6) & 63) );
-            ADD_HASH(0x80 | (c & 63) );
-         }
-      }
+      return HashUtf16Range(__w + start, __w + start + inLen);
    }
    else
    #endif
@@ -1132,32 +1152,7 @@ unsigned int String::calcHash() const
    #ifdef HX_SMART_STRINGS
    if (isUTF16Encoded())
    {
-      for(int i=0;i<length;i++)
-      {
-         int c = __w[i];
-         if( c <= 0x7F )
-         {
-            ADD_HASH(c);
-         }
-         else if( c <= 0x7FF )
-         {
-            ADD_HASH(0xC0 | (c >> 6));
-            ADD_HASH(0x80 | (c & 63));
-         }
-         else if( c <= 0xFFFF )
-         {
-            ADD_HASH(0xE0 | (c >> 12));
-            ADD_HASH(0x80 | ((c >> 6) & 63));
-            ADD_HASH(0x80 | (c & 63));
-         }
-         else
-         {
-            ADD_HASH(0xF0 | (c >> 18));
-            ADD_HASH(0x80 | ((c >> 12) & 63));
-            ADD_HASH(0x80 | ((c >> 6) & 63) );
-            ADD_HASH(0x80 | (c & 63) );
-         }
-      }
+      return HashUtf16Range(__w, __w + length);
    }
    else
    #endif
@@ -1804,11 +1799,6 @@ void __hxcpp_bytes_of_string(Array<unsigned char> &outBytes,const String &inStri
 #ifdef HX_SMART_STRINGS
 String _hx_utf8_to_utf16(const unsigned char *ptr, int inUtf8Len, bool addHash)
 {
-   unsigned int hash = 0;
-   if (addHash)
-      for(int i=0;i<inUtf8Len;i++)
-         hash = hash*223 + ptr[i];
-
    int char16Count = 0;
    const unsigned char *u = ptr;
    const unsigned char *end = ptr + inUtf8Len;
@@ -1818,8 +1808,14 @@ String _hx_utf8_to_utf16(const unsigned char *ptr, int inUtf8Len, bool addHash)
       char16Count += UTF16BytesCheck(code);
    }
 
+   // Reserve a slot and let String::hash() memoize lazily.  The old eager
+   // bake hashed the raw utf8 input, which could differ from the hash of
+   // the decoded content (invalid sequences become U+FFFD), and stored it
+   // at an address the reader did not use for wide strings - equal strings
+   // then hashed differently and missed each other in string maps.
+   bool hashSlot = addHash || char16Count >= HX_GC_STRING_HASH_SLOT_MIN_LEN;
    int allocSize = 2*(char16Count+1);
-   if (addHash)
+   if (hashSlot)
       allocSize += sizeof(int);
    char16_t *str = (char16_t *)NewGCPrivate(0,allocSize);
 
@@ -1830,17 +1826,7 @@ String _hx_utf8_to_utf16(const unsigned char *ptr, int inUtf8Len, bool addHash)
       int code = DecodeAdvanceUTF8(u,end);
       Char16AdvanceSet(o,code);
    }
-   if (addHash)
-   {
-      #ifdef EMSCRIPTEN
-         *((emscripten_align1_int *)(str+char16Count+1) ) = hash;
-      #else
-         *((unsigned int *)(str+char16Count+1) ) = hash;
-      #endif
-      ((unsigned int *)(str))[-1] |= HX_GC_STRING_HASH | HX_GC_STRING_CHAR16_T;
-   }
-   else
-      ((unsigned int *)(str))[-1] |= HX_GC_STRING_CHAR16_T;
+   ((unsigned int *)(str))[-1] |= HX_GC_STRING_CHAR16_T | (hashSlot ? HX_GC_STRING_HASH_SLOT : 0);
 
    return String(str, char16Count);
 }

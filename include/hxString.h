@@ -6,6 +6,7 @@
 #endif
 
 #include <hx/StringAlloc.h>
+#include <atomic>
 
 #ifdef __OBJC__
 #import <Foundation/Foundation.h>
@@ -219,6 +220,18 @@ public:
          return __w[index];
       return __s[index];
    }
+   // For GC (non-const) strings the memoized hash lives after the
+   // terminator - note the offset is in BYTES, so wide strings store it
+   // past their final two-byte NUL
+   inline unsigned int *endHashSlot() const
+   {
+      #ifdef HX_SMART_STRINGS
+      if (!isAsciiEncodedQ())
+         return (unsigned int *)(__s + (length<<1) + 2);
+      #endif
+      return (unsigned int *)(__s + length + 1);
+   }
+
    inline unsigned int hash( ) const
    {
       if (!__s) return 0;
@@ -228,7 +241,7 @@ public:
          unsigned int result = calcHash();
 
          unsigned int have = (((unsigned int *)__s)[-1] & HX_GC_CONST_ALLOC_BIT) ?
-                ((unsigned int *)__s)[-2] :  *((unsigned int *)(__s+length+1) );
+                ((unsigned int *)__s)[-2] :  *endHashSlot();
 
          if ( have != result )
          {
@@ -246,15 +259,36 @@ public:
             return  ((unsigned int *)__s)[-2];
             #endif
          }
+         // The cached value was published with a release fence before the
+         // hash bit - pair it with an acquire so the value is seen too
+         std::atomic_thread_fence(std::memory_order_acquire);
         #ifdef EMSCRIPTEN
-           return *((emscripten_align1_int *)(__s+length+1) );
+           return *((emscripten_align1_int *)endHashSlot());
         #else
-           return *((unsigned int *)(__s+length+1) );
+           return *endHashSlot();
         #endif
       }
 
       // Slow path..
-      return calcHash();
+      unsigned int result = calcHash();
+
+      // Memoize when the allocation reserved a slot (GC strings only -
+      // the bit cannot appear on const data, which uses [-2] instead)
+      if ( (__s[HX_GC_STRING_HASH_OFFSET] & HX_GC_STRING_HASH_SLOT_BIT) &&
+           !(__s[HX_GC_CONST_ALLOC_MARK_OFFSET] & HX_GC_CONST_ALLOC_MARK_BIT) )
+      {
+         #ifdef EMSCRIPTEN
+         *((emscripten_align1_int *)endHashSlot()) = result;
+         #else
+         *endHashSlot() = result;
+         #endif
+         // Publish the value before the flag.  The flag is set with a byte
+         // store, so it cannot stomp the GC mark byte in the same header
+         // word; concurrent memoizers write identical values.
+         std::atomic_thread_fence(std::memory_order_release);
+         const_cast<char *>(__s)[HX_GC_STRING_HASH_OFFSET] |= HX_GC_STRING_HASH_BIT;
+      }
+      return result;
    }
 
    unsigned int calcHash() const;
