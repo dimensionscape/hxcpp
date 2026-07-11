@@ -26,7 +26,6 @@
 * Sped up String.split with a memchr candidate scan instead of a libc compare per byte position (~15-20% on byte strings including the per-part allocation, much more on the raw scan), added a first-unit skip to the wide-string path, and fixed delimiters containing NUL falsely matching any NUL in the subject
 * Sped up haxe.io.Bytes.ofString ~25% for non-ASCII strings by sizing the output once and encoding directly into the buffer instead of pushing per byte
 * Reduced GC pause time for programs holding many large (4KB+) allocations: conservative stack marking now rejects out-of-range candidates against cached bounds instead of scanning the whole large-object list per stack word, and the last-value dedupe in the conservative marker actually works now
-* Enabled the PCRE2 JIT for EReg: 3.7-6.2x faster matching/search/replace in benchmarks. The JIT was compiled in as a disabled stub and never invoked. Falls back to the interpreter automatically where executable memory is unavailable; disabled at build time on iOS/tvOS/watchOS/emscripten/WinRT, opt out anywhere with -D HXCPP_PCRE_NO_JIT
 * Sped up indexOf/lastIndexOf on UTF-16 (non-ASCII) strings 2-3.5x with first-unit candidate skipping, and made searching a byte string for an unmatchable wide needle O(1) instead of a full scan
 * Fixed sys.thread.Lock timed waits breaking after ~24.8 days of process uptime on Windows (was built on the 32-bit clock(); now uses the monotonic 64-bit tick count)
 * Reduced marker-thread cache-line contention by skipping redundant row-mark stores during the GC mark phase
