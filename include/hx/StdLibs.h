@@ -989,6 +989,7 @@ void _hx_ssl_set_socket( Dynamic hssl, Dynamic hsocket );
 void _hx_ssl_set_hostname( Dynamic hssl, String hostname );
 Dynamic _hx_ssl_get_peer_certificate( Dynamic hssl );
 bool _hx_ssl_get_verify_result( Dynamic hssl );
+String _hx_ssl_get_alpn( Dynamic hssl );
 void _hx_ssl_send_char( Dynamic hssl, int v );
 int _hx_ssl_send( Dynamic hssl, Array<unsigned char> buf, int p, int l );
 void _hx_ssl_write( Dynamic hssl, Array<unsigned char> buf );
@@ -1000,6 +1001,7 @@ void _hx_ssl_conf_close( Dynamic hconf );
 void _hx_ssl_conf_set_ca( Dynamic hconf, Dynamic hcert );
 void _hx_ssl_conf_set_verify( Dynamic hconf, int mode );
 void _hx_ssl_conf_set_cert( Dynamic hconf, Dynamic hcert, Dynamic hpkey );
+void _hx_ssl_conf_set_alpn( Dynamic hconf, Array<String> protos );
 #if (HXCPP_API_LEVEL>=500)
 void _hx_ssl_conf_set_servername_callback(Dynamic hconf, ::hx::Callable<::Dynamic(::String)> obj);
 #else

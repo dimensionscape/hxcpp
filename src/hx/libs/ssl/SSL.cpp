@@ -76,16 +76,31 @@ struct sslctx : public hx::Object
 	String toString() HXCPP_OVERRIDE { return HX_CSTRING("sslctx"); }
 };
 
+// mbedtls_ssl_conf_alpn_protocols() stores the list by reference
+// (conf->alpn_list = protos) and mbedtls_ssl_config_free() only zeroizes the
+// struct, so the array and every string in it have to outlive the config.
+// sslconf owns them and releases them here.
+static void free_alpn_list( char **list )
+{
+	if( !list )
+		return;
+	for( int i = 0; list[i]; i++ )
+		free( list[i] );
+	free( list );
+}
+
 struct sslconf : public hx::Object
 {
    HX_IS_INSTANCE_OF enum { _hx_ClassId = hx::clsIdSslConf };
 
 	mbedtls_ssl_config *c;
+	char **alpn;
 
 	void create()
 	{
 		c = (mbedtls_ssl_config *)malloc(sizeof(mbedtls_ssl_config));
 		mbedtls_ssl_config_init(c);
+		alpn = 0;
 		_hx_set_finalizer(this, finalize);
 	}
 
@@ -97,6 +112,10 @@ struct sslconf : public hx::Object
 			free(c);
 			c = 0;
 		}
+		// Idempotent: destroy() runs again from the finalizer after an
+		// explicit _hx_ssl_conf_close().
+		free_alpn_list( alpn );
+		alpn = 0;
 	}
 
 	static void finalize(Dynamic obj)
@@ -278,6 +297,27 @@ Dynamic _hx_ssl_get_peer_certificate( Dynamic hssl ){
 	sslcert *cert = new sslcert();
 	cert->create( crt );
 	return cert;
+}
+
+String _hx_ssl_get_alpn( Dynamic hssl ){
+	sslctx *ssl = val_ssl(hssl);
+#if defined(MBEDTLS_SSL_ALPN)
+	// Points into the config's alpn_list, so copy it out rather than wrap it.
+	const char *proto = mbedtls_ssl_get_alpn_protocol( ssl->s );
+	if( proto == NULL )
+		return null();
+
+	// RFC 7301 protocol names are ASCII, so a byte-by-byte widen is exact
+	// whether HX_CHAR is char or char16_t.
+	int len = (int)strlen( proto );
+	HX_CHAR *result = hx::NewString( len );
+	for( int i = 0; i < len; i++ )
+		result[i] = (unsigned char)proto[i];
+	result[len] = 0;
+	return String( result, len );
+#else
+	return null();
+#endif
 }
 
 bool _hx_ssl_get_verify_result( Dynamic hssl ){
@@ -491,6 +531,63 @@ void _hx_ssl_conf_set_cert( Dynamic hconf, Dynamic hcert, Dynamic hpkey ) {
 
 	if( r = mbedtls_ssl_conf_own_cert(conf->c, cert->c, pkey->k) != 0 )
 		ssl_error(r);
+}
+
+void _hx_ssl_conf_set_alpn( Dynamic hconf, Array<String> protos ) {
+	sslconf *conf = val_conf(hconf);
+#if defined(MBEDTLS_SSL_ALPN)
+	// Held until the new list is installed so a failure part way through leaves
+	// the config on the list it already had rather than on freed memory.
+	char **previous = conf->alpn;
+
+	if( protos == null() || protos->length == 0 ){
+		// mbedtls_ssl_conf_alpn_protocols() walks *protos before testing protos,
+		// so passing NULL to clear the list segfaults. Assigning the field is the
+		// supported way off: the handshake guards on alpn_list == NULL.
+		conf->alpn = 0;
+		conf->c->alpn_list = NULL;
+		free_alpn_list( previous );
+		return;
+	}
+
+	int n = protos->length;
+	// mbedtls walks the list until it reads a NULL, hence the terminator slot.
+	char **list = (char **)calloc( n + 1, sizeof(char *) );
+	if( !list )
+		hx::Throw( HX_CSTRING("Out of memory") );
+
+	for( int i = 0; i < n; i++ ){
+		String proto = protos[i];
+		if( proto == null() ){
+			free_alpn_list( list );
+			hx::Throw( HX_CSTRING("null ALPN protocol") );
+		}
+		// Scoped per iteration: the pointer is only valid while buf is alive.
+		hx::strbuf buf;
+		const char *utf8 = proto.utf8_str( &buf );
+		size_t plen = strlen( utf8 );
+		list[i] = (char *)malloc( plen + 1 );
+		if( !list[i] ){
+			free_alpn_list( list );
+			hx::Throw( HX_CSTRING("Out of memory") );
+		}
+		memcpy( list[i], utf8, plen + 1 );
+	}
+
+	// Rejects empty names, names over MBEDTLS_SSL_MAX_ALPN_NAME_LEN, and lists
+	// over MBEDTLS_SSL_MAX_ALPN_LIST_LEN. On failure it has not stored the
+	// pointer, so the list is still ours to free.
+	int ret = mbedtls_ssl_conf_alpn_protocols( conf->c, (const char **)list );
+	if( ret != 0 ){
+		free_alpn_list( list );
+		ssl_error( ret );
+	}
+
+	conf->alpn = list;
+	free_alpn_list( previous );
+#else
+	hx::Throw( HX_CSTRING("ALPN not supported: mbedtls built without MBEDTLS_SSL_ALPN") );
+#endif
 }
 
 static int sni_callback( void *arg, mbedtls_ssl_context *ctx, const unsigned char *name, size_t len ){
