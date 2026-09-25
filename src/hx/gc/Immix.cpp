@@ -3170,6 +3170,13 @@ public:
          {
             LocalAllocator *result = mLocalPool[p];
             mLocalPool[p] = 0;
+            // Drop the range its last thread was allocating from. Until
+            //  AttachThread adds it to mLocalAllocs, this allocator is in
+            //  neither that list nor the pool, so a collection in between
+            //  resets neither it nor the block it points into - it reclaims
+            //  that block's free rows for other threads, while this one goes
+            //  on allocating from the same rows.
+            ClearPooledAlloc(result);
             return result;
          }
       }
