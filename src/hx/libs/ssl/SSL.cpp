@@ -20,6 +20,14 @@ typedef int SOCKET;
 
 typedef size_t socket_int;
 
+// As std's Socket.cpp sends: a write to a peer that has gone raises SIGPIPE
+// on Linux, whose default is to end the process, where it should fail with
+// EPIPE. macOS has no MSG_NOSIGNAL and std sets SO_NOSIGPIPE on the socket
+// instead; Windows raises no signal.
+#if !defined(MSG_NOSIGNAL)
+#define MSG_NOSIGNAL 0
+#endif
+
 #define SOCKET_ERROR (-1)
 #define NRETRYS	20
 
@@ -249,7 +257,7 @@ int net_read( void *fd, unsigned char *buf, size_t len ){
 
 int net_write( void *fd, const unsigned char *buf, size_t len ){
 	hx::EnterGCFreeZone();
-	int r = send((SOCKET)(socket_int)fd, (char *)buf, len, 0);
+	int r = send((SOCKET)(socket_int)fd, (char *)buf, len, MSG_NOSIGNAL);
 	if( r == SOCKET_ERROR && is_block_error() )
  		r = MBEDTLS_ERR_SSL_WANT_WRITE;
 	hx::ExitGCFreeZone();
