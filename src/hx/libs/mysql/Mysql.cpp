@@ -482,7 +482,15 @@ Dynamic _hx_mysql_request(Dynamic handle,String req)
 {
    Connection *connection = getConnection(handle);
 
-   if( mysql_real_query(connection->m,req.utf8_str(),req.length) != 0 )
+   // The length of the UTF-8 bytes, not of the string. req.length counts
+   // UTF-16 units, so every extra byte of a non-ASCII character anywhere in
+   // the query cut one byte off its end: an UPDATE naming a city with an
+   // umlaut and ending WHERE id = 12 reached the server as WHERE id = 1.
+   hx::strbuf sqlBuffer;
+   int sqlBytes = 0;
+   const char *sql = req.utf8_str(&sqlBuffer,true,&sqlBytes);
+
+   if( mysql_real_query(connection->m,sql,sqlBytes) != 0 )
       error(connection->m,req);
 
    MYSQL_RES *res = mysql_store_result(connection->m);
@@ -513,10 +521,16 @@ struct AutoBuf
 String  _hx_mysql_escape(Dynamic handle,String str)
 {
    Connection *connection = getConnection(handle);
-   int len = str.length * 2 + 1;
+   // Sized and escaped by UTF-8 bytes, as the query is sent: a length in
+   // UTF-16 units escaped only the first str.length bytes of the value and
+   // left a buffer too small for the rest.
+   hx::strbuf inBuffer;
+   int inBytes = 0;
+   const char *in = str.utf8_str(&inBuffer,true,&inBytes);
+   int len = inBytes * 2 + 1;
    AutoBuf sout(len);
 
-   int finalLen = mysql_real_escape_string(connection->m,sout.buffer,str.utf8_str(),str.length);
+   int finalLen = mysql_real_escape_string(connection->m,sout.buffer,in,inBytes);
    if( finalLen < 0 )
       hx::Throw( HX_CSTRING("Unsupported charset : ") + String(mysql_character_set_name(connection->m)) );
 
