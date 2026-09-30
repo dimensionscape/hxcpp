@@ -236,7 +236,7 @@ static Dynamic date_value( const char *s )
    double fraction = 0;
    const char *dot = strchr(s,'.');
    if( dot )
-      fraction = atof(dot);
+      fraction = _hx_strtod_c_locale(dot);
 
    double seconds = (double)days_from_civil(y,mo,d) * 86400.0 + h * 3600.0 + mi * 60.0 + sec + fraction;
    return gDateFromSeconds.call(seconds);
@@ -262,7 +262,9 @@ static Dynamic convert_value( CONV conv, const char *s, unsigned long length )
       case CONV_BOOL:
          return *s != '0';
       case CONV_FLOAT:
-         return atof(s);
+         // In the C locale whatever the process's is: the server writes a
+         // point, and atof under a locale with a decimal comma read 1.5 as 1.
+         return _hx_strtod_c_locale(s);
       case CONV_BINARY:
          {
             Array<unsigned char> buf = Array_obj<unsigned char>::__new((int)length,(int)length);
@@ -462,7 +464,7 @@ Float   _hx_mysql_result_get_float(Dynamic handle,int n)
    }
 
    const char *s = r->current[n];
-   return s?atof(s):0;
+   return s?_hx_strtod_c_locale(s):0;
 }
 
 static CONV convert_type( enum enum_field_types t, int flags, unsigned int length, int charset ) {
