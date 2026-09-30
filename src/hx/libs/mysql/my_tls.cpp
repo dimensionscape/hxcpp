@@ -13,6 +13,7 @@
  * no collected memory: the MYSQL structure and its options are malloc'd.
  */
 #include <hxcpp.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include "my_proto.h"
