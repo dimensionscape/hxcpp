@@ -91,6 +91,7 @@ static void myp_read_eof( MYSQL *m, MYSQL_PACKET *p ) {
 }
 
 static void io_failure( MYSQL *m, const char *what, int reading );
+static int myp_drain( MYSQL *m );
 
 static int myp_ok( MYSQL *m, int allow_others ) {
 	int code;
@@ -611,7 +612,7 @@ void mysql_set_keepalive( MYSQL *m, int on, int idle, int interval, int count ) 
 int mysql_ping( MYSQL *m ) {
 	MYSQL_PACKET *p = &m->packet;
 	int pcount = 0;
-	if( not_connected(m) )
+	if( not_connected(m) || !myp_drain(m) )
 		return -1;
 	myp_begin_packet(p,0);
 	myp_write_byte(p,COM_PING);
@@ -637,7 +638,7 @@ unsigned int mysql_thread_id( MYSQL *m ) {
 int mysql_select_db( MYSQL *m, const char *dbname ) {
 	MYSQL_PACKET *p = &m->packet;
 	int pcount = 0;
-	if( not_connected(m) )
+	if( not_connected(m) || !myp_drain(m) )
 		return -1;
 	myp_begin_packet(p,0);
 	myp_write_byte(p,COM_INIT_DB);
@@ -655,7 +656,7 @@ int mysql_real_query( MYSQL *m, const char *query, int qlength ) {
 	int pcount = 0;
 	m->errcode = 0;
 	strcpy(m->sqlstate,"00000");
-	if( not_connected(m) )
+	if( not_connected(m) || !myp_drain(m) )
 		return -1;
 	myp_begin_packet(p,0);
 	myp_write_byte(p,COM_QUERY);
@@ -673,7 +674,8 @@ int mysql_real_query( MYSQL *m, const char *query, int qlength ) {
 	return 0;
 }
 
-static int do_store( MYSQL *m, MYSQL_RES *r ) {
+// The field definitions after a result's header, and the EOF after them.
+static int read_fields( MYSQL *m, MYSQL_RES *r ) {
 	int i;
 	MYSQL_PACKET *p = &m->packet;
 	p->pos = 0;
@@ -710,6 +712,39 @@ static int do_store( MYSQL *m, MYSQL_RES *r ) {
 	if( myp_read_byte(p) != 0xFE || p->size >= 9 )
 		return 0;
 	myp_read_eof(m,p);
+	return 1;
+}
+
+// The row in the packet buffer, each value NUL-terminated in place.
+static void parse_row( MYSQL_PACKET *p, int nfields, MYSQL_ROW_DATA *current ) {
+	int i;
+	int prev = 0;
+	p->pos = 0;
+	for(i=0;i<nfields;i++) {
+		int l = myp_read_bin(p);
+		if( !p->error )
+			p->buf[prev] = 0;
+		if( l == -1 ) {
+			current->lengths[i] = 0;
+			current->datas[i] = NULL;
+		} else {
+			if( p->pos + l > p->size ) {
+				p->error = 1;
+				l = 0;
+			}
+			current->lengths[i] = l;
+			current->datas[i] = p->buf + p->pos;
+			p->pos += l;
+		}
+		prev = p->pos;
+	}
+	if( !p->error )
+		p->buf[prev] = 0;
+}
+
+// Rows until the EOF that ends them, each packet kept as its row's storage.
+static int store_rows( MYSQL *m, MYSQL_RES *r ) {
+	MYSQL_PACKET *p = &m->packet;
 	// reset packet buffer (to prevent to store large buffer in row data)
 	free(p->buf);
 	p->buf = NULL;
@@ -740,26 +775,10 @@ static int do_store( MYSQL *m, MYSQL_RES *r ) {
 		// read row fields
 		{
 			MYSQL_ROW_DATA *current = r->rows + r->row_count++;
-			int prev = 0;			
 			current->raw = p->buf;
 			current->lengths = (unsigned long*)malloc(sizeof(unsigned long) * r->nfields);
 			current->datas = (char**)malloc(sizeof(char*) * r->nfields);
-			for(i=0;i<r->nfields;i++) {
-				int l = myp_read_bin(p);
-				if( !p->error )
-					p->buf[prev] = 0;
-				if( l == -1 ) {
-					current->lengths[i] = 0;
-					current->datas[i] = NULL;
-				} else {
-					current->lengths[i] = l;
-					current->datas[i] = p->buf + p->pos;
-					p->pos += l;
-				}
-				prev = p->pos;
-			}
-			if( !p->error )
-				p->buf[prev] = 0;
+			parse_row(p,r->nfields,current);
 		}
 		// the packet buffer as been stored, don't reuse it
 		p->buf = NULL;
@@ -767,6 +786,46 @@ static int do_store( MYSQL *m, MYSQL_RES *r ) {
 		if( p->error )
 			return 0;
 	}
+	return 1;
+}
+
+static int do_store( MYSQL *m, MYSQL_RES *r ) {
+	return read_fields(m,r) && store_rows(m,r);
+}
+
+/*
+	Reads the rest of the result being read a row at a time, when another
+	command needs the connection first. Kept for that result to take back
+	rather than dropped, so a statement paged part way, then another run on
+	the same connection, then paged on, still gets all of its rows -- as it
+	did when every result was stored whole before its first row was
+	returned. If the result is never read again the rows go when the next
+	result is set aside, or the connection closes.
+*/
+static int myp_drain( MYSQL *m ) {
+	MYSQL_RES *aside;
+	if( !m->stream_id )
+		return 1;
+	aside = (MYSQL_RES*)malloc(sizeof(struct _MYSQL_RES));
+	memset(aside,0,sizeof(struct _MYSQL_RES));
+	aside->nfields = m->stream_fields;
+	if( !store_rows(m,aside) ) {
+		if( m->errcode <= 0 ) {
+			mysql_free_result(aside);
+			m->stream_id = 0;
+			io_failure(m,"Lost connection to the server while reading a result",1);
+			return 0;
+		}
+		// The server ended the result with an error, which leaves the
+		// connection free: what was read is set aside as the rest was.
+		m->errcode = 0;
+		strcpy(m->sqlstate,"00000");
+	}
+	if( m->orphan )
+		mysql_free_result(m->orphan);
+	m->orphan = aside;
+	m->orphan_id = m->stream_id;
+	m->stream_id = 0;
 	return 1;
 }
 
@@ -793,6 +852,129 @@ MYSQL_RES *mysql_store_result( MYSQL *m ) {
 	}
 	m->last_field_count = r->nfields;
 	return r;
+}
+
+/*
+	A result whose rows are read as they arrive, one at a time, by
+	mysql_fetch_row_stream: a million-row SELECT used to be read whole --
+	190 MB before the first page of it was returned, 470 MB with every row
+	then made an object -- where this holds one row.
+*/
+MYSQL_RES *mysql_use_result( MYSQL *m ) {
+	MYSQL_RES *r;
+	MYSQL_PACKET *p = &m->packet;
+	if( p->id != IS_QUERY )
+		return NULL;
+	if( p->buf[0] == 0 ) {
+		p->pos = 0;
+		m->last_field_count = myp_read_byte(p); // 0
+		myp_read_ok(m,p);
+		return NULL;
+	}
+	r = (MYSQL_RES*)malloc(sizeof(struct _MYSQL_RES));
+	memset(r,0,sizeof(struct _MYSQL_RES));
+	m->errcode = 0;
+	if( !read_fields(m,r) ) {
+		mysql_free_result(r);
+		if( !m->errcode )
+			io_failure(m,"Lost connection to the server while reading a result",1);
+		return NULL;
+	}
+	m->next_stream_id++;
+	if( m->next_stream_id <= 0 )
+		m->next_stream_id = 1;
+	r->stream_id = m->next_stream_id;
+	r->stream_row.lengths = (unsigned long*)malloc(sizeof(unsigned long) * (r->nfields ? r->nfields : 1));
+	r->stream_row.datas = (char**)malloc(sizeof(char*) * (r->nfields ? r->nfields : 1));
+	m->stream_id = r->stream_id;
+	m->stream_fields = r->nfields;
+	m->last_field_count = r->nfields;
+	// Nothing was generated or changed by a statement that returns rows.
+	m->last_insert_id = 0;
+	m->affected_rows = 0;
+	return r;
+}
+
+MYSQL_ROW mysql_fetch_row_stream( MYSQL *m, MYSQL_RES *r, int *failed ) {
+	MYSQL_PACKET *p = &m->packet;
+	*failed = 0;
+	if( r->stream_id == 0 )
+		return mysql_fetch_row(r);
+	if( r->eof )
+		return NULL;
+	if( m->stream_id != r->stream_id ) {
+		if( m->orphan && m->orphan_id == r->stream_id ) {
+			// Another command read the rest aside: take it, and carry on as
+			// a stored result.
+			MYSQL_RES *aside = m->orphan;
+			r->rows = aside->rows;
+			r->row_count = aside->row_count;
+			r->memory_rows = aside->memory_rows;
+			r->current = NULL;
+			r->stream_id = 0;
+			aside->rows = NULL;
+			aside->row_count = 0;
+			mysql_free_result(aside);
+			m->orphan = NULL;
+			m->orphan_id = 0;
+			return mysql_fetch_row(r);
+		}
+		error(m,"The rest of this result is gone: the connection was closed, or read another result, before it was finished",NULL);
+		r->eof = 1;
+		*failed = 1;
+		return NULL;
+	}
+	if( m->s == INVALID_SOCKET ) {
+		error(m,"The connection to the server is closed",NULL);
+		m->errcode = 2006;
+		m->stream_id = 0;
+		r->eof = 1;
+		*failed = 1;
+		return NULL;
+	}
+	if( !myp_read_packet(m,p) ) {
+		m->stream_id = 0;
+		r->eof = 1;
+		io_failure(m,"Lost connection to the server while reading a result",1);
+		*failed = 1;
+		return NULL;
+	}
+	if( (unsigned char)p->buf[0] == 0xFE && p->size < 9 ) {
+		myp_read_eof(m,p);
+		m->stream_id = 0;
+		r->eof = 1;
+		return NULL;
+	}
+	if( (unsigned char)p->buf[0] == 0xFF ) {
+		save_error(m,p);
+		m->stream_id = 0;
+		r->eof = 1;
+		*failed = 1;
+		return NULL;
+	}
+	parse_row(p,r->nfields,&r->stream_row);
+	if( p->error ) {
+		m->stream_id = 0;
+		r->eof = 1;
+		io_failure(m,"Failed to decode a row",1);
+		*failed = 1;
+		return NULL;
+	}
+	r->row_count++;
+	r->current = &r->stream_row;
+	return r->stream_row.datas;
+}
+
+long long mysql_insert_id( MYSQL *m ) {
+	return m->last_insert_id > 0 ? m->last_insert_id : 0;
+}
+
+long long mysql_affected_rows64( MYSQL *m ) {
+	return m->affected_rows > 0 ? m->affected_rows : 0;
+}
+
+const char *mysql_get_server_info( MYSQL *m ) {
+	return m->infos.server_version ? m->infos.server_version : "";
 }
 
 int mysql_field_count( MYSQL *m ) {
@@ -840,6 +1022,8 @@ void mysql_close( MYSQL *m ) {
 	}
 	myp_close(m);
 	myp_tls_free(m);
+	if( m->orphan )
+		mysql_free_result(m->orphan);
 	free(m->packet.buf);
 	free(m->infos.server_version);
 	free(m->infos.auth_plugin);
@@ -896,6 +1080,8 @@ unsigned long *mysql_fetch_lengths( MYSQL_RES *r ) {
 
 MYSQL_ROW mysql_fetch_row( MYSQL_RES * r ) {
 	MYSQL_ROW_DATA *cur = r->current;
+	if( cur == &r->stream_row )
+		cur = NULL;
 	if( cur == NULL )
 		cur = r->rows;
 	else {
@@ -943,6 +1129,8 @@ void mysql_free_result( MYSQL_RES *r ) {
 		}
 		free(r->rows);
 	}
+	free(r->stream_row.lengths);
+	free(r->stream_row.datas);
 	free(r);
 }
 

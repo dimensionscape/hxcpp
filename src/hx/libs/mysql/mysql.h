@@ -96,6 +96,11 @@ typedef struct {
 #define mysql_errno			mp_errno
 #define mysql_sqlstate		mp_sqlstate
 #define mysql_thread_id		mp_thread_id
+#define mysql_use_result	mp_use_result
+#define mysql_fetch_row_stream	mp_fetch_row_stream
+#define mysql_insert_id		mp_insert_id
+#define mysql_affected_rows64	mp_affected_rows64
+#define mysql_get_server_info	mp_get_server_info
 #define mysql_auth_plugin	mp_auth_plugin
 #define mysql_escape_string	mp_escape_string
 #define mysql_real_escape_string mp_real_escape_string
@@ -129,6 +134,13 @@ int mysql_ping( MYSQL *m );
 int mysql_errno( MYSQL *m );
 const char *mysql_sqlstate( MYSQL *m );
 unsigned int mysql_thread_id( MYSQL *m );
+// A result whose rows are read one at a time, as they arrive.
+MYSQL_RES *mysql_use_result( MYSQL *m );
+// Its next row; NULL at its end, or on a failure, which *failed says.
+MYSQL_ROW mysql_fetch_row_stream( MYSQL *m, MYSQL_RES *r, int *failed );
+long long mysql_insert_id( MYSQL *m );
+long long mysql_affected_rows64( MYSQL *m );
+const char *mysql_get_server_info( MYSQL *m );
 const char *mysql_auth_plugin( MYSQL *m );
 int mysql_escape_string( MYSQL *m, char *sout, const char *sin, int length );
 int mysql_real_escape_string( MYSQL *m, char *sout, const char *sin, int length );

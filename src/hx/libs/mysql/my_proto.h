@@ -156,6 +156,15 @@ struct _MYSQL {
 	long long affected_rows;
 	long long last_insert_id;
 	unsigned short warning_count;
+	// The result being read a row at a time (mysql_use_result): its id, and
+	// its column count, so the rest of it can be read aside when another
+	// command needs the connection first. 0 when there is none.
+	int stream_id;
+	int stream_fields;
+	int next_stream_id;
+	// The rows read aside, for the result they belong to to take back.
+	struct _MYSQL_RES *orphan;
+	int orphan_id;
 	char last_error[MAX_ERR_SIZE];
 };
 
@@ -172,6 +181,12 @@ struct _MYSQL_RES {
 	MYSQL_ROW_DATA *current;
 	int row_count;
 	int memory_rows;
+	// Read a row at a time: the id matching MYSQL.stream_id while its rows
+	// are still on the wire, 0 for a result stored whole.
+	int stream_id;
+	int eof;
+	// The row last read, pointing into the connection's packet buffer.
+	MYSQL_ROW_DATA stream_row;
 };
 
 

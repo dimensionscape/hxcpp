@@ -145,6 +145,10 @@ struct Result : public hx::Object
    // making each one permanent would keep every one ever seen.
    Array<String> field_names;
    MYSQL_ROW current;
+   // For a result read a row at a time: the connection it reads from, held
+   // so the connection outlives it, and the rows read so far.
+   Dynamic owner;
+   int rowsRead;
 
    void create(MYSQL_RES *inR)
    {
@@ -152,6 +156,7 @@ struct Result : public hx::Object
       fields_convs = 0;
       field_names = null();
       nfields = 0;
+      rowsRead = 0;
       _hx_set_finalizer(this, finalize);
    }
 
@@ -174,9 +179,9 @@ struct Result : public hx::Object
       ((Result *)(obj.mPtr))->destroy();
    }
 
-   void __Mark(hx::MarkContext *__inCtx) HXCPP_OVERRIDE { HX_MARK_MEMBER(field_names); }
+   void __Mark(hx::MarkContext *__inCtx) HXCPP_OVERRIDE { HX_MARK_MEMBER(field_names); HX_MARK_MEMBER(owner); }
    #ifdef HXCPP_VISIT_ALLOCS
-   void __Visit(hx::VisitContext *__inCtx) HXCPP_OVERRIDE { HX_VISIT_MEMBER(field_names); }
+   void __Visit(hx::VisitContext *__inCtx) HXCPP_OVERRIDE { HX_VISIT_MEMBER(field_names); HX_VISIT_MEMBER(owner); }
    #endif
 };
 
@@ -295,7 +300,11 @@ int  _hx_mysql_result_get_length(Dynamic handle)
    if( handle->__GetType() == vtInt )
       return handle;
 
-   return getResult(handle)->numRows();
+   Result *r = getResult(handle);
+   // A result read as it arrives knows only the rows read so far.
+   if( r->owner.mPtr )
+      return r->rowsRead;
+   return r->numRows();
 }
 
 /**
@@ -356,7 +365,24 @@ Dynamic _hx_mysql_result_next(Dynamic handle)
       return null();
 
    Result *r = getResult(handle);
-   MYSQL_ROW row = mysql_fetch_row(r->r);
+   MYSQL_ROW row;
+   if( r->owner.mPtr )
+   {
+      Connection *owner = dynamic_cast<Connection *>(r->owner.mPtr);
+      if( !owner || !owner->m )
+         HXTHROW("The connection this result reads from is closed");
+      int failed = 0;
+      row = mysql_fetch_row_stream(owner->m,r->r,&failed);
+      if( !row )
+      {
+         if( failed )
+            error(owner->m,0);
+         return null();
+      }
+      r->rowsRead++;
+   }
+   else
+      row = mysql_fetch_row(r->r);
    if( !row )
       return null();
 
@@ -583,6 +609,69 @@ Dynamic _hx_mysql_request(Dynamic handle,String req)
    return alloc_result(connection,res);
 }
 
+
+/**
+   request_stream : 'connection -> string -> 'result
+   <doc>Executes an SQL request whose rows are read as they arrive, one per
+   [result_next], rather than all of them first. Another command on the
+   connection before the last row reads the rest aside for this result to
+   take back. The handle of a statement with no rows is its affected-row
+   count, as for [request].</doc>
+**/
+Dynamic _hx_mysql_request_stream(Dynamic handle,String req)
+{
+   Connection *connection = getConnection(handle);
+
+   hx::strbuf sqlBuffer;
+   int sqlBytes = 0;
+   const char *sql = req.utf8_str(&sqlBuffer,true,&sqlBytes);
+
+   if( mysql_real_query(connection->m,sql,sqlBytes) != 0 )
+      error(connection->m,0);
+
+   MYSQL_RES *res = mysql_use_result(connection->m);
+   if( !res )
+   {
+      if( mysql_field_count(connection->m) == 0 )
+         return mysql_affected_rows(connection->m);
+      else
+         error(connection->m,0);
+   }
+
+   Result *result = alloc_result(connection,res);
+   result->owner = handle;
+   HX_OBJ_WB_GET(result, result->owner.mPtr);
+   return result;
+}
+
+/**
+   insert_id : 'connection -> int
+   <doc>The AUTO_INCREMENT id the last statement generated, 0 when it generated
+   none: an Int, or an Int64 past 2^31. From the OK packet, where it came
+   free; reading it needed no SELECT LAST_INSERT_ID().</doc>
+**/
+Dynamic _hx_mysql_insert_id(Dynamic handle)
+{
+   return integer_value(mysql_insert_id(getConnection(handle)->m));
+}
+
+/**
+   affected_rows : 'connection -> int
+   <doc>The rows the last statement changed: an Int, or an Int64 past 2^31.</doc>
+**/
+Dynamic _hx_mysql_affected_rows(Dynamic handle)
+{
+   return integer_value(mysql_affected_rows64(getConnection(handle)->m));
+}
+
+/**
+   server_version : 'connection -> string
+   <doc>The version the server gave in its greeting.</doc>
+**/
+String _hx_mysql_server_version(Dynamic handle)
+{
+   return String(mysql_get_server_info(getConnection(handle)->m));
+}
 
 /**
    server_status : 'connection -> int
