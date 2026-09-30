@@ -257,7 +257,7 @@ public:
       return mProc<other->mProc ? -1 : 1;
    }
 
-   int __ArgCount() const { return mArgCount; }
+   int __ArgCount() const HXCPP_OVERRIDE { return mArgCount; }
 
 
    void        *mProc;
