@@ -239,6 +239,19 @@ int     _hx_sqlite_last_insert_id(Dynamic handle)
 }
 
 /**
+   get_autocommit : 'db -> bool
+   <doc>Whether the database is in autocommit mode, which is to say whether no
+   transaction is open: sqlite3_get_autocommit. A transaction begun or ended
+   with SQL text -- BEGIN, COMMIT, a ROLLBACK SQLite performed itself after an
+   error -- is reflected here as surely as one begun through the API.</doc>
+**/
+bool _hx_sqlite_get_autocommit(Dynamic handle)
+{
+   database *db = getDatabase(handle);
+   return sqlite3_get_autocommit(db->db) != 0;
+}
+
+/**
    request : 'db -> sql:string -> 'result
    <doc>Executes the SQL request and returns its result</doc>
 **/

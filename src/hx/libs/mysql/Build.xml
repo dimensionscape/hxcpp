@@ -1,5 +1,10 @@
 <xml>
 
+<!-- Included by Haxe's sys.db.Mysql and by any library calling the client
+     directly; without this, two includes link the objects twice, which GNU
+     ld refuses. -->
+<pragma once="true" />
+
 <files id="hxcpp_mysql" dir="${this_dir}" >
   <depend files="hxcpp-depends"/>
   <depend name="${this_dir}/Build.xml" dateOnly="true" />

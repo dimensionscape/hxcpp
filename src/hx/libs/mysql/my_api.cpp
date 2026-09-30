@@ -53,6 +53,33 @@ static void save_error( MYSQL *m, MYSQL_PACKET *p ) {
 	m->errcode = ecode;
 }
 
+/*
+	The rest of an OK packet, after its 0x00: what the statement did, and the
+	session state the server reports after it. The status flags are the only
+	place the server says whether a transaction is open and whether
+	backslashes still escape, and they were read once, from the greeting, and
+	never again: after SET sql_mode = 'NO_BACKSLASH_ESCAPES' a quote was still
+	escaped with a backslash, which that mode reads as a literal backslash
+	followed by the end of the string.
+*/
+static void myp_read_ok( MYSQL *m, MYSQL_PACKET *p ) {
+	m->affected_rows = myp_read_bin64(p);
+	m->last_insert_id = myp_read_bin64(p);
+	if( m->is41 && p->size - p->pos >= 4 ) {
+		m->infos.server_status = myp_read_ui16(p);
+		m->warning_count = myp_read_ui16(p);
+	}
+}
+
+/* The same flags, from the EOF packet that ends a result. */
+static void myp_read_eof( MYSQL *m, MYSQL_PACKET *p ) {
+	if( m->is41 && p->size >= 5 ) {
+		p->pos = 1;
+		m->warning_count = myp_read_ui16(p);
+		m->infos.server_status = myp_read_ui16(p);
+	}
+}
+
 static int myp_ok( MYSQL *m, int allow_others ) {
 	int code;
 	MYSQL_PACKET *p = &m->packet;
@@ -61,8 +88,13 @@ static int myp_ok( MYSQL *m, int allow_others ) {
 		return 0;
 	}
 	code = myp_read_byte(p);
-	if( code == 0x00 )
+	if( code == 0x00 ) {
+		// A result set's header is not an OK packet even when its first
+		// byte could be read as one; the caller parses those.
+		if( !allow_others )
+			myp_read_ok(m,p);
 		return 1;
+	}
 	if( code == 0xFF )
 		save_error(m,p);
 	else if( allow_others )
@@ -212,6 +244,7 @@ send_cnx_packet:
 		int code = myp_read_byte(p);
 		switch( code ) {
 		case 0: // OK packet
+			myp_read_ok(m,p);
 			break;
 		case 0xFF: // ERROR
 			myp_close(m);
@@ -308,6 +341,7 @@ static int do_store( MYSQL *m, MYSQL_RES *r ) {
 		return 0;
 	if( myp_read_byte(p) != 0xFE || p->size >= 9 )
 		return 0;
+	myp_read_eof(m,p);
 	// reset packet buffer (to prevent to store large buffer in row data)
 	free(p->buf);
 	p->buf = NULL;
@@ -317,8 +351,10 @@ static int do_store( MYSQL *m, MYSQL_RES *r ) {
 		if( !myp_read_packet(m,p) )
 			return 0;
 		// EOF : end of datas
-		if( (unsigned char)p->buf[0] == 0xFE && p->size < 9 )
+		if( (unsigned char)p->buf[0] == 0xFE && p->size < 9 ) {
+			myp_read_eof(m,p);
 			break;
+		}
 		// ERROR ?
 		if( (unsigned char)p->buf[0] == 0xFF ) {
 			save_error(m,p);
@@ -375,8 +411,7 @@ MYSQL_RES *mysql_store_result( MYSQL *m ) {
 	if( p->buf[0] == 0 ) {
 		p->pos = 0;
 		m->last_field_count = myp_read_byte(p); // 0
-		m->affected_rows = myp_read_bin(p);
-		m->last_insert_id = myp_read_bin(p);
+		myp_read_ok(m,p);
 		return NULL;
 	}
 	r = (MYSQL_RES*)malloc(sizeof(struct _MYSQL_RES));
@@ -397,7 +432,11 @@ int mysql_field_count( MYSQL *m ) {
 }
 
 int mysql_affected_rows( MYSQL *m ) {
-	return m->affected_rows;
+	return m->affected_rows > 0x7FFFFFFF ? 0x7FFFFFFF : (int)m->affected_rows;
+}
+
+int mysql_server_status( MYSQL *m ) {
+	return m->infos.server_status;
 }
 
 int mysql_escape_string( MYSQL *m, char *sout, const char *sin, int length ) {

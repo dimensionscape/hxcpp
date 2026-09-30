@@ -520,6 +520,19 @@ Dynamic _hx_mysql_request(Dynamic handle,String req)
 
 
 /**
+   server_status : 'connection -> int
+   <doc>The status flags the server sent with its last OK or EOF packet:
+   SERVER_STATUS_IN_TRANS (1), SERVER_STATUS_AUTOCOMMIT (2),
+   SERVER_STATUS_NO_BACKSLASH_ESCAPES (512) and the rest. Costs no round
+   trip.</doc>
+**/
+int _hx_mysql_server_status(Dynamic handle)
+{
+   Connection *connection = getConnection(handle);
+   return mysql_server_status(connection->m);
+}
+
+/**
    escape : 'connection -> string -> string
    <doc>Escape the string for inserting into a SQL request</doc>
 **/

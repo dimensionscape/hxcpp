@@ -109,8 +109,11 @@ struct _MYSQL {
 	int is41;
 	int errcode;
 	int last_field_count;
-	int affected_rows;
-	int last_insert_id;
+	// From the last OK packet. 64-bit, as the protocol sends them: an
+	// AUTO_INCREMENT BIGINT is past 2^31 as soon as it is past 2^31.
+	long long affected_rows;
+	long long last_insert_id;
+	unsigned short warning_count;
 	char last_error[MAX_ERR_SIZE];
 };
 
@@ -145,6 +148,7 @@ unsigned short myp_read_ui16( MYSQL_PACKET *p );
 int myp_read_int( MYSQL_PACKET *p );
 const char *myp_read_string( MYSQL_PACKET *p );
 int myp_read_bin( MYSQL_PACKET *p );
+long long myp_read_bin64( MYSQL_PACKET *p );
 char *myp_read_bin_str( MYSQL_PACKET *p );
 
 // packet write

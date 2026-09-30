@@ -85,6 +85,7 @@ typedef struct {
 #define mysql_store_result	mp_store_result
 #define mysql_field_count	mp_field_count
 #define mysql_affected_rows	mp_affected_rows
+#define mysql_server_status	mp_server_status
 #define mysql_escape_string	mp_escape_string
 #define mysql_real_escape_string mp_real_escape_string
 #define mysql_close			mp_close
@@ -103,6 +104,7 @@ int mysql_real_query( MYSQL *m, const char *query, int qlength );
 MYSQL_RES *mysql_store_result( MYSQL *m );
 int mysql_field_count( MYSQL *m );
 int mysql_affected_rows( MYSQL *m );
+int mysql_server_status( MYSQL *m );
 int mysql_escape_string( MYSQL *m, char *sout, const char *sin, int length );
 int mysql_real_escape_string( MYSQL *m, char *sout, const char *sin, int length );
 void mysql_close( MYSQL *m );

@@ -93,8 +93,42 @@ int myp_read_bin( MYSQL_PACKET *p ) {
 		myp_read(p,&c,3);
 		return c;
 	}
-	if( c == 254 )
-		return myp_read_int(p);
+	if( c == 254 ) {
+		// Eight bytes follow, not four. Reading four left the other four to
+		// be taken for whatever came next -- the status flags of an OK
+		// packet, or the next column of a row.
+		long long v = 0;
+		myp_read(p,&v,8);
+		if( v < 0 || v > 0x7FFFFFFF ) {
+			p->error = 1;
+			return 0;
+		}
+		return (int)v;
+	}
+	p->error = 1;
+	return 0;
+}
+
+// A length-encoded integer at its full width, for the counts an OK packet
+// carries: affected rows and the insert id are 64-bit.
+long long myp_read_bin64( MYSQL_PACKET *p ) {
+	int c = myp_read_byte(p);
+	if( c <= 250 )
+		return c;
+	if( c == 251 )
+		return -1; // NULL
+	if( c == 252 )
+		return myp_read_ui16(p);
+	if( c == 253 ) {
+		int v = 0;
+		myp_read(p,&v,3);
+		return v;
+	}
+	if( c == 254 ) {
+		long long v = 0;
+		myp_read(p,&v,8);
+		return v;
+	}
 	p->error = 1;
 	return 0;
 }
