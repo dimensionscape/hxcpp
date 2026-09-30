@@ -609,6 +609,14 @@ void mysql_set_keepalive( MYSQL *m, int on, int idle, int interval, int count ) 
 	m->options.keepalive_count = count;
 }
 
+void mysql_keepalive_state( MYSQL *m, int *state ) {
+	if( m->s == INVALID_SOCKET ) {
+		state[0] = state[1] = state[2] = state[3] = -1;
+		return;
+	}
+	psock_keepalive_state(m->s,state);
+}
+
 int mysql_ping( MYSQL *m ) {
 	MYSQL_PACKET *p = &m->packet;
 	int pcount = 0;

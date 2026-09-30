@@ -51,6 +51,7 @@ SERR psock_set_timeout( PSOCK s, double timeout );
 SERR psock_set_recv_timeout( PSOCK s, double timeout );
 SERR psock_set_send_timeout( PSOCK s, double timeout );
 SERR psock_set_keepalive( PSOCK s, int idle, int interval, int count );
+void psock_keepalive_state( PSOCK s, int *state );
 int psock_last_error();
 SERR psock_set_blocking( PSOCK s, int block );
 SERR psock_set_fastsend( PSOCK s, int fast );

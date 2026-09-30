@@ -28,6 +28,7 @@
 	static int init_done = 0;
 	static WSADATA init_data;
 #	include <mstcpip.h>
+#	include <ws2tcpip.h>
 #else
 #	include <sys/types.h>
 #	include <sys/socket.h>
@@ -199,7 +200,7 @@ SERR psock_set_send_timeout( PSOCK s, double t ) {
 	the socket timeout, which was five hours. `idle` seconds without traffic
 	before the first probe, `interval` between probes, `count` unanswered
 	probes before the connection is dropped; 0 leaves the system's own.
-	Windows sets the first two and fixes the count at ten.
+	Windows before 10 (1703) has no count to set, and keeps it at ten.
 */
 SERR psock_set_keepalive( PSOCK s, int idle, int interval, int count ) {
 	int on = 1;
@@ -215,6 +216,11 @@ SERR psock_set_keepalive( PSOCK s, int idle, int interval, int count ) {
 		if( WSAIoctl(s,SIO_KEEPALIVE_VALS,&values,sizeof(values),NULL,0,&returned,NULL,NULL) != 0 )
 			return PS_ERROR;
 	}
+#	ifdef TCP_KEEPCNT
+	// Refused where Windows is too old to know it, which leaves the ten.
+	if( count > 0 )
+		setsockopt(s,IPPROTO_TCP,TCP_KEEPCNT,(char*)&count,sizeof(count));
+#	endif
 #else
 #	ifdef TCP_KEEPIDLE
 	if( idle > 0 )
@@ -233,6 +239,44 @@ SERR psock_set_keepalive( PSOCK s, int idle, int interval, int count ) {
 #	endif
 #endif
 	return PS_OK;
+}
+
+/*
+	The keepalive the socket has, read back from it rather than taken from
+	what was asked for: `state` gets on (0 or 1), then the idle and interval
+	in seconds and the probe count, each -1 where the system does not report
+	it.
+*/
+static int keepalive_option( PSOCK s, int level, int option ) {
+	// Zeroed first: Windows writes SO_KEEPALIVE as a single byte.
+	int value = 0;
+#	ifdef NEKO_WINDOWS
+	int size = sizeof(value);
+#	else
+	socklen_t size = sizeof(value);
+#	endif
+	if( getsockopt(s,level,option,(char*)&value,&size) != 0 )
+		return -1;
+	return value;
+}
+
+void psock_keepalive_state( PSOCK s, int *state ) {
+	int on = keepalive_option(s,SOL_SOCKET,SO_KEEPALIVE);
+	state[0] = on < 0 ? -1 : on != 0;
+	state[1] = -1;
+	state[2] = -1;
+	state[3] = -1;
+#	if defined(TCP_KEEPIDLE)
+	state[1] = keepalive_option(s,IPPROTO_TCP,TCP_KEEPIDLE);
+#	elif defined(TCP_KEEPALIVE)
+	state[1] = keepalive_option(s,IPPROTO_TCP,TCP_KEEPALIVE);
+#	endif
+#	ifdef TCP_KEEPINTVL
+	state[2] = keepalive_option(s,IPPROTO_TCP,TCP_KEEPINTVL);
+#	endif
+#	ifdef TCP_KEEPCNT
+	state[3] = keepalive_option(s,IPPROTO_TCP,TCP_KEEPCNT);
+#	endif
 }
 
 int psock_last_error() {

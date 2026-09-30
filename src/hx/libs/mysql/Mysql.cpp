@@ -883,6 +883,23 @@ bool _hx_mysql_is_tls(Dynamic handle)
 }
 
 /**
+   keepalive : 'connection -> int array
+   <doc>The TCP keepalive the connection's socket has, read back from the
+   socket: on (1 or 0), then the idle and interval in seconds and the probe
+   count, each -1 where the system does not report it; all four -1 once a
+   failure has lost the connection.</doc>
+**/
+Array<int> _hx_mysql_keepalive(Dynamic handle)
+{
+   int state[4];
+   mysql_keepalive_state(getConnection(handle)->m,state);
+   Array<int> result = Array_obj<int>::__new(4,4);
+   for(int i=0;i<4;i++)
+      result[i] = state[i];
+   return result;
+}
+
+/**
    auth_plugin : 'connection -> string
    <doc>The authentication plugin the account logged in with.</doc>
 **/
