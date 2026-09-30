@@ -189,6 +189,14 @@ int sCtxReg = SLJIT_S0;
 int sFrameReg = SLJIT_S1;
 int sThisReg = SLJIT_S2;
 
+// Called from jitted prologues when the script stack limit is hit.  Jitted
+// code cannot unwind C++ exceptions, so follow the runtime convention:
+// store the exception and let the emitted checkException route it.
+static void cppiaJitStackOverflow(CppiaCtx *inCtx)
+{
+   inCtx->exception = Dynamic(HX_CSTRING("Stack Overflow")).mPtr;
+}
+
 JitReg sJitCtx(SLJIT_S0,jtPointer);
 JitReg sJitFrame(SLJIT_S1,jtPointer);
 JitReg sJitThis(SLJIT_S2,jtPointer);
@@ -196,6 +204,7 @@ JitReg sJitThis(SLJIT_S2,jtPointer);
 
 JitVal sJitCtxFrame = sJitCtx.star(jtPointer, offsetof(CppiaCtx,frame));
 JitVal sJitCtxPointer = sJitCtx.star(jtPointer, offsetof(CppiaCtx,pointer));
+JitVal sJitCtxStackEnd = sJitCtx.star(jtPointer, offsetof(CppiaCtx,stackEnd));
 
 static double sZero = 0.0;
 
@@ -333,6 +342,16 @@ public:
       frameSize = baseFrameSize;
       uncaught.setSize(0);
       catching = 0;
+
+      if (usesFrame && makesNativeCalls)
+      {
+         // Deep jit-to-jit recursion bypasses the interpreter's stack check.
+         // Emitted after the throw lists reset so the exception jump binds.
+         JumpId stackOk = compare( cmpP_LESS, sJitCtxPointer, sJitCtxStackEnd, 0 );
+         callNative( (void *)cppiaJitStackOverflow, sJitCtx.as(jtPointer) );
+         checkException();
+         comeFrom(stackOk);
+      }
    }
 
    CppiaFunc finishGeneration() HXCPP_OVERRIDE
@@ -808,6 +827,10 @@ public:
    void setMaxPointer() HXCPP_OVERRIDE
    {
       add( sJitCtxPointer, sJitFrame, maxFrameSize );
+      JumpId stackOk = compare( cmpP_LESS, sJitCtxPointer, sJitCtxStackEnd, 0 );
+      callNative( (void *)cppiaJitStackOverflow, sJitCtx.as(jtPointer) );
+      checkException();
+      comeFrom(stackOk);
    }
 
    void makeAddress(const JitVal &outAddress, const JitVal &inSrc)
@@ -938,7 +961,9 @@ public:
          switch(inSrcType)
          {
             case etInt:
-               emit_fop1( SLJIT_CONV_F64_FROM_S32, inTarget.as(jtInt), inSrc.as(jtFloat) );
+               // The destination of int->float is the FLOAT operand - the swapped
+               // tags made register accounting attribute it to the wrong class
+               emit_fop1( SLJIT_CONV_F64_FROM_S32, inTarget.as(jtFloat), inSrc.as(jtInt) );
                break;
 
             case etObject:
@@ -978,7 +1003,7 @@ public:
          switch(inSrcType)
          {
             case etFloat:
-               emit_fop1( SLJIT_CONV_S32_FROM_F64, inTarget.as(jtFloat), inSrc.as(jtInt) );
+               emit_fop1( SLJIT_CONV_S32_FROM_F64, inTarget.as(jtInt), inSrc.as(jtFloat) );
                break;
 
             case etObject:

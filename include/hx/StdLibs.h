@@ -80,6 +80,7 @@ HXCPP_EXTERN_CLASS_ATTRIBUTES int hxcpp_alloc_kind();
 
 // --- Maths ---------------------------------------------------------
 double __hxcpp_drand();
+HXCPP_EXTERN_CLASS_ATTRIBUTES double _hx_strtod_c_locale(const char *inStr);
 HXCPP_EXTERN_CLASS_ATTRIBUTES int __hxcpp_irand(int inMax);
 
 // --- Casting/Converting ---------------------------------------------------------

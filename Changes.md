@@ -12,6 +12,114 @@
 * Added x86_64 support to older Android NDKs
 * Added optional detaching of main thread
 
+* Improved Map/StringMap/IntMap lookup performance by ~16-26% by lowering the default hash table load factor
+* Fixed catastrophic IntMap collisions for keys with low-bit structure (pointers, aligned/strided ids) by mixing integer hashes; up to ~280x faster lookups for such keys with no regression for dense keys
+* Applied the same hash mixing to Int64 and object map keys (fixes ~168x slower lookups for strided Int64 keys; modest gain for object keys)
+* Reduced large-map build time ~24-36% by switching hash table growth from 2x to 4x once a map is large (small maps keep 2x, so their memory is unchanged)
+* Improved array slice/splice by skipping the generational GC write barrier for arrays of primitive (non-pointer) types
+* Increased Socket.read() chunk buffer from 256 bytes to 16KB, cutting recv() syscalls ~64x when reading a stream to EOF
+* Sped up String.indexOf on byte strings using memchr: ~58x faster for sparse/absent single-char search (the common contains check) and ~2.5x faster for multi-char search
+* Sped up String.toUpperCase/toLowerCase ~2.3x for ASCII strings with a branchless transform instead of per-char locale-dependent toupper/tolower
+* Sped up Date field access ~3.7x by caching the last localtime/gmtime conversion per thread (getHours/getMinutes/getFullYear/... on one date no longer each call localtime)
+* Sped up Int/Int64/UInt64 to String conversion ~2.5x by writing digits directly instead of snprintf (affects Std.string of integers, string interpolation, etc.)
+* Replaced the C rand() backing of Math.random/Std.random with a per-thread xoshiro256++ generator: ~10x faster, no libc lock contention, 53-bit doubles, and worker threads no longer produce identical sequences on Windows (also fixes Std.random(0) crashing with division by zero)
+* Sped up String.split with a memchr candidate scan instead of a libc compare per byte position (~15-20% on byte strings including the per-part allocation, much more on the raw scan), added a first-unit skip to the wide-string path, and fixed delimiters containing NUL falsely matching any NUL in the subject
+* Sped up haxe.io.Bytes.ofString ~25% for non-ASCII strings by sizing the output once and encoding directly into the buffer instead of pushing per byte
+* Reduced GC pause time for programs holding many large (4KB+) allocations: conservative stack marking now rejects out-of-range candidates against cached bounds instead of scanning the whole large-object list per stack word, and the last-value dedupe in the conservative marker actually works now
+* Sped up indexOf/lastIndexOf on UTF-16 (non-ASCII) strings 2-3.5x with first-unit candidate skipping, and made searching a byte string for an unmatchable wide needle O(1) instead of a full scan
+* Fixed sys.thread.Lock timed waits breaking after ~24.8 days of process uptime on Windows (was built on the 32-bit clock(); now uses the monotonic 64-bit tick count)
+* Reduced marker-thread cache-line contention by skipping redundant row-mark stores during the GC mark phase
+* Fixed a data race in the large-allocation recycle list: the lock-free probe now reads a dedicated counter instead of scanning the vector concurrently with mutation (also fixed a skipped-entry bug when the locked recheck failed)
+* Sped up freeing large allocations on the array/Bytes growth path ~36% in realloc-heavy benchmarks by searching the large-object list from the end, where the just-allocated buffer lives
+* Reduced Dynamic function call overhead at API level 500 (Haxe 5): arguments are written into a pre-sized array instead of pushed one at a time with per-element capacity checks
+* Made the GC-safe-zone handshake lock-free when no collection is pending: entering skips the kernel event signal and exiting skips the process-global mutex unless a collect is actually starting or running. Combined with uncontended fast paths in sys.thread.Mutex/ConditionVariable/Semaphore (try-lock before entering the zone), uncontended Mutex.acquire/release is ~18x faster and Semaphore ~2x, and independent threads no longer serialize on a global lock for every blocking call
+* Fixed Dynamic + with boxed Int64 operands producing a string concatenation of the two numbers; Int64 addition now stays in 64-bit math (no precision loss via double), and Int + Int keeps an Int-typed result consistent with - and * (also avoids boxing a double per addition)
+* Made Std.parseFloat and Float-to-String formatting independent of the process locale: host frameworks (GUI toolkits, audio libraries, plugin containers) that call setlocale after startup no longer flip the decimal separator and break float parsing, printing, and serialization (uses explicit "C" numeric locale on Windows, macOS, glibc and Android 21+)
+* Fixed equal strings hashing differently and missing each other in string maps in two cases: strings created from bytes (haxe.io.Bytes.toString, file/socket reads of non-ASCII text) stored their pre-computed hash at an address the hash reader did not use for UTF-16 strings, and strings containing astral-plane characters (emoji) hashed surrogate halves individually while compile-time literals hashed real UTF-8 - so a literal key and an equal runtime-built key could not find each other
+* Sped up string maps with runtime-built keys 2.2-2.4x: strings of 8+ chars now memoize their hash on first use in a reserved slot after the terminator instead of re-hashing the whole string on every map operation
+* Sped up Array.sort with scalar elements ~23-33% by boxing comparator arguments once per element instead of twice per comparison
+* Fixed Sys.sleep with a negative duration hanging ~49.7 days on Windows (schedulers computing sleep(deadline-now) could dip below zero)
+* Fixed FileSystem.kind/isDirectory misclassifying special files (the S_IF* constants were tested as bit flags: sockets reported as "file", block devices as "dir")
+* Fixed File.getContent/getBytes silently returning truncated data for huge files (32-bit length math), leaking the file handle on the length-error path, and now reporting "file too large" instead of wrapping
+* Fixed FileSystem.fullPath on Windows returning uninitialized memory for paths longer than MAX_PATH, and a one-character stack overflow in readDirectory at exactly MAX_PATH
+* Fixed an operator-precedence bug destroying every mbedtls error code reported from SSL (eleven call sites reported "UNKNOWN ERROR CODE (0001)" instead of the real failure)
+* Fixed sys.ssl writeByte silently dropping the byte on would-block/error and readByte turning a non-blocking retry into a spurious end-of-file
+* Sped up sys.ssl Socket.read ~64x fewer native calls per TLS record (256-byte drain buffer -> 16KB)
+* Sped up print/println on Windows by caching the stdout console probe (was a kernel call per print), and only force-flushing per line when stdout is interactive (a redirected stream no longer pays a write syscall per println)
+* Fixed cppia array access through host-class getters returning garbage (the linked getter was validated but never invoked - the argument frame was read back as the result)
+* Fixed cppia float constants parsing locale-dependently (comma-decimal hosts)
+* Sped up Std.isOfType(x, Int) by replacing RTTI dynamic_casts with cheap type probes
+* Fixed comparing a statically-typed number with a Dynamic skipping the runtime type check: 5 == ("5":Dynamic) was true (the string was parsed as a number) and 0 compared equal to non-numeric objects; mixed string/number comparisons also answered != incorrectly
+* Fixed SQLite 64-bit INTEGER columns (timestamps, large ids, SUM aggregates) being silently truncated to 32 bits - values that fit stay Int, larger ones widen to Float; last_insert_id saturates instead of wrapping
+* Fixed ++/-- on Dynamic values and untyped fields rewriting Int values as Float (disabling downstream Int fast paths) - Int values now stay Int
+* Improved Sys.time() resolution on Windows from ~15.6ms to sub-microsecond (GetSystemTimePreciseAsFileTime with a Win7 fallback)
+* Fixed a race between Sys.getEnv and Sys.putEnv (putenv can free the storage a concurrent getenv result points into) - environment access is now serialized
+* Sped up File.getContent by reading directly into the string buffer (was staged through a std::vector, doubling peak memory with an extra full copy)
+* Fixed converting a null function value across compatible Callable signatures producing a non-null callable (the universal `if (callback != null) callback()` idiom then threw instead of skipping)
+* Fixed truncated/corrupt .cppia files driving the loader past the end of the buffer (the byte reader now reports EOF like the other stream primitives)
+* Added a script stack overflow guard to cppia: deep recursion now throws a catchable "Stack Overflow" instead of silently corrupting the heap past the fixed script stack (checked in the interpreter entries and in jitted function prologues)
+* Fixed the cppia JIT writing before the array buffer for stores with a negative index (heap corruption; the write is now dropped, matching compiled code)
+* Fixed jitted calls that omit two or more optional arguments corrupting the callee frame (each omitted argument advanced the frame twice)
+* Fixed swapped register-class tags in jitted int/float conversions, which miscounted scratch registers
+* Sped up jitted Int % Int ~7.6x: a real integer division (with a bailout for divisors 0 and -1) instead of two int-to-double conversions and a native fmod call per operation
+* Fixed the jitted stack-overflow guard raising a C++ exception, which cannot unwind through jitted frames (crashed instead of throwing catchably) - it now follows the runtime's stored-exception convention
+* Sped up Type.resolveClass ~3.7x by replacing the class registry's ordered map (full string comparisons per tree level) with a hash map keyed on the precomputed permanent-string hashes, and fixed runtime cppia class registration racing unsynchronized against concurrent Type.resolveClass
+* Sped up Type.getInstanceFields ~5.7x by caching the computed field list per class (metadata is immutable after registration; callers receive copies)
+* CFFI val_id field lookups no longer allocate a std::string per call (transparent comparator)
+* Sped up cppia dynamic field access ~1.7-2.3x (get/set/Reflect.field on script classes): each class now builds a hash map of its members at link time instead of scanning functions, dynamic functions and variables linearly with a string compare per entry on every access
+* Sped up interpreted cppia switch statements with constant integer cases (including over int expressions the runtime types as float, like %): the body is found with one hash probe instead of re-running every case condition per execution (~20% on a 12-case switch including loop overhead; the win grows with case count)
+* Sped up interpreted Int % Int: both operands now stay in integer math (with a bailout for divisors 0 and -1) instead of two double conversions and a native fmod per operation
+* Calling a Dynamic value that is not a function now throws "Cannot call ..." at API level 500 (Haxe 5) instead of silently returning null, matching the other targets; API level 430 and below keep the old behavior
+* TLS connections now require TLS 1.2 or newer - the bundled mbedtls preset still negotiated the deprecated TLS 1.0/1.1 with downgrade-capable peers
+* Fixed Socket.select smashing the stack on Linux/macOS when a descriptor number reaches FD_SETSIZE (1024) - the guard only counted sockets, valid on Windows where fd_set is a counted array, while posix fd_set is a fixed bitmap; selecting on a closed socket (fd -1) had the same effect and both now throw a descriptive error
+* Fixed sys.net/sys.ssl reads and writes that hold a raw pointer into a GC array across a blocking call: TLS reads/writes now stage through a stack buffer (mbedtls re-enters the GC-visible world mid-call) and plain socket send/recv pin the buffer in the scanned frame, closing a heap-corruption window in moving-GC builds
+* Fixed Socket.connect doing a dynamic field lookup (and potentially throwing) inside the GC free zone - a caught "Invalid socket handle" left the thread permanently marked as parked, letting the collector run concurrently with live code
+* Fixed Socket.setTimeout: a negative value configured a random timeout from uninitialized stack memory on posix (now throws), a sub-millisecond value on Windows rounded to 0 = block forever (now 1ms minimum), and huge values overflowed; setting the timeout now reports failure instead of silently doing nothing
+* A UDP datagram larger than the receive buffer on Windows now returns the truncated data like posix instead of throwing a spurious "EOF" and discarding it (WSAEMSGSIZE)
+* Added the missing EINTR retry to socket send and accept - any signal (profilers, child-process reaping) made them throw a bogus "EOF" and the connection got closed; an interrupted blocking connect now reports "Blocking" (the connect continues asynchronously per posix) instead of "EOF"
+* Socket listen and setBlocking failures now throw instead of failing silently (a failed listen left the app believing it was accepting connections); shutdown throws except for the defensive not-connected case
+* Fixed Socket.select on Windows reporting errno (always garbage) instead of WSAGetLastError, and both selects now sample the error code before leaving the GC free zone, which can clobber it
+* Fixed socket poll reporting sockets from a previous poll as ready after a poll error (stale index lists are now terminated)
+* Accepted sockets now inherit close-on-exec (posix) and SO_NOSIGPIPE (macOS) like freshly created ones - accepted connections leaked into child processes, and a client reset could SIGPIPE-kill a macOS server
+* Fixed resolving "255.255.255.255" (UDP limited broadcast) throwing "Unknown host" - inet_addr's error value collides with the broadcast address
+* Socket close no longer retries on EINTR (posix releases the descriptor regardless, so the retry could close a descriptor just handed to another thread) and runs in the GC free zone so a lingering close cannot stall collection
+* Hardened the socket/TLS buffer bounds checks against integer overflow in position+length
+* Fixed sys.ssl Certificate loading with a null CA chain crashing (the null check tested the wrong handle), and message digests over-allocating their result 4x
+* Fixed GC finalizer-map corruption when a finalizer unregisters itself or another finalizer: dropping an unclosed haxe.zip Compress/Uncompress (whose finalizer calls the same close() as manual cleanup) invalidated the iterator the GC was holding - undefined behavior on every such collection. Dead entries are now unregistered before their callbacks run
+* Fixed Array<Dynamic>.concat/blit with an empty untyped operand silently corrupting the receiver: it installed byte storage, so a later push(300) stored 44 and push(-1) stored 255
+* Fixed Array<Dynamic>.resize on a fresh untyped array: the result reported length 0, pop/shift/copy/slice/concat ignored the elements, and the first typed push rewrote the null elements as 0/false
+* Fixed untyped-array equality operators: comparing a wrapped array with null was inverted, == against a typed array permanently froze and retyped the array as a side effect of comparing, and == / != could both be true for the same operands (now identity comparison, like all other array comparisons)
+* Fixed memcmp on an empty untyped array returning inverted results (reported two empty arrays as different and an empty vs non-empty as equal)
+* Fixed bool-element untyped arrays mislabeling their storage after copy/slice/concat/splice, which made a later push(5) silently store true
+* Out-of-range reads on an untyped array now return null instead of a boxed 0/false from the typed backing store
+* Mixing Int64 and Float values in an untyped array now promotes to object storage instead of silently rounding Int64 values beyond 2^53 through a double
+* haxe.zip.Uncompress.run no longer reallocates and copies the whole accumulated output per 64KB chunk (quadratic - decompressing 100MB copied ~80GB), and guards against 2GB overflow instead of writing past the output
+* A zlib stream requesting a preset dictionary (FDICT) now throws instead of looping forever (denial of service on hostile input); zlib failures now include the error code and zlib's message text instead of a bare "ZLib Error"
+* Fixed haxe.zip streaming buffers held as raw pointers across the GC free zone while zlib runs (moving-GC corruption window), an uninitialized flush mode for unknown mode strings, Compress.run copying its whole result an extra time to shrink it, and using a closed Uncompress reporting "Compress closed"
+* Writing to a dead child process's stdin no longer kills the whole host process via SIGPIPE on Linux/macOS - it throws like other closed-stream writes (SIGPIPE is now ignored process-wide once sys.io.Process is used)
+* Process.kill/exitCode/getPid after close() now throw instead of operating on a recycled OS handle - kill() could terminate an unrelated process and exitCode() hang forever
+* A child process killed by a signal (crash, kill()) no longer reports exit code 0: exitCode() returns 128+signal (shell convention); a command that cannot be executed reports 127 instead of 1
+* Fixed Process.exitCode(false) on Windows conflating exit code 259 with "still running" (could poll forever) and reading an uninitialized exit code when the status query failed; on Linux a stale EINTR turned the non-blocking poll into a 100% CPU busy-wait
+* Process pipe reads/writes now retry on EINTR instead of reporting a bogus EOF mid-stream (silent output truncation under signals), and a failed stdin write throws instead of making writeFullBytes spin forever
+* Process pipes are now close-on-exec: concurrently spawned children no longer inherit each other's descriptors, which held stdout/stderr open so reads hung past child exit; closing an unconsumed process also reaps the zombie if it already exited
+* Fixed sys.io.Process resource leaks: a failed CreateProcess (e.g. executable not found) leaked six pipe handles per attempt on Windows, partial pipe/fork failures leaked descriptors on posix, and an unchecked CreatePipe could close arbitrary process handles via uninitialized stack values
+* The forked child no longer allocates GC memory in the exec-failure path (deadlock risk in multithreaded apps) and uses _exit instead of running the parent's atexit handlers; a quote embedded in the Windows command name is rejected instead of smuggling extra arguments
+* Fixed every Thread.create on Windows leaking a kernel thread handle for the process lifetime
+* An uncaught exception in a sys.thread.Thread now prints the exception instead of silently terminating the whole process with no diagnostic; the thread's closure is released when it finishes instead of being pinned by the thread handle
+* Fixed native threads that touch a Haxe thread API leaking a semaphore (a kernel event handle on Windows) per thread, and Lock.wait/timed waits overflowing for very large timeout values
+* Fixed a latent use-after-free in the ndll primitive cache: cache keys were made permanent only after insertion (which changes a local copy, not the stored key), so any cpp.Lib.load after a GC cycle compared against freed string data
+* Fixed == on loaded ndll primitives returning true exactly when they were different functions (inverted comparison contract)
+* The plugin loader (module registry, primitive cache, kind registry, search paths) is now thread-safe; failed lookups no longer permanently grow the registries; __hxcpp_unload_all_libraries clears the caches so later loads cannot use freed module handles or call into unmapped libraries
+* "Could not load module" errors now include the OS loader detail (dlerror/Windows error code) - a missing dependent library or wrong bitness was indistinguishable from file-not-found
+* CFFI fixes: buffer_to_string returned an unterminated string aliasing the live buffer (later appends mutated the result, C consumers overread); val_fun_nargs reported arbitrary objects as varargs functions instead of faNotFunction; val_to_buffer/val_array_push silently failed for dynamically typed arrays; an abstract allocated with a size but no finalizer leaked its payload on collection; loaded primitives report their real arity
+* Haxelib resolution fixes: non-ASCII Windows home directories no longer break ndll lookup (wide environment reads, copied instead of aliasing CRT storage), trailing whitespace in .current/.dev files is trimmed, and pushing an empty dll path no longer inserts the filesystem root into the search list
+* Debugger fixes: an inverted condition silently disabled all breakpoints after toggling execution trace (and ran the per-line handler forever with none set); thread-terminated events always reported thread -1; querying a thread that exited during a break-all crashed the debugged process (NULL map entry); reading stack variables could deadlock the whole process (GC allocation under the debugger lock); break-all no longer stalls every thread for the 2s timeout; replacing breakpoints freed the old set while unlocked readers could still dereference it; stepping state is atomic (lost step counts with multiple threads); a detach racing a stop no longer calls a null handler; execution trace logged every line twice
+* Math.round/fround no longer double-round (the largest double below 0.5 rounded to 1 where every other target gives 0), Math.floor/ceil/round of NaN is a defined 0 on every platform (was undefined per-platform behavior), and Type.getClassFields(Math) reports the full field list
+* cpp.encoding hardening (new marshal API surface): Ascii.decode no longer truncates at the first NUL byte; malformed UTF-8 (bad continuation bytes, overlong forms, codepoints beyond U+10FFFF) throws instead of producing mojibake, desynchronized decodes, or leaking uninitialized memory into the decoded String; decoded ASCII/char strings are properly NUL-terminated; a lone trailing surrogate reports "Invalid UTF16" instead of an internal view error; the all-ASCII detection is a byte scan instead of a triple decode
+* Sped up sys.thread.Deque and the thread message queue ~25x for deep queues (200k add+drain: 1070ms -> 43ms): popping advances a head offset with amortized compaction instead of memmoving the entire remaining queue per pop while holding the lock; uncontended queue operations also skip two GC-free-zone transitions via a try-lock fast path
+* Reduced stop-the-world GC work: the per-collect class-statics walk iterates a dense registration list instead of chasing the class registry's hash buckets (the list replaces entries in place when cppia reloads re-register a name, so replaced classes do not stay rooted)
+* Type.resolveClass no longer crashes when called by a native host before any class has booted
+
 * Updated mbedtls to 2.28.2
 * Updated sqlite to 3.40.1
 * Updated zlib to 1.2.13
@@ -22,6 +130,28 @@
 * Fixed critial error handler returning the wrong callstack
 * Fixed ARM64 library names on Mac
 * Fixed generational GC when used with HXCPP_ALIGN_ALLOC
+* Fixed heap corruption in the moving/compacting GC (HXCPP_GC_MOVING) with HXCPP_ALIGN_ALLOC: the alignment padding added to the destination position was not deducted from the remaining hole length, so the free-space count drifted and an object could be relocated past the end of a block, corrupting adjacent objects
+* Fixed the moving GC not adjusting pointers held by large (non-block) objects after a compaction, leaving them dangling
+* Fixed heap corruption sorting arrays of Bool or small integer element types (Array&lt;Bool&gt;.sort, cpp.UInt8/Int16/etc): the buffer was reinterpreted as an array of Dynamic and read/written out of bounds
+* Fixed Array.resize with a negative size zeroing memory before the array buffer
+* Fixed integer overflow in array growth size math: huge reserve/resize requests now throw a catchable exception instead of corrupting the heap, and pushing past ~2GB of buffer no longer hangs in an infinite loop
+* Fixed integer overflow in Array.splice with huge lengths (now clamps like other targets) and rejected negative element counts in array blit
+* Fixed haxe.io.Bytes.fill with a negative position writing before the buffer (GC heap corruption)
+* Fixed out-of-bounds read looking up a missing field on an anonymous object with exactly 5 fields, and missed lookups when field-name hashes collide
+* Fixed String.fromCharCode with negative codes corrupting global memory (now throws), and made its lazy lookup-table init thread-safe
+* Fixed charAt/substr on non-ASCII byte strings in legacy (non-smart-strings) builds passing negative char codes
+* Fixed UTF-16 surrogate-pair validation: a lone high surrogate no longer swallows the following character, produces corrupt code points, or scans past the end of the buffer when converting to UTF-8 (out-of-bounds read)
+* Fixed haxe.zip.Uncompress/Compress execute() returning cumulative stream totals instead of per-call counts, which broke haxe.zip.Uncompress.run for any output larger than the buffer size (64K default) and corrupted all streaming loops after the first call
+* Fixed zlib state leaks: Compress.run/Uncompress.run now release zlib's internal state on all paths including errors, and closing a Compress/Uncompress no longer leaks the stream structure
+* Fixed Windows console writes larger than 4096 UTF-16 units being silently discarded while reporting success (output is now converted and written in chunks), and fixed the broken surrogate constants in the partial-write accounting
+* Fixed a lost wakeup in sys.thread.Deque on Windows: with multiple blocked consumers, coalesced signals could leave a consumer asleep while items sat in the queue
+* Fixed comparison of boxed Int64 values above 2^53 (was routed through double, making distinct values compare equal)
+* Fixed null Dynamic operands crashing in -, *, ++ and -- (now treated as 0, consistent with +, / and %)
+* Fixed Std.parseInt undefined behaviour passing non-ASCII chars to isspace, and made overflow behaviour platform-independent (decimal values saturate to the Int range instead of depending on the platform's long size)
+* Fixed sys.io.Process.close followed by stdin.close closing a stale (possibly recycled by the OS) handle
+* Fixed EReg.matchSub integer overflow with huge lengths, regex runtime errors (e.g. match limit) being silently treated as no-match, and undefined behaviour passing unvalidated UTF-16 subjects to PCRE2 with the no-check flag
+* Fixed sys.thread.Semaphore on Linux throwing spurious exceptions when a signal interrupts acquire/tryAcquire (EINTR is now retried)
+* Fixed sys.thread.Semaphore.tryAcquire on Apple platforms truncating fractional timeouts to whole seconds (0.5 became 0), and a dispatch semaphore leak per Semaphore object
 * Fixed pthread structured being unaligned
 * Fixed cppia crash on functions with empty bodies
 * Fixed regression parsing integers which wrap around
@@ -33,6 +163,14 @@
 * Fixed behaviour of indexOf and lastIndexOf on empty strings not aligning with other targets
 * Fixed behaviour of directory reading function not aligning with other targets
 * Fixed haxelib not being invoked with the current working directory
+* Fixed String(unsigned int) appending a literal "d" (from a "%ud" format) for raw unsigned ints formatted via the runtime
+* Fixed Std.string of NaN/Infinity to match other targets ("NaN", "Infinity", "-Infinity") instead of platform printf output ("-nan(ind)", "inf")
+* Fixed Std.string(Float) losing precision: now emits the shortest representation that round-trips (e.g. 0.1+0.2 prints "0.30000000000000004"), so String<->parseFloat is lossless and matches other targets
+* Normalized float exponent formatting to minimal digits ("1e-7" instead of "1e-07"), matching other targets
+* Fixed out-of-bounds read when deleting a fixed field of an anonymous object (Reflect.deleteField)
+* Fixed String.indexOf with a negative start index reading out of bounds and returning a bogus negative result (now clamps to 0, matching other targets)
+* Fixed String.lastIndexOf with a negative start index returning -1 instead of matching at index 0 (now clamps to 0, matching other targets)
+* Fixed Dynamic modulo (%) dereferencing a null operand without a guard (now coerces null to 0 like the other dynamic operators)
 
 * Removed Haxe 3 support
 

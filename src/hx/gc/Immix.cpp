@@ -10,6 +10,7 @@
 #include <mutex>
 #include <thread>
 #include <condition_variable>
+#include <atomic>
 
 #ifdef __EMSCRIPTEN__
    #include <emscripten/stack.h>
@@ -63,6 +64,7 @@ enum { gAlwaysMove = false };
 #endif
 
 #include <vector>
+#include <utility>
 #include <stdio.h>
 
 #include <hx/QuickVec.h>
@@ -2095,18 +2097,26 @@ void MarkAllocUnchecked(void *inPtr,hx::MarkContext *__inCtx)
 
       char *block = (char *)(ptr_i & IMMIX_BLOCK_BASE_MASK);
       char *rowMark = block + ((ptr_i & IMMIX_BLOCK_OFFSET_MASK)>>IMMIX_LINE_BITS);
-      *rowMark = 1;
+      // Several objects share a row, so the byte is usually set already -
+      // checking first keeps the cache line shared between marker threads
+      // instead of ping-ponging it with redundant stores
+      if (!*rowMark)
+         *rowMark = 1;
       if (rows>1)
       {
-         rowMark[1] = 1;
+         if (!rowMark[1])
+            rowMark[1] = 1;
          if (rows>2)
          {
-            rowMark[2] = 1;
+            if (!rowMark[2])
+               rowMark[2] = 1;
             if (rows>3)
             {
-               rowMark[3] = 1;
+               if (!rowMark[3])
+                  rowMark[3] = 1;
                for(int r=4; r<rows; r++)
-                  rowMark[r]=1;
+                  if (!rowMark[r])
+                     rowMark[r]=1;
             }
          }
       }
@@ -2164,18 +2174,24 @@ void MarkObjectAllocUnchecked(hx::Object *inPtr,hx::MarkContext *__inCtx)
       if ( ((ptr_i & IMMIX_BLOCK_OFFSET_MASK)>>IMMIX_LINE_BITS) + rows > IMMIX_LINES) DebuggerTrap();
       #endif
 
-      *rowMark = 1;
+      // Check before storing - see MarkAllocUnchecked
+      if (!*rowMark)
+         *rowMark = 1;
       if (rows>1)
       {
-         rowMark[1] = 1;
+         if (!rowMark[1])
+            rowMark[1] = 1;
          if (rows>2)
          {
-            rowMark[2] = 1;
+            if (!rowMark[2])
+               rowMark[2] = 1;
             if (rows>3)
             {
-               rowMark[3] = 1;
+               if (!rowMark[3])
+                  rowMark[3] = 1;
                for(int r=4; r<rows; r++)
-                  rowMark[r]=1;
+                  if (!rowMark[r])
+                     rowMark[r]=1;
             }
          }
       }
@@ -2656,40 +2672,49 @@ void RunFinalizers()
          idx++;
    }
 
+   // Unregister dead entries before invoking their callbacks: a finalizer
+   // that itself calls val_gc/_hx_set_finalizer(obj,0) (eg, a close()
+   // shared with the manual-cleanup path) erases the node the loop is
+   // holding, and one that registers a new finalizer can rehash the map -
+   // either invalidates the iterators mid-walk
+   static std::vector< std::pair<hx::Object *,hx::finalizer> > sRunNativeFinalizers;
+   sRunNativeFinalizers.clear();
    for(FinalizerMap::iterator i=sFinalizerMap.begin(); i!=sFinalizerMap.end(); )
    {
       hx::Object *obj = i->first;
-      FinalizerMap::iterator next = i;
-      ++next;
-
       unsigned char mark = ((unsigned char *)obj)[HX_ENDIAN_MARK_ID_BYTE];
       if ( mark!=gByteMarkID )
       {
          finalizerCount++;
-         (*i->second)(obj);
-         sFinalizerMap.erase(i);
+         sRunNativeFinalizers.push_back( std::make_pair(obj, i->second) );
+         i = sFinalizerMap.erase(i);
       }
-
-      i = next;
+      else
+         ++i;
    }
+   for(size_t run=0; run<sRunNativeFinalizers.size(); run++)
+      (*sRunNativeFinalizers[run].second)(sRunNativeFinalizers[run].first);
+   sRunNativeFinalizers.clear();
 
 
+   static std::vector< std::pair<hx::Object *,HaxeFinalizer> > sRunHaxeFinalizers;
+   sRunHaxeFinalizers.clear();
    for(HaxeFinalizerMap::iterator i=sHaxeFinalizerMap.begin(); i!=sHaxeFinalizerMap.end(); )
    {
       hx::Object *obj = i->first;
-      HaxeFinalizerMap::iterator next = i;
-      ++next;
-
       unsigned char mark = ((unsigned char *)obj)[HX_ENDIAN_MARK_ID_BYTE];
       if ( mark!=gByteMarkID )
       {
          finalizerCount++;
-         (*i->second)(obj);
-         sHaxeFinalizerMap.erase(i);
+         sRunHaxeFinalizers.push_back( std::make_pair(obj, i->second) );
+         i = sHaxeFinalizerMap.erase(i);
       }
-
-      i = next;
+      else
+         ++i;
    }
+   for(size_t run=0; run<sRunHaxeFinalizers.size(); run++)
+      (*sRunHaxeFinalizers[run].second)(sRunHaxeFinalizers[run].first);
+   sRunHaxeFinalizers.clear();
 
    MEM_STAMP(hx::tFinalizers);
 
@@ -3119,6 +3144,9 @@ public:
       memset((void *)mNextFreeBlockOfSize,0,sizeof(mNextFreeBlockOfSize));
       mRowsInUse = 0;
       mLargeAllocated = 0;
+      mLargeMin = (size_t)-1;
+      mLargeMax = 0;
+      mRecycleSize = 0;
       mLargeAllocSpace = 40 << 20;
       mLargeAllocForceRefresh = mLargeAllocSpace;
       // Start at 1 Meg...
@@ -3207,8 +3235,16 @@ public:
          unsigned int size = *blob;
          mLargeListLock.lock();
          mLargeAllocated -= size;
-         // Could somehow keep it in the list, but mark as recycled?
-         mLargeList.qerase_val(blob);
+         // Search from the end - the realloc-growth path frees the buffer it
+         // just allocated, which is the most recently pushed entry, so the
+         // common case finds it immediately instead of scanning the whole
+         // list (qerase does not preserve order, so direction is free)
+         for(int i=mLargeList.size()-1;i>=0;i--)
+            if (mLargeList[i]==blob)
+            {
+               mLargeList.qerase(i);
+               break;
+            }
          // We could maybe free anyhow?
          if (!largeObjectRecycle.hasExtraCapacity(1))
          {
@@ -3217,6 +3253,7 @@ public:
             return;
          }
          largeObjectRecycle.push(blob);
+         mRecycleSize = largeObjectRecycle.size();
          mLargeListLock.unlock();
       }
    }
@@ -3250,26 +3287,30 @@ public:
       bool isLocked = false;
 
 
-      if (largeObjectRecycle.size())
+      // Probe the count only - scanning the vector itself unlocked raced
+      // with concurrent push/qerase under the lock (and the old recheck
+      // 'continue' skipped the entry swapped into the current slot)
+      if (mRecycleSize)
       {
+         if (do_lock && !isLocked)
+         {
+            mLargeListLock.lock();
+            isLocked = true;
+         }
          for(int i=0;i<largeObjectRecycle.size();i++)
          {
             if ( largeObjectRecycle[i][0] == inSize )
             {
-               if (do_lock && !isLocked)
-               {
-                  mLargeListLock.lock();
-                  isLocked = true;
-                  if (  i>=largeObjectRecycle.size() || largeObjectRecycle[i][0] != inSize )
-                     continue;
-               }
-
                result = largeObjectRecycle[i];
                largeObjectRecycle.qerase(i);
-               // You can use this to test race condition
-               //Sleep(1);
+               mRecycleSize = largeObjectRecycle.size();
                break;
             }
+         }
+         if (do_lock && !result)
+         {
+            mLargeListLock.unlock();
+            isLocked = false;
          }
       }
 
@@ -3313,6 +3354,15 @@ public:
 
       mLargeList.push(result);
       mLargeAllocated += inSize;
+
+      // Grow-only object-pointer bounds, used to reject conservative-mark
+      // candidates without scanning the list.  Stale-wide after frees is
+      // fine - the bounds only ever skip definite non-members.
+      size_t objPtr = (size_t)(result+2);
+      if (objPtr < mLargeMin)
+         mLargeMin = objPtr;
+      if (objPtr > mLargeMax)
+         mLargeMax = objPtr;
 
       if (do_lock)
          mLargeListLock.unlock();
@@ -3802,7 +3852,16 @@ public:
                         }
 
                         #ifdef HXCPP_ALIGN_ALLOC
-                        destPos += ALIGN_PADDING(destPos);
+                        // The fit test above reserved space for this alignment
+                        // padding (allocSize + ALIGN_PADDING), so the padding must
+                        // be charged against destLen as well as destPos - otherwise
+                        // destLen over-counts the free space and a later object can
+                        // be placed past the end of the block.
+                        {
+                           int alignPad = ALIGN_PADDING(destPos);
+                           destPos += alignPad;
+                           destLen -= alignPad;
+                        }
                         #endif
 
                         int startRow = destPos>>IMMIX_LINE_BITS;
@@ -4010,9 +4069,15 @@ public:
 
                            // TODO - not copy + paste
 
-                        printf("Move!\n");
                            #ifdef HXCPP_ALIGN_ALLOC
-                           destPos += ALIGN_PADDING(destPos);
+                           // Charge the alignment padding against destLen too (see
+                           // the matching fix in MoveBlocks) so destLen cannot
+                           // over-count free space and overflow the block.
+                           {
+                              int alignPad = ALIGN_PADDING(destPos);
+                              destPos += alignPad;
+                              destLen -= alignPad;
+                           }
                            #endif
 
                            int startRow = destPos>>IMMIX_LINE_BITS;
@@ -4263,6 +4328,23 @@ public:
       else
          for(int i=0;i<mAllBlocks.size();i++)
             mAllBlocks[i]->VisitBlock(inCtx);
+
+      // Large objects are not stored in blocks and never move, but they can hold
+      // references into the moved heap, so their members must be visited too -
+      // the mAllBlocks pass above only covers block-sized allocations.  The
+      // remembered-set path covers these via the write barrier.
+      if (!inRemembered)
+         for(int i=0;i<mLargeList.size();i++)
+         {
+            unsigned int *blob = mLargeList[i];
+            if ( (blob[1] & IMMIX_ALLOC_MARK_ID) == hx::gMarkID &&
+                 (blob[1] & IMMIX_ALLOC_IS_CONTAINER) )
+            {
+               hx::Object *obj = (hx::Object *)(blob + 2);
+               if (*(void **)obj)
+                  obj->__Visit(inCtx);
+            }
+         }
 
       for(int i=0;i<mLocalAllocs.size();i++)
          VisitLocalAlloc(mLocalAllocs[i], inCtx);
@@ -5112,6 +5194,7 @@ public:
          else
             idx++;
       }
+      mRecycleSize = largeObjectRecycle.size();
 
       int l1 = mLargeList.size();
 
@@ -5559,6 +5642,12 @@ public:
       if (isBlock)
          return memBlock;
 
+      // Most stack words are nowhere near the large allocations - reject on
+      // the cached bounds before paying for the full list scan
+      size_t p = (size_t)inPtr;
+      if (p < mLargeMin || p > mLargeMax)
+         return memUnmanaged;
+
       for(int i=0;i<mLargeList.size();i++)
       {
          unsigned int *blob = mLargeList[i] + 2;
@@ -5575,6 +5664,8 @@ public:
    size_t mLargeAllocSpace;
    size_t mLargeAllocForceRefresh;
    size_t mLargeAllocated;
+   size_t mLargeMin;
+   size_t mLargeMax;
    size_t mTotalAfterLastCollect;
    size_t mAllBlocksCount;
    double mGenerationalRetainEstimate;
@@ -5594,6 +5685,9 @@ public:
    hx::QuickVec<LocalAllocator *> mLocalAllocs;
    LocalAllocator *mLocalPool[LOCAL_POOL_SIZE];
    hx::QuickVec<unsigned int *> largeObjectRecycle;
+   // Lock-free probe for AllocLarge - only read unlocked, maintained under
+   // mLargeListLock (or stop-the-world in the sweep)
+   volatile int mRecycleSize;
 };
 
 
@@ -5662,6 +5756,10 @@ void MarkConservative(int *inBottom, int *inTop,hx::MarkContext *__inCtx)
 
       if (vptr && !((size_t)vptr & validObjectMask) && vptr!=prev && vptr!=lastPin)
       {
+         // Last-value cache - adjacent stack slots often hold the same
+         // pointer (spills, argument copies), and without this assignment
+         // the prev test above never fires
+         prev = vptr;
 
          #ifdef PROFILE_COLLECT
          hx::localCount++;
@@ -5792,7 +5890,10 @@ class LocalAllocator : public hx::StackContext
    int                   mRegisterBufSize;
 
    #ifndef HXCPP_SINGLE_THREADED_APP
-   bool            mGCFreeZone;
+   volatile bool   mGCFreeZone;
+   // True while our mReadyForCollect event may be set - lets the zone exit
+   // clear it without taking the global state lock
+   bool            mReadySignalled;
    HxSemaphore     mReadyForCollect;
    HxSemaphore     mCollectDone;
    #endif
@@ -5852,6 +5953,7 @@ public:
       #ifndef HXCPP_SINGLE_THREADED_APP
       mGCFreeZone = true;
       mReadyForCollect.Set();
+      mReadySignalled = true;
       #endif
       sGlobalAlloc->AddLocal(this);
    }
@@ -6062,7 +6164,18 @@ public:
       #endif
 
       mGCFreeZone = true;
-      mReadyForCollect.Set();
+      // The collector announces itself by setting gPauseForCollect (a full
+      // atomic op) before it reads mGCFreeZone.  With the store-load fence
+      // here, at least one side observes the other: either the collector
+      // sees us safely in the zone, or we see the pending collection and
+      // signal.  When no collection is pending this skips the kernel-event
+      // call entirely.
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      if (*(volatile int *)&hx::gPauseForCollect)
+      {
+         mReadyForCollect.Set();
+         mReadySignalled = true;
+      }
       #endif
    }
 
@@ -6094,9 +6207,31 @@ public:
       if (!mGCFreeZone)
          CriticalGCError("GCFree Zone mismatch");
 
-      std::lock_guard<std::recursive_mutex> lock(*gThreadStateChangeLock);
-      mReadyForCollect.Reset();
+      // Clear any signal we own before leaving the zone, so a collector
+      // that observes us outside it cannot consume a stale event and scan
+      // while we run
+      if (mReadySignalled)
+      {
+         mReadyForCollect.Reset();
+         mReadySignalled = false;
+      }
+
       mGCFreeZone = false;
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      if (*(volatile int *)&hx::gPauseForCollect)
+      {
+         // A collection is pending or running.  The collector either saw us
+         // in the zone (and expects us to stay parked) or is waiting on our
+         // event - re-enter the zone, signal, and queue on the state lock,
+         // which the collector holds until the collect completes.
+         mGCFreeZone = true;
+         mReadyForCollect.Set();
+         mReadySignalled = true;
+         std::lock_guard<std::recursive_mutex> lock(*gThreadStateChangeLock);
+         mReadyForCollect.Reset();
+         mReadySignalled = false;
+         mGCFreeZone = false;
+      }
       #endif
    }
         // For when we already hold the lock
@@ -6104,6 +6239,7 @@ public:
    {
       #ifndef HXCPP_SINGLE_THREADED_APP
       mReadyForCollect.Reset();
+      mReadySignalled = false;
       mGCFreeZone = false;
       #endif
    }

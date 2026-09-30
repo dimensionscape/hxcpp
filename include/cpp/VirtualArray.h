@@ -42,7 +42,7 @@ public:
    template<typename SOURCE_> inline bool operator==( const Array<SOURCE_> &inRHS );
 
    inline bool operator!=(Dynamic value) const { return value!=*this; }
-   template<typename SOURCE_> inline bool operator!=( const Array<SOURCE_> &inRHS ) { return inRHS!=*this; }
+   template<typename SOURCE_> inline bool operator!=( const Array<SOURCE_> &inRHS ) { return !operator==(inRHS); }
 
 };
 
@@ -217,10 +217,12 @@ public:
          case hx::arrayFixed:
             return;
          case hx::arrayInt:
-         case hx::arrayInt64:
          case hx::arrayEmpty:
             MakeFloatArray();
             break;
+         case hx::arrayInt64:
+            // A double cannot represent every Int64 - rewriting the
+            // existing elements as floats silently loses precision
          case hx::arrayBool:
          case hx::arrayString:
             MakeObjectArray();
@@ -255,7 +257,6 @@ public:
       {
          case hx::arrayNull:
          case hx::arrayInt64:
-         case hx::arrayFloat:
          case hx::arrayObject:
          case hx::arrayFixed:
             return;
@@ -263,6 +264,9 @@ public:
          case hx::arrayEmpty:
             MakeInt64Array();
             break;
+         case hx::arrayFloat:
+            // Storing the Int64 as a double would silently lose precision
+            // for values beyond 2^53
          case hx::arrayBool:
          case hx::arrayString:
             MakeObjectArray();
@@ -471,10 +475,20 @@ public:
    VirtualArray concat( VirtualArray inTail )
    {
       inTail->checkBase();
-      EnsureArrayStorage(inTail);
+      // Empty tail first: converging the storage on an empty-store tail
+      // used to install a byte array in the receiver (EnsureBase), making
+      // later int pushes truncate to 8 bits
       if (inTail->__length()<1)
          return copy();
-      return new VirtualArray_obj( base->__concat(inTail), store==hx::arrayFixed );
+      EnsureArrayStorage(inTail);
+      if (!base)
+         MakeObjectArray();
+      VirtualArray result = new VirtualArray_obj( base->__concat(inTail), store==hx::arrayFixed );
+      if (store!=hx::arrayFixed)
+         // The constructor infers the store from the element type, which
+         // reports bool storage as object - keep the known store
+         result->store = store;
+      return result;
    }
    VirtualArray copy( )
    {
@@ -482,14 +496,20 @@ public:
       if (store==hx::arrayEmpty)
          return new VirtualArray_obj(hx::arrayEmpty);
 
-      return new VirtualArray_obj(base->__copy(), store==hx::arrayFixed);
+      VirtualArray result = new VirtualArray_obj(base->__copy(), store==hx::arrayFixed);
+      if (store!=hx::arrayFixed)
+         result->store = store;
+      return result;
    }
    VirtualArray slice(int inPos, Dynamic end = null())
    {
       checkBase();
       if (store==hx::arrayEmpty)
          return new VirtualArray_obj(hx::arrayEmpty);
-      return new VirtualArray_obj(base->__slice(inPos,end), store==hx::arrayFixed);
+      VirtualArray result = new VirtualArray_obj(base->__slice(inPos,end), store==hx::arrayFixed);
+      if (store!=hx::arrayFixed)
+         result->store = store;
+      return result;
    }
    VirtualArray splice(int inPos, int len);
    VirtualArray map(ArrayBase::DynamicMappingFunc inFunc);
@@ -547,13 +567,19 @@ public:
    {
       checkBase();
       if (store==hx::arrayEmpty)
-         return inOther->__length() == 0;
+         // memcmp convention: 0 means equal (was inverted - returned 1
+         // for two empty arrays and 0 against a non-empty one)
+         return inOther->__length() == 0 ? 0 : -1;
       return base->__memcmp(inOther);
    }
    inline void blit(int inDestElement,  cpp::VirtualArray inSourceArray, int inSourceElement, int inElementCount)
    {
       inSourceArray->checkBase();
-      EnsureArrayStorage(inSourceArray);
+      // See concat - an empty-store source must not poison the receiver
+      if (inSourceArray->store!=hx::arrayEmpty)
+         EnsureArrayStorage(inSourceArray);
+      else if (!base && inElementCount>0)
+         MakeObjectArray();
       if (base)
          base->__blit(inDestElement, inSourceArray, inSourceElement, inElementCount);
    }
@@ -561,7 +587,9 @@ public:
    String join(String inSeparator) { checkBase(); if (!base) return HX_CSTRING(""); return base->__join(inSeparator); }
 
 
-   Dynamic __get(int inIndex) const { checkBase(); if (store==hx::arrayEmpty) return null(); return base->__GetItem(inIndex); }
+   // Out-of-range reads on a dynamically typed array are null, not the
+   // element type's default (the typed __GetItem would box 0/false/"")
+   Dynamic __get(int inIndex) const { checkBase(); if (store==hx::arrayEmpty || inIndex<0 || inIndex>=get_length()) return null(); return base->__GetItem(inIndex); }
 
 #if (HXCPP_API_LEVEL>=500)
    ::hx::Callable<::cpp::VirtualArray(::cpp::VirtualArray)> concat_dyn();
@@ -611,7 +639,7 @@ public:
    ::hx::Callable<::Dynamic(::Dynamic, ::Dynamic)> __unsafe_set_dyn();
    ::hx::Callable<void(int, ::cpp::VirtualArray, int, int)> blit_dyn();
    ::hx::Callable<void(::Dynamic, ::Dynamic)> zero_dyn();
-   ::hx::Callable<void(::cpp::VirtualArray)> memcmp_dyn();
+   ::hx::Callable<int(::cpp::VirtualArray)> memcmp_dyn();
    ::hx::Callable<void(int)> resize_dyn();
 #else
    Dynamic concat_dyn();
@@ -744,8 +772,11 @@ template<typename SOURCE_>
 inline bool VirtualArray::operator==( const Array<SOURCE_> &inRHS )
 {
    if (!mPtr)
-      return inRHS.mPtr;
-   return mPtr->castArray< Array<SOURCE_> >() == inRHS;
+      return !inRHS.mPtr;
+   // Identity comparison like every other array == - the old castArray
+   // route permanently froze and retyped this array as a side effect of
+   // comparing, and disagreed with the reversed operand order
+   return mPtr->__GetRealObject() == (hx::Object *)inRHS.mPtr;
 }
 
 } // end namespace cpp

@@ -27,6 +27,10 @@ hx::thread::CountingSemaphore_obj::CountingSemaphore_obj(int value) : impl(new I
 
 void hx::thread::CountingSemaphore_obj::acquire()
 {
+	// Uncontended fast path - skip the GC free zone unless we will block
+	if (NO_ERROR == WaitForSingleObject(impl->semaphore, 0))
+		return;
+
 	hx::EnterGCFreeZone();
 
 	if (NO_ERROR != WaitForSingleObject(impl->semaphore, INFINITE))
@@ -48,6 +52,20 @@ void hx::thread::CountingSemaphore_obj::release()
 
 bool hx::thread::CountingSemaphore_obj::tryAcquire(Null<double> timeout)
 {
+	// Zero-timeout poll cannot block - no free zone needed.  Also try a
+	// non-blocking grab first for the timed case.
+	switch (WaitForSingleObject(impl->semaphore, 0))
+	{
+	case NO_ERROR:
+		return true;
+	case WAIT_TIMEOUT:
+		if (timeout.Default(0)<=0)
+			return false;
+		break;
+	default:
+		return hx::Throw(HX_CSTRING("Failed to wait for semaphore"));
+	}
+
 	hx::EnterGCFreeZone();
 
 	switch (WaitForSingleObject(impl->semaphore, static_cast<DWORD>(timeout.Default(0) * 1000)))

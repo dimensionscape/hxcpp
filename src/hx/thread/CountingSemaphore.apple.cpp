@@ -45,8 +45,11 @@ bool hx::thread::CountingSemaphore_obj::tryAcquire(Null<double> timeout)
 {
 	hx::AutoGCFreeZone zone;
 
+	// Convert to nanoseconds before truncating - casting the seconds value
+	// first discards the fractional part, so tryAcquire(0.5) returned
+	// immediately instead of waiting 500ms
 	return
 		(0 == dispatch_semaphore_wait(
 			impl->semaphore,
-			dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(timeout.Default(0)) * 1000 * 1000 * 1000)));
+			dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(timeout.Default(0) * 1e9))));
 }

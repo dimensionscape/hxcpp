@@ -113,8 +113,14 @@ void GCAddFinalizer(hx::Object *v, finalizer f)
 
 HX_CHAR *NewString(int inLen)
 {
-   char *result =  (char *)hx::InternalNew( (inLen+1)*sizeof(char), false );
+   // Strings long enough for rehashing to be noticeable get four extra
+   // bytes after the terminator, where String::hash() memoizes the hash on
+   // first use
+   bool hashSlot = inLen >= HX_GC_STRING_HASH_SLOT_MIN_LEN;
+   char *result =  (char *)hx::InternalNew( (inLen+1)*sizeof(char) + (hashSlot ? 4 : 0), false );
    result[inLen] = '\0';
+   if (hashSlot)
+      ((unsigned int *)result)[-1] |= HX_GC_STRING_HASH_SLOT;
 #ifdef HXCPP_TELEMETRY
    __hxt_new_string(result, inLen+1);
 #endif

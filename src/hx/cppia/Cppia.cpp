@@ -4807,6 +4807,14 @@ struct DataVal : public CppiaExprWithValue
 
    ExprType getType() HXCPP_OVERRIDE { return (ExprType)ExprTypeOf<T>::value; }
 
+   bool getConstantInt(int &outValue) HXCPP_OVERRIDE
+   {
+      if (getType()!=etInt)
+         return false;
+      outValue = ValToInt(data);
+      return true;
+   }
+
    void        runVoid(CppiaCtx *ctx) HXCPP_OVERRIDE {  }
    int runInt(CppiaCtx *ctx) HXCPP_OVERRIDE { return ValToInt(data); }
    Float       runFloat(CppiaCtx *ctx) HXCPP_OVERRIDE { return ValToFloat(data); }
@@ -5686,6 +5694,9 @@ struct ArrayAccessI : public CppiaDynamicExpr
             ctx->pushInt(i);
 
             AutoStack a(ctx,pointer);
+            // The getter was linked and validated but never invoked, so
+            // setResult read the raw argument frame back as the "result"
+            __get.execute(ctx);
             BCR_VCHECK;
             setResult(ctx,outValue);
          }
@@ -6145,10 +6156,17 @@ struct SwitchExpr : public CppiaExpr
    CppiaExpr *condition;
    std::vector<Case> cases;
    CppiaExpr *defaultCase;
+   // Constant dispatch - when every case condition is a literal int, the
+   // body is found with one hash probe instead of re-running every
+   // condition expression linearly
+   std::unordered_map<int,CppiaExpr *> constIntCases;
+   bool useConstIntCases;
+
 
 
    SwitchExpr(CppiaStream &stream)
    {
+      useConstIntCases = false;
       caseCount = stream.getInt();
       bool hasDefault = stream.getInt();
       condition = createCppiaExpr(stream);
@@ -6173,6 +6191,28 @@ struct SwitchExpr : public CppiaExpr
       }
       if (defaultCase)
          defaultCase = defaultCase->link(inModule);
+
+      // Also worthwhile for float conditions (eg, the int-typed OpMod
+      // reports etFloat) - an exact int-equality check keeps the float
+      // comparison semantics
+      ExprType condType = condition->getType();
+      if (condType==etInt || condType==etFloat)
+      {
+         useConstIntCases = true;
+         for(int i=0;i<caseCount && useConstIntCases;i++)
+            for(int j=0;j<cases[i].conditions.size() && useConstIntCases;j++)
+            {
+               int val = 0;
+               if (cases[i].conditions[j]->getConstantInt(val))
+                  // insert() keeps the first entry, matching the
+                  // first-match-wins order of the linear scan
+                  constIntCases.insert( std::make_pair(val,cases[i].body) );
+               else
+                  useConstIntCases = false;
+            }
+         if (!useConstIntCases)
+            constIntCases.clear();
+      }
       return this;
    }
 
@@ -6201,10 +6241,30 @@ struct SwitchExpr : public CppiaExpr
       switch(condition->getType())
       {
          case etInt :
-             // todo - int/map ?
+             if (useConstIntCases)
+             {
+                std::unordered_map<int,CppiaExpr *>::iterator match =
+                   constIntCases.find( condition->runInt(ctx) );
+                return match!=constIntCases.end() ? match->second : defaultCase;
+             }
              return TGetBody<int>(ctx);
          case etString : return TGetBody<String>(ctx);
-         case etFloat : return TGetBody<Float>(ctx);
+         case etFloat :
+             if (useConstIntCases)
+             {
+                // The cases are all int constants, so only an exactly
+                // integral value can match one (NaN matches nothing)
+                Float fval = condition->runFloat(ctx);
+                int ival = (int)fval;
+                if ( fval==(Float)ival )
+                {
+                   std::unordered_map<int,CppiaExpr *>::iterator match =
+                      constIntCases.find(ival);
+                   return match!=constIntCases.end() ? match->second : defaultCase;
+                }
+                return defaultCase;
+             }
+             return TGetBody<Float>(ctx);
          // Enum
          case etObject : return TGetBody<Dynamic>(ctx);
          default: ;
@@ -7620,12 +7680,32 @@ struct OpMod : public BinOp
 
    int runInt(CppiaCtx *ctx) HXCPP_OVERRIDE
    {
+      if (left->getType()==etInt && right->getType()==etInt)
+      {
+         int lval = left->runInt(ctx);
+         BCR_CHECK;
+         int rval = right->runInt(ctx);
+         // 0 gives NaN and INT_MIN % -1 traps - the double path keeps
+         // the old behaviour for both
+         if (rval!=0 && rval!=-1)
+            return lval % rval;
+         return hx::DoubleMod(lval,rval);
+      }
       double lval = left->runFloat(ctx);
       BCR_CHECK;
       return hx::DoubleMod(lval,right->runFloat(ctx));
    }
    Float runFloat(CppiaCtx *ctx) HXCPP_OVERRIDE
    {
+      if (left->getType()==etInt && right->getType()==etInt)
+      {
+         int lval = left->runInt(ctx);
+         BCR_CHECK;
+         int rval = right->runInt(ctx);
+         if (rval!=0 && rval!=-1)
+            return (Float)(lval % rval);
+         return hx::DoubleMod(lval,rval);
+      }
       Float lval = left->runFloat(ctx);
       BCR_CHECK;
       return hx::DoubleMod(lval,right->runFloat(ctx));
@@ -7638,6 +7718,39 @@ struct OpMod : public BinOp
       {
          left->genCode(compiler,JitVal(),etVoid);
          right->genCode(compiler,JitVal(),etVoid);
+      }
+      else if (left->getType()==etInt && right->getType()==etInt)
+      {
+         
+         // Integer modulo with a real division instead of two int->double
+         // conversions plus a native fmod call.  Divisors 0 and -1 bail to
+         // the double path (division traps: by zero, and INT_MIN % -1).
+         JitTemp leftVal(compiler,etInt);
+         left->genCode(compiler, leftVal, etInt);
+         JitTemp rightVal(compiler,etInt);
+         right->genCode(compiler, rightVal, etInt);
+
+         compiler->move(sJitTemp0.as(jtInt), leftVal);
+         compiler->move(sJitTemp1.as(jtInt), rightVal);
+
+         // unsigned (divisor+1) <= 1 catches exactly 0 and -1
+         compiler->add(sJitTemp2.as(jtInt), sJitTemp1.as(jtInt), (int)1);
+         JumpId bail = compiler->compare(cmpI_LESS_EQUAL, sJitTemp2.as(jtInt), (int)1, 0);
+
+         // quotient -> R0, remainder -> R1
+         compiler->divmod();
+         compiler->convert(sJitTemp1.as(jtInt), etInt, inDest, destType);
+         JumpId done = compiler->jump();
+
+         compiler->comeFrom(bail);
+         JitTemp leftRightVal(compiler,etFloat, sizeof(Float)*2 );
+         compiler->convert(leftVal, etInt, leftRightVal, etFloat);
+         compiler->convert(rightVal, etInt, leftRightVal + sizeof(Float), etFloat);
+         compiler->add(sJitArg0, leftRightVal.getReg(), leftRightVal.offset );
+         compiler->callNative((void *)double_mod, sJitArg0 );
+         compiler->convert(leftRightVal,etFloat,inDest,destType);
+
+         compiler->comeFrom(done);
       }
       else
       {
@@ -7904,7 +8017,9 @@ CppiaExpr *createCppiaExpr(CppiaStream &stream)
    else if (tok=="s")
       result = new StringVal(stream.getInt());
    else if (tok=="f")
-      result = new DataVal<Float>(atof( stream.module->strings[stream.getInt()].out_str() ));
+      // Locale-independent - a host setlocale must not change how cppia
+      // float constants parse
+      result = new DataVal<Float>(_hx_strtod_c_locale( stream.module->strings[stream.getInt()].out_str() ));
    else if (tok=="i")
       result = new DataVal<int>(stream.getInt());
    else if (tok=="POSINFO")

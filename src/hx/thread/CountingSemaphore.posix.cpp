@@ -29,9 +29,22 @@ hx::thread::CountingSemaphore_obj::CountingSemaphore_obj(int value) : impl(new I
 
 void hx::thread::CountingSemaphore_obj::acquire()
 {
+	// Uncontended fast path - skip the GC free zone unless we will block
+	if (0 == sem_trywait(&impl->semaphore))
+		return;
+
 	hx::EnterGCFreeZone();
 
-	if (0 != sem_wait(&impl->semaphore))
+	// sem_wait is never restarted after a caught signal, regardless of
+	// SA_RESTART - retry on EINTR rather than throwing spuriously
+	int r;
+	do
+	{
+		r = sem_wait(&impl->semaphore);
+	}
+	while (0 != r && EINTR == errno);
+
+	if (0 != r)
 	{
 		hx::ExitGCFreeZone();
 		hx::Throw(HX_CSTRING("Failed to wait on semaphore"));
@@ -71,7 +84,15 @@ bool hx::thread::CountingSemaphore_obj::tryAcquire(Null<double> timeout)
 		t.tv_sec = tv.tv_sec + idelta + idelta2;
 		t.tv_nsec = (long)delta;
 
-		if (0 == sem_timedwait(&impl->semaphore, &t))
+		// Retry on EINTR - the absolute deadline keeps the timeout intact
+		int r;
+		do
+		{
+			r = sem_timedwait(&impl->semaphore, &t);
+		}
+		while (0 != r && EINTR == errno);
+
+		if (0 == r)
 		{
 			hx::ExitGCFreeZone();
 			return true;

@@ -8,6 +8,7 @@
 #include <io.h>
 #elif defined(__unix__) || defined(__APPLE__)
 #include <sys/time.h>
+#include <unistd.h>
 #ifndef __EMSCRIPTEN__
 typedef int64_t __int64;
 #endif
@@ -225,22 +226,77 @@ namespace hx
 // --- System ---------------------------------------------------------------------
 
 // --- Maths ---------------------------------------------------------
-static double rand_scale = 1.0 / (1<<16) / (1<<16);
+// Thread-local xoshiro256++ generator.  The old C rand() backing took a
+// global libc lock per call on glibc (three calls per Math.random()),
+// produced the same default-seeded sequence on every Windows worker
+// thread (MSVC rand state is per-thread but only the booting thread was
+// seeded), and had only 32 bits of state.
+namespace
+{
+   inline unsigned long long hxRotl64(unsigned long long x, int k)
+   {
+      return (x << k) | (x >> (64 - k));
+   }
+
+   struct HxRandState
+   {
+      unsigned long long s[4];
+      bool seeded;
+
+      void seed()
+      {
+         // The TLS address is distinct per live thread, the counters are
+         // distinct per run - splitmix64 whitens them into a full state
+         unsigned long long mix = (unsigned long long)(size_t)this;
+         mix ^= ((unsigned long long)time(0)) << 24;
+         mix ^= (unsigned long long)clock();
+         #ifdef HX_WINDOWS
+         LARGE_INTEGER now;
+         QueryPerformanceCounter(&now);
+         mix ^= (unsigned long long)now.QuadPart;
+         #endif
+         for(int i=0;i<4;i++)
+         {
+            mix += 0x9e3779b97f4a7c15ULL;
+            unsigned long long z = mix;
+            z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+            z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+            s[i] = z ^ (z >> 31);
+         }
+         seeded = true;
+      }
+
+      inline unsigned long long next()
+      {
+         if (!seeded)
+            seed();
+         unsigned long long result = hxRotl64(s[0] + s[3], 23) + s[0];
+         unsigned long long t = s[1] << 17;
+         s[2] ^= s[0];
+         s[3] ^= s[1];
+         s[1] ^= s[2];
+         s[0] ^= s[3];
+         s[2] ^= t;
+         s[3] = hxRotl64(s[3], 45);
+         return result;
+      }
+   };
+
+   thread_local HxRandState sHxRand;
+}
+
 double __hxcpp_drand()
 {
-   unsigned int lo = rand() & 0xfff;
-   unsigned int mid = rand() & 0xfff;
-   unsigned int hi = rand() & 0xff;
-   double result = (lo | (mid<<12) | (hi<<24) ) * rand_scale;
-   return result;
+   // 53 random mantissa bits in [0,1)
+   return (sHxRand.next() >> 11) * (1.0/9007199254740992.0);
 }
 
 int __hxcpp_irand(int inMax)
 {
-   unsigned int lo = rand() & 0xfff;
-   unsigned int mid = rand() & 0xfff;
-   unsigned int hi = rand() & 0xff;
-   return (lo | (mid<<12) | (hi<<24) ) % inMax;
+   if (inMax<=0)
+      return 0;
+   // Multiply-shift bounding - cheaper than modulo and avoids its bias
+   return (int)(( (sHxRand.next()>>32) * (unsigned long long)(unsigned int)inMax ) >> 32);
 }
 
 #ifdef HX_WINDOWS
@@ -650,12 +706,26 @@ Array<String> __get_args()
 }
 
 
+#ifdef HX_WINDOWS
+// stdout console state - GetConsoleMode is a kernel round-trip, so probing
+// it per print made every println pay a syscall even when redirected.
+// Cached once: a process's stdout handle does not change under us in any
+// supported configuration.
+static bool hxStdoutIsConsole(HANDLE &outHandle)
+{
+   static HANDLE sHandle = GetStdHandle(STD_OUTPUT_HANDLE);
+   static DWORD sMode = 0;
+   static bool sIsConsole = GetConsoleMode(sHandle, &sMode) != 0;
+   outHandle = sHandle;
+   return sIsConsole;
+}
+#endif
+
 void __hxcpp_print_string(const String &inV)
 {
 #ifdef HX_WINDOWS
-   HANDLE handle = GetStdHandle(STD_OUTPUT_HANDLE);
-   DWORD mode;
-   if (GetConsoleMode(handle, &mode) && inV.isUTF16Encoded())
+   HANDLE handle;
+   if (hxStdoutIsConsole(handle) && inV.isUTF16Encoded())
    {
       fflush(stdout);
       WriteConsoleAllW(handle, inV.__WCStr(), inV.length);
@@ -669,9 +739,9 @@ void __hxcpp_print_string(const String &inV)
 void __hxcpp_println_string(const String &inV)
 {
 #ifdef HX_WINDOWS
-   HANDLE handle = GetStdHandle(STD_OUTPUT_HANDLE);
-   DWORD mode;
-   if (GetConsoleMode(handle, &mode) && inV.isUTF16Encoded())
+   HANDLE handle;
+   bool isConsole = hxStdoutIsConsole(handle);
+   if (isConsole && inV.isUTF16Encoded())
    {
       fflush(stdout);
       WriteConsoleAllW(handle, inV.__WCStr(), inV.length);
@@ -682,7 +752,15 @@ void __hxcpp_println_string(const String &inV)
 #endif
    hx::strbuf convertBuf;
    PRINTF("%s\n", inV.out_str(&convertBuf));
-   fflush(stdout);
+   // An interactive console wants the line immediately; for a redirected
+   // stream a forced flush per line is a syscall per println
+#ifdef HX_WINDOWS
+   if (isConsole)
+      fflush(stdout);
+#else
+   if (isatty(1))
+      fflush(stdout);
+#endif
 }
 
 
@@ -704,6 +782,11 @@ bool __instanceof(const Dynamic &inValue, const Dynamic &inType)
 
 int __int__(double x)
 {
+   // NaN slips past both range comparisons into an undefined (int) cast -
+   // MSVC x64 yields INT_MIN, ARM yields 0, so Math.floor(NaN) differed
+   // across platforms of the same target
+   if (x != x)
+      return 0;
    #ifndef __EMSCRIPTEN__
    if (x < -0x7fffffff || x>0x7fffffff )
    {
@@ -722,6 +805,34 @@ static inline bool is_hex_string(const char *c, int len)
       || (len > 3 && (c[0] == '-' || c[0] == '+') && c[1] == '0' && (c[2] == 'x' || c[2] == 'X'));
 }
 
+// Locale-independent strtod - the process locale is global mutable state
+// that host frameworks change after boot, which flips the decimal separator
+// and silently breaks parseFloat (see the matching helper in String.cpp)
+#if defined(HX_WINDOWS) && !defined(HX_WINRT)
+static double hxStrtodC(const char *inStr, char **outEnd)
+{
+   static _locale_t cLoc = _create_locale(LC_NUMERIC, "C");
+   return _strtod_l(inStr, outEnd, cLoc);
+}
+#elif defined(__APPLE__) || defined(__GLIBC__) || (defined(__ANDROID_API__) && __ANDROID_API__>=21)
+#ifdef __APPLE__
+#include <xlocale.h>
+#endif
+static double hxStrtodC(const char *inStr, char **outEnd)
+{
+   static locale_t cLoc = newlocale(LC_NUMERIC_MASK, "C", (locale_t)0);
+   locale_t old = uselocale(cLoc);
+   double result = strtod(inStr, outEnd);
+   uselocale(old);
+   return result;
+}
+#else
+static double hxStrtodC(const char *inStr, char **outEnd)
+{
+   return strtod(inStr, outEnd);
+}
+#endif
+
 Dynamic __hxcpp_parse_int(const String &inString)
 {
    if (!inString.raw_ptr())
@@ -729,20 +840,32 @@ Dynamic __hxcpp_parse_int(const String &inString)
    hx::strbuf buf;
    const char *str = inString.utf8_str(&buf);
 
-   // On the first non space char check to see if we've got a hex string
-   while (isspace(*str)) ++str;
+   // On the first non space char check to see if we've got a hex string.
+   // isspace requires an unsigned char value - a negative char (any
+   // non-ASCII utf8 byte) is undefined behaviour
+   while (isspace((unsigned char)*str)) ++str;
    bool isHex = is_hex_string(str, strlen(str));
    char *end = 0;
-   long result;
+   // Parse at a fixed 64-bit width so the overflow behaviour does not
+   // depend on the platform's long size (32-bit on Windows, 64-bit on
+   // most others)
+   long long result;
    if (isHex)
    {
       bool neg = str[0] == '-';
       if (neg) str++;
-      result = strtoul(str,&end,16);
+      result = (long long)strtoull(str,&end,16);
       if (neg) result = -result;
    }
-   else 
-      result = strtol(str,&end,10);
+   else
+   {
+      result = strtoll(str,&end,10);
+      // Saturate decimal values to the Int range on every platform
+      if (result > 0x7fffffffLL)
+         result = 0x7fffffffLL;
+      else if (result < -0x80000000LL)
+         result = -0x80000000LL;
+   }
    #ifdef HX_WINDOWS
    if (str==end && !isHex)
    #else
@@ -761,7 +884,7 @@ double __hxcpp_parse_substr_float(const String &inString,int start, int length)
    hx::strbuf buf;
    const char *str = inString.ascii_substr(&buf,start,length);
    char *end = (char *)str;
-   double result = str ? strtod(str,&end) : 0;
+   double result = str ? hxStrtodC(str,&end) : 0;
 
    if (end==str)
       return Math_obj::NaN;
@@ -778,7 +901,7 @@ double __hxcpp_parse_float(const String &inString)
    hx::strbuf buf;
    const char *str = inString.utf8_str(&buf);
    char *end = (char *)str;
-   double result = str ? strtod(str,&end) : 0;
+   double result = str ? hxStrtodC(str,&end) : 0;
 
    if (end==str)
       return Math_obj::NaN;
@@ -856,7 +979,17 @@ Dynamic __hxcpp_create_var_args(Dynamic &inArrayFunc)
 
 static std::mutex sgFieldMapMutex;
 
-typedef std::map<std::string,int> StringToField;
+// Transparent comparator: lets find() take the raw char* without
+// constructing a std::string (a heap allocation) per lookup - val_id is
+// called from native extensions inside per-frame callbacks
+struct FieldNameLess
+{
+   typedef void is_transparent;
+   bool operator()(const std::string &a, const std::string &b) const { return a < b; }
+   bool operator()(const std::string &a, const char *b) const { return a.compare(b) < 0; }
+   bool operator()(const char *a, const std::string &b) const { return b.compare(a) > 0; }
+};
+typedef std::map<std::string,int,FieldNameLess> StringToField;
 
 // These need to be pointers because of the unknown order of static object construction.
 String *sgFieldToString=0;
@@ -888,13 +1021,12 @@ int  __hxcpp_field_to_id( const char *inFieldName )
       sgStringToField = new StringToField;
    }
 
-   std::string f(inFieldName);
-   StringToField::iterator i = sgStringToField->find(f);
+   StringToField::iterator i = sgStringToField->find(inFieldName);
    if (i!=sgStringToField->end())
       return i->second;
 
    int result = sgFieldToStringSize;
-   (*sgStringToField)[f] = result;
+   (*sgStringToField)[std::string(inFieldName)] = result;
    String str(inFieldName,strlen(inFieldName));
 
    // Make into "const" string that will not get collected...
@@ -928,9 +1060,16 @@ unsigned char *__hxcpp_memory = 0;
 
 void  __hxcpp_memory_memset(Array<unsigned char> &inBuffer ,int pos, int len, int value)
 {
+   // Clamp the start - a negative pos would write before the buffer
+   if (pos<0)
+   {
+      len += pos;
+      pos = 0;
+   }
    if (pos<inBuffer->length)
    {
-      if (pos+len>inBuffer->length)
+      // Overflow-safe upper clamp
+      if (len > inBuffer->length - pos)
          len = inBuffer->length - pos;
       if (len>0)
          memset( inBuffer->Pointer() + pos, value, len);

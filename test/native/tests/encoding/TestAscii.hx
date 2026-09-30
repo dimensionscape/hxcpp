@@ -50,7 +50,8 @@ class TestAscii extends Test
 	}
 
 	function test_decode_empty() {
-		Assert.raises(() -> Ascii.decode(ViewExtensions.empty()));
+		// Like Utf8.decode and Utf16.decode
+		Assert.equals('', Ascii.decode(ViewExtensions.empty()));
 	}
 
 	function test_decode() {
@@ -63,7 +64,8 @@ class TestAscii extends Test
 		Assert.equals('test', Ascii.decode(buffer.asView()));
 	}
 
-	function test_decode_null_termination() {
+	function test_decode_keeps_nul() {
+		// The view's length is authoritative: a NUL is a character, not the end
 		final buffer = Bytes.alloc(9);
 		buffer.set(0, 't'.code);
 		buffer.set(1, 'e'.code);
@@ -74,13 +76,18 @@ class TestAscii extends Test
 		buffer.set(6, 'e'.code);
 		buffer.set(7, 's'.code);
 		buffer.set(8, 't'.code);
-		
-		Assert.equals('test', Ascii.decode(buffer.asView()));
+
+		final decoded = Ascii.decode(buffer.asView());
+		Assert.equals(9, decoded.length);
+		Assert.equals(0, decoded.charCodeAt(4));
+		Assert.equals('test', decoded.substr(5));
 	}
 
-	function test_decode_no_string() {
+	function test_decode_only_nul() {
 		final buffer = Bytes.alloc(1);
 
-		Assert.equals('', Ascii.decode(buffer.asView()));
+		final decoded = Ascii.decode(buffer.asView());
+		Assert.equals(1, decoded.length);
+		Assert.equals(0, decoded.charCodeAt(0));
 	}
 }

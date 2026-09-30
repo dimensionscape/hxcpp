@@ -22,6 +22,10 @@ hx::thread::ConditionVariable_obj::ConditionVariable_obj() : impl(new Impl())
 
 void hx::thread::ConditionVariable_obj::acquire()
 {
+	// Uncontended fast path - skip the GC free zone unless we will block
+	if (impl->mutex.try_lock())
+		return;
+
 	hx::AutoGCFreeZone zone;
 
 	impl->mutex.lock();

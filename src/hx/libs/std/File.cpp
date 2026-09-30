@@ -155,37 +155,67 @@ int _hx_std_file_write( Dynamic handle, Array<unsigned char> s, int p, int n )
    if (_isatty(_fileno(f->io)) && GetConsoleMode((HANDLE)_get_osfhandle(_fileno(f->io)), &console_mode)) {
       fflush(f->io);
       HANDLE win_handle = (HANDLE)_get_osfhandle(_fileno(f->io));
-      static const int MAX_BUFFER_SIZE = 8192;
-      wchar_t buf[MAX_BUFFER_SIZE / 2];
-      int result = MultiByteToWideChar(CP_UTF8, 0, (char *)&s[p], len, buf, MAX_BUFFER_SIZE / 2);
-      DWORD written = 0;
-      if(!WriteConsoleW(win_handle, buf, result, &written, NULL)) {
-         file_error("file_write", f->name);
-      }
-      if (written == result) {
-         return len;
-      } else {
-         auto first_code_unit_remaining = buf[written];
-         if (first_code_unit_remaining > 0xDCEE && first_code_unit_remaining <= 0xDFF) {
-            DWORD tmp;
-            WriteConsoleW(win_handle, &buf[written], 1, &tmp, NULL);
-            written += 1;
+      static const int MAX_CHARS = 4096;
+      wchar_t buf[MAX_CHARS];
+      int done = 0;
+      bool convertOk = true;
+      while (done < len) {
+         // Convert in bounded chunks - a single oversized conversion fails
+         // outright and previously reported the whole write as successful
+         // while printing nothing.  Each utf8 byte yields at most one utf16
+         // unit, so a chunk of MAX_CHARS bytes always fits the buffer.
+         int chunk = len - done;
+         if (chunk > MAX_CHARS) {
+            chunk = MAX_CHARS;
+            // Do not split a multi-byte utf8 sequence between chunks
+            while (chunk > 0 && (s[p + done + chunk] & 0xC0) == 0x80)
+               chunk--;
+            if (chunk == 0)
+               chunk = MAX_CHARS;
          }
-         int count = 0;
-         for (int i = 0; i < written; i++) {
-            wchar_t ch = buf[i];
-            if (ch >= 0 && ch <= 0x7F) {
-               count += 1;
-            } else if (ch >= 0x0080 && ch <= 0x07FF) {
-               count += 2;
-            } else if (ch >= 0xDCEE && ch <= 0xDFF) {
-               count += 1;
-            } else {
-               count += 3;
+         int result = MultiByteToWideChar(CP_UTF8, 0, (char *)&s[p + done], chunk, buf, MAX_CHARS);
+         if (result == 0) {
+            // Not convertible - write the remainder as raw bytes below
+            convertOk = false;
+            break;
+         }
+         DWORD written = 0;
+         if(!WriteConsoleW(win_handle, buf, result, &written, NULL)) {
+            file_error("file_write", f->name);
+         }
+         if ((int)written == result) {
+            done += chunk;
+            continue;
+         }
+         // Partial console write - report how many utf8 bytes were consumed
+         // so the caller can retry the rest
+         if (written < (DWORD)result) {
+            wchar_t next = buf[written];
+            if (next >= 0xDC00 && next <= 0xDFFF) {
+               // Do not leave a surrogate pair half-written
+               DWORD tmp;
+               WriteConsoleW(win_handle, &buf[written], 1, &tmp, NULL);
+               written += 1;
             }
          }
-         return count;
+         int count = 0;
+         for (DWORD i = 0; i < written; i++) {
+            wchar_t ch = buf[i];
+            if (ch <= 0x7F)
+               count += 1;
+            else if (ch <= 0x07FF)
+               count += 2;
+            else if (ch >= 0xD800 && ch <= 0xDFFF)
+               count += 2;   // 2 utf8 bytes per half: a full pair is 4
+            else
+               count += 3;
+         }
+         return done + count;
       }
+      if (convertOk)
+         return len;
+      p += done;
+      len -= done;
    }
 #endif
    while( len > 0 )
@@ -338,10 +368,25 @@ void _hx_std_file_flush( Dynamic handle )
    file_contents : f:string -> string
    <doc>Read the content of the file [f] and return it.</doc>
 **/
+
+// 64-bit file length - plain ftell is 32-bit on Windows and the int cast
+// silently wrapped huge files elsewhere, returning truncated content with
+// no error.  Returns -1 on failure.
+static long long file_length64(FILE *file)
+{
+#ifdef NEKO_WINDOWS
+   if (_fseeki64(file,0,SEEK_END))
+      return -1;
+   return _ftelli64(file);
+#else
+   if (fseeko(file,0,SEEK_END))
+      return -1;
+   return ftello(file);
+#endif
+}
+
 String _hx_std_file_contents_string( String name )
 {
-   std::vector<char> buffer;
-
    hx::strbuf buf;
 #ifdef NEKO_WINDOWS
    hx::EnterGCFreeZone();
@@ -353,10 +398,13 @@ String _hx_std_file_contents_string( String name )
    if(!file)
       file_error("file_contents",name);
 
-   fseek(file,0,SEEK_END);
-   int len = ftell(file);
-   if (len<0)
-      file_error("file_ftell",name);
+   long long len64 = file_length64(file);
+   if (len64<0 || len64>0x7ffffff0)
+   {
+      fclose(file);
+      file_error(len64<0 ? "file_ftell" : "file_too_large",name);
+   }
+   int len = (int)len64;
    if (len==0)
    {
       fclose(file);
@@ -365,12 +413,17 @@ String _hx_std_file_contents_string( String name )
    }
 
    fseek(file,0,SEEK_SET);
-   buffer.resize(len);
+   // Read straight into the GC string buffer - the old std::vector staging
+   // copy doubled peak memory and added a full extra memcpy
+   hx::ExitGCFreeZone();
+   char *dest = hx::NewString(len);
+   hx::EnterGCFreeZone();
+   int total = len;
    int p = 0;
    while( len > 0 )
    {
       POSIX_LABEL(file_contents);
-      int d = (int)fread(&buffer[p],1,len,file);
+      int d = (int)fread(dest+p,1,len,file);
       if( d <= 0 )
       {
          HANDLE_FINTR(file,file_contents);
@@ -383,7 +436,15 @@ String _hx_std_file_contents_string( String name )
    fclose(file);
    hx::ExitGCFreeZone();
 
-   return String::create(&buffer[0], buffer.size());
+   // dest is already a GC string buffer - wrap it without re-copying.
+   // Non-ASCII content still needs the utf16 conversion pass.
+   #ifdef HX_SMART_STRINGS
+   const unsigned char *c = (const unsigned char *)dest;
+   for(int i=0;i<total;i++)
+      if (c[i]>127)
+         return _hx_utf8_to_utf16(c, total, false);
+   #endif
+   return String(dest, total);
 }
 
 
@@ -405,10 +466,13 @@ Array<unsigned char> _hx_std_file_contents_bytes( String name )
    if(!file)
       file_error("file_contents",name);
 
-   fseek(file,0,SEEK_END);
-   int len = ftell(file);
-   if (len<0)
-      file_error("file_ftell",name);
+   long long len64 = file_length64(file);
+   if (len64<0 || len64>0x7ffffff0)
+   {
+      fclose(file);
+      file_error(len64<0 ? "file_ftell" : "file_too_large",name);
+   }
+   int len = (int)len64;
 
    fseek(file,0,SEEK_SET);
    hx::ExitGCFreeZone();

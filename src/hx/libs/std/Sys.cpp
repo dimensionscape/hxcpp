@@ -1,5 +1,6 @@
 #include <hxcpp.h>
 #include <hx/OS.h>
+#include <hx/Thread.h>
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -75,11 +76,21 @@
    <doc>Get some environment variable if exists</doc>
 **/
 
+// The environment is shared mutable state: putenv/setenv may free or move
+// the storage a concurrent getenv result points into.  Serialize access and
+// copy under the lock.
+static HxMutex &hxEnvMutex()
+{
+   static HxMutex sMutex;
+   return sMutex;
+}
+
 String _hx_std_get_env( String v )
 {
    #ifdef HX_WINRT
       return String();
    #else
+      AutoLock lock(hxEnvMutex());
       #if defined(NEKO_WINDOWS) && defined(HX_SMART_STRINGS)
          hx::strbuf wbuf;
          return String::create( _wgetenv( v.wchar_str(&wbuf) ) );
@@ -101,6 +112,7 @@ void _hx_std_put_env( String e, String v )
 #elif defined(NEKO_WINDOWS)
    String set = e + HX_CSTRING("=") + (v != null()?v:"");
 
+   AutoLock lock(hxEnvMutex());
    #ifdef HX_SMART_STRINGS
    if (set.isUTF16Encoded())
       _wputenv(set.wchar_str());
@@ -108,6 +120,7 @@ void _hx_std_put_env( String e, String v )
    #endif
       putenv(set.utf8_str());
 #else
+   AutoLock lock(hxEnvMutex());
    if (v == null())
       unsetenv(e.utf8_str());
    else
@@ -122,6 +135,12 @@ void _hx_std_put_env( String e, String v )
 
 void _hx_std_sys_sleep( double f )
 {
+   // A negative duration must not sleep at all - the double->DWORD
+   // conversion on Windows wraps it to ~49.7 days, and schedulers routinely
+   // compute sleep(deadline - now), which dips below zero under load.
+   // (!(f>0) also catches NaN.)
+   if (!(f > 0))
+      return;
    hx::EnterGCFreeZone();
 #if defined(NEKO_WINDOWS)
    Sleep((DWORD)(f * 1000));
@@ -529,22 +548,21 @@ String _hx_std_sys_file_type( String path )
    if (err)
       return String();
 
-   if( s.st_mode & S_IFREG )
-      return HX_CSTRING("file");
-   if( s.st_mode & S_IFDIR )
-      return HX_CSTRING("dir");
-   if( s.st_mode & S_IFCHR )
-      return HX_CSTRING("char");
+   // The S_IF* constants are values of the S_IFMT field, not independent
+   // bits - testing them with & made sockets report as "file" and block
+   // devices as "dir" (FileSystem.isDirectory matched block devices)
+   switch( s.st_mode & S_IFMT )
+   {
+      case S_IFREG: return HX_CSTRING("file");
+      case S_IFDIR: return HX_CSTRING("dir");
+      case S_IFCHR: return HX_CSTRING("char");
 #ifndef NEKO_WINDOWS
-   if( s.st_mode & S_IFLNK )
-      return HX_CSTRING("symlink");
-   if( s.st_mode & S_IFBLK )
-      return HX_CSTRING("block");
-   if( s.st_mode & S_IFIFO )
-      return HX_CSTRING("fifo");
-   if( s.st_mode & S_IFSOCK )
-      return HX_CSTRING("sock");
+      case S_IFLNK: return HX_CSTRING("symlink");
+      case S_IFBLK: return HX_CSTRING("block");
+      case S_IFIFO: return HX_CSTRING("fifo");
+      case S_IFSOCK: return HX_CSTRING("sock");
 #endif
+   }
    return String();
    #endif
 }
@@ -612,14 +630,19 @@ double _hx_std_sys_time()
 {
 #ifdef NEKO_WINDOWS
 #define EPOCH_DIFF   (134774*24*60*60.0)
-   SYSTEMTIME t;
+   // GetSystemTime only updates at the ~15.6ms timer tick; the precise
+   // variant (Win8+) has sub-microsecond resolution at the same epoch
+   typedef VOID (WINAPI *GetTimeFunc)(LPFILETIME);
+   static GetTimeFunc sGetTime = (GetTimeFunc)GetProcAddress(
+         GetModuleHandleA("kernel32"), "GetSystemTimePreciseAsFileTime");
    FILETIME ft;
-    ULARGE_INTEGER ui;
-   GetSystemTime(&t);
-   if( !SystemTimeToFileTime(&t,&ft) )
-      return 0;
-    ui.LowPart = ft.dwLowDateTime;
-    ui.HighPart = ft.dwHighDateTime;
+   ULARGE_INTEGER ui;
+   if( sGetTime )
+      sGetTime(&ft);
+   else
+      GetSystemTimeAsFileTime(&ft);
+   ui.LowPart = ft.dwLowDateTime;
+   ui.HighPart = ft.dwHighDateTime;
    return ( ((double)ui.QuadPart) / 10000000.0 - EPOCH_DIFF );
 #elif defined(EPPC)
    time_t tod;
@@ -677,7 +700,8 @@ Array<String> _hx_std_sys_read_dir( String p )
    std::wstring tempWStr(path);
    std::string searchPath(tempWStr.begin(), tempWStr.end());
   #else
-   wchar_t searchPath[ MAX_PATH + 4 ];
+   // Worst case append below is "/*.*" plus the terminator - five wchars
+   wchar_t searchPath[ MAX_PATH + 5 ];
    memcpy(searchPath,path, len*sizeof(wchar_t));
   #endif
 
@@ -752,7 +776,10 @@ String _hx_std_file_full_path( String path )
 #elif defined(NEKO_WINDOWS)
    wchar_t buf[MAX_PATH+1];
    hx::strbuf wbuf;
-   if( GetFullPathNameW(path.wchar_str(&wbuf),MAX_PATH+1,buf,NULL) == 0 )
+   // A return larger than the buffer is the REQUIRED size - the buffer was
+   // not written, so treating it as success returned uninitialized stack
+   DWORD res = GetFullPathNameW(path.wchar_str(&wbuf),MAX_PATH+1,buf,NULL);
+   if( res == 0 || res > MAX_PATH+1 )
       return null();
    return String::create(buf);
 #elif defined(EPPC)
@@ -825,6 +852,7 @@ Array<String> _hx_std_sys_env()
 {
    Array<String> result = Array_obj<String>::__new();
    #ifndef HX_WINRT
+   AutoLock lock(hxEnvMutex());
    char **e = environ;
    while( *e )
    {

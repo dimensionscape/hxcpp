@@ -2,6 +2,7 @@
 #include <thread>
 #include <array>
 #include <atomic>
+#include <cstdio>
 #include <hx/thread/CountingSemaphore.hpp>
 #include "ThreadImpl.hpp"
 
@@ -57,7 +58,22 @@ namespace
 		// Release the creation function
 		semaphore->release();
 
-		job();
+		// An exception escaping a std::thread's function is std::terminate -
+		// the whole process died with no diagnostic at all
+		try
+		{
+			job();
+		}
+		catch(Dynamic e)
+		{
+			hx::strbuf buf;
+			String err = e==null() ? HX_CSTRING("null") : e->toString();
+			fprintf(stderr, "Uncaught exception in thread: %s\n", err.utf8_str(&buf));
+		}
+		catch(...)
+		{
+			fprintf(stderr, "Uncaught native exception in thread\n");
+		}
 
 		hx::UnregisterCurrentThread();
 	}

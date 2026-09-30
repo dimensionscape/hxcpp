@@ -5,6 +5,10 @@
 #include <map>
 #include <vector>
 #include <stdlib.h>
+#include <mutex>
+
+// The last dlopen/LoadLibrary failure detail for the final error message
+static std::string sgLastLoadError;
 
 #ifdef ANDROID
 #include <android/log.h>
@@ -49,10 +53,19 @@ Module hxLoadLibrary(String inLib) { return LoadPackagedLibrary(inLib.__WCStr(),
 Module hxLoadLibrary(String inLib)
 {
    HMODULE result = LoadLibraryW(inLib.__WCStr());
-   if (gLoadDebug)
+   if (!result)
    {
-      if (result)
-         printf("Loaded module : %S.\n", inLib.__WCStr());
+      // Distinguish not-found from wrong-bitness/missing-dependency
+      DWORD err = GetLastError();
+      char buf[64];
+      snprintf(buf, sizeof(buf), "Windows error %lu", (unsigned long)err);
+      sgLastLoadError = buf;
+      if (gLoadDebug)
+         printf("Error loading library: (%S) %s\n", inLib.__WCStr(), buf);
+   }
+   else if (gLoadDebug)
+   {
+      printf("Loaded module : %S.\n", inLib.__WCStr());
    }
    return result;
 }
@@ -78,18 +91,25 @@ Module hxLoadLibrary(String inLib)
    #endif
    
    Module result = dlopen(inLib.__CStr(), flags);
+   if (!result)
+   {
+      // dlerror() clears its state - read once
+      const char *err = dlerror();
+      if (err)
+         sgLastLoadError = err;
+   }
    if (gLoadDebug)
    {
 #ifdef HX_WINRT
       if (result)
          WINRT_LOG("Loaded : %s.\n", inLib.__CStr());
       else
-         WINRT_LOG("Error loading library: (%s) %s\n", inLib.__CStr(), dlerror());
+         WINRT_LOG("Error loading library: (%s) %s\n", inLib.__CStr(), sgLastLoadError.c_str());
 #else
       if (result)
          printf("Loaded : %s.\n", inLib.__CStr());
       else
-         printf("Error loading library: (%s) %s\n", inLib.__CStr(), dlerror());
+         printf("Error loading library: (%s) %s\n", inLib.__CStr(), sgLastLoadError.c_str());
 #endif
    }
    return result;
@@ -230,8 +250,14 @@ public:
       const ExternalPrimitive *other = dynamic_cast<const ExternalPrimitive *>(inRHS);
       if (!other)
          return -1;
-      return mProc==other->mProc;
+      // 0 means equal - returning the boolean made == true exactly when
+      // the procs differed
+      if (mProc==other->mProc)
+         return 0;
+      return mProc<other->mProc ? -1 : 1;
    }
+
+   int __ArgCount() const { return mArgCount; }
 
 
    void        *mProc;
@@ -245,6 +271,16 @@ namespace
 {
 typedef std::map<String,ExternalPrimitive *> LoadedMap;
 LoadedMap sLoadedMap;
+
+// The whole loader (module registry, prim cache, search paths, registered
+// prims) was unsynchronized although any thread can call cpp.Lib.load.
+// Recursive: dlopen runs the module's static initializers, which call
+// __hxcpp_register_prim on this same thread
+std::recursive_mutex &LoaderMutex()
+{
+   static std::recursive_mutex m;
+   return m;
+}
 }
 
 
@@ -274,14 +310,38 @@ static String GetFileContents(String inFile)
    if (bytes<1)
       return null();
    buf[bytes]='\0';
+   // Trim trailing whitespace - a hand-edited .current/.dev with a
+   // trailing newline failed every later path probe with no diagnostic
+   while(bytes>0 && (buf[bytes-1]=='\n' || buf[bytes-1]=='\r' ||
+                     buf[bytes-1]==' ' || buf[bytes-1]=='\t'))
+      buf[--bytes]='\0';
+   if (bytes<1)
+      return null();
    return String::create(buf);
 }
 
 static String GetEnv(const char *inPath)
 {
+   #ifdef _WIN32
+   // The ANSI getenv mangles non-ASCII values (user-name home paths), and
+   // the no-copy String constructor aliased CRT storage that a concurrent
+   // putenv could free
+   wchar_t wname[128];
+   int n = 0;
+   for(; inPath[n] && n<127; n++)
+      wname[n] = inPath[n];
+   wname[n] = 0;
+   wchar_t wbuf[1024];
+   DWORD len = GetEnvironmentVariableW(wname, wbuf, 1024);
+   if (len==0 || len>=1024)
+      return String();
+   return String::create(wbuf, (int)len);
+   #else
    const char *env  = getenv(inPath);
-   String result(env,env?strlen(env):0);
-   return result;
+   if (!env)
+      return String();
+   return String::create(env);
+   #endif
 }
 
 static String FindHaxelib(String inLib)
@@ -380,6 +440,16 @@ static String FindHaxelib(String inLib)
 typedef std::map<std::string,void *> RegistrationMap;
 RegistrationMap *sgRegisteredPrims=0;
 
+// find(), not operator[] - every missed probe permanently inserted a null
+// entry, growing the map and turning read-only lookups into mutations
+static void *FindRegisteredPrim(const char *inName)
+{
+   if (!sgRegisteredPrims)
+      return 0;
+   RegistrationMap::iterator it = sgRegisteredPrims->find(inName);
+   return it==sgRegisteredPrims->end() ? 0 : it->second;
+}
+
 
 
 static std::vector<String> sgLibPath;
@@ -463,8 +533,12 @@ String __hxcpp_get_dll_extension()
 
 void __hxcpp_push_dll_path(String inPath)
 {
-   int last = inPath.length-1;
-   int lastCode = (last>0) ? inPath.cca(last) : -1;
+   // An empty path used to become "/" (the filesystem root) in the search
+   // list, and a one-character path skipped the separator check
+   if (inPath.length==0)
+      return;
+   std::lock_guard<std::recursive_mutex> lock(LoaderMutex());
+   int lastCode = inPath.cca(inPath.length-1);
 
    if ( lastCode!='\\' && lastCode!='/')
       sgLibPath.push_back( (inPath + HX_CSTRING("/")).makePermanent() );
@@ -491,29 +565,25 @@ Dynamic __loadprim(String inLib, String inPrim,int inArgCount)
           full_name += HX_CSTRING("__MULT");
    }
 
-   String libString = inLib + HX_CSTRING("_") + full_name;
-   ExternalPrimitive *prim = sLoadedMap[libString];
-   if (prim)
-      return Dynamic(prim);
+   // Permanent before it becomes a map key: the map node is invisible to
+   // the GC, and the old post-insert makePermanent only changed the local
+   // copy, leaving the key's character data to be collected
+   String libString = (inLib + HX_CSTRING("_") + full_name).makePermanent();
+   std::lock_guard<std::recursive_mutex> lock(LoaderMutex());
+   LoadedMap::iterator cached = sLoadedMap.find(libString);
+   if (cached!=sLoadedMap.end() && cached->second)
+      return Dynamic(cached->second);
 
-   if (sgRegisteredPrims)
+   void *registered = FindRegisteredPrim(full_name.__CStr());
+   // Try with lib name ...
+   if (!registered)
+      registered = FindRegisteredPrim(libString.__CStr());
+
+   if (registered)
    {
-      void *registered = (*sgRegisteredPrims)[full_name.__CStr()];
-      // Try with lib name ...
-      if (!registered)
-      {
-         registered = (*sgRegisteredPrims)[libString.__CStr()];
-         if (registered)
-            full_name = libString;
-      }
-
-      if (registered)
-      {
-         libString = libString.makePermanent();
-         prim = new ExternalPrimitive(registered,inArgCount,libString);
-         sLoadedMap[libString] = prim;
-         return Dynamic(prim);
-      }
+      ExternalPrimitive *prim = new ExternalPrimitive(registered,inArgCount,libString);
+      sLoadedMap[libString] = prim;
+      return Dynamic(prim);
    }
 
    printf("Primitive not found : %s\n", full_name.__CStr() );
@@ -522,8 +592,9 @@ Dynamic __loadprim(String inLib, String inPrim,int inArgCount)
 
 void *__hxcpp_get_proc_address(String inLib, String inPrim,bool ,bool inQuietFail)
 {
-   if (sgRegisteredPrims)
-      return (*sgRegisteredPrims)[inPrim.__CStr()];
+   void *registered = FindRegisteredPrim(inPrim.__CStr());
+   if (registered)
+      return registered;
 
    if (!inQuietFail)
       printf("Primitive not found : %s\n", inPrim.__CStr() );
@@ -541,14 +612,12 @@ extern "C" void *hx_cffi(const char *inName);
 
 void *__hxcpp_get_proc_address(String inLib, String full_name,bool inNdllProc,bool inQuietFail)
 {
+   std::lock_guard<std::recursive_mutex> lock(LoaderMutex());
    if (inLib.length==0)
    {
-      if (sgRegisteredPrims)
-      {
-         void *registered = (*sgRegisteredPrims)[full_name.__CStr()];
-         if (registered)
-            return registered;
-      }
+      void *registeredStatic = FindRegisteredPrim(full_name.__CStr());
+      if (registeredStatic)
+         return registeredStatic;
       if (!inQuietFail)
       {
          #ifdef ANDROID
@@ -603,18 +672,19 @@ void *__hxcpp_get_proc_address(String inLib, String full_name,bool inNdllProc,bo
    hx::strbuf convertBuf;
 
 
-   Module module = sgLoadedModule[module_name.utf8_str()];
+   LoadedModule::iterator modIt = sgLoadedModule.find(module_name.utf8_str());
+   Module module = modIt==sgLoadedModule.end() ? 0 : modIt->second;
 
    bool new_module = module==0;
 
-   if (!module && sgRegisteredPrims)
+   if (!module)
    {
-      void *registered = (*sgRegisteredPrims)[full_name.__CStr()];
+      void *registered = FindRegisteredPrim(full_name.__CStr());
       // Try with lib name ...
       if (!registered)
       {
          String libString = inLib + HX_CSTRING("_") + full_name;
-         registered = (*sgRegisteredPrims)[libString.__CStr()];
+         registered = FindRegisteredPrim(libString.__CStr());
       }
 
       if (registered)
@@ -715,7 +785,12 @@ void *__hxcpp_get_proc_address(String inLib, String full_name,bool inNdllProc,bo
 
    if (!module)
    {
-      hx::Throw(HX_CSTRING("Could not load module ") + inLib + HX_CSTRING("@") + full_name);
+      String message = HX_CSTRING("Could not load module ") + inLib + HX_CSTRING("@") + full_name;
+      // The classic message gave no reason - a missing dependent library
+      // or wrong bitness looked identical to file-not-found
+      if (!sgLastLoadError.empty())
+         message = message + HX_CSTRING(" (") + String::create(sgLastLoadError.c_str()) + HX_CSTRING(")");
+      hx::Throw(message);
    }
 
 
@@ -772,6 +847,7 @@ void *__hxcpp_get_proc_address(String inLib, String full_name,bool inNdllProc,bo
 
 int __hxcpp_unload_all_libraries()
 {
+   std::lock_guard<std::recursive_mutex> lock(LoaderMutex());
    int unloaded = 0;
    while(sgOrderedModules.size())
    {
@@ -780,6 +856,14 @@ int __hxcpp_unload_all_libraries()
       hxFreeLibrary(module);
       unloaded++;
    }
+   // A later load must not see freed module handles, and the cached
+   // primitives point into the unmapped libraries - calling one would be
+   // use-after-free.  Nulling the proc makes a call throw instead
+   sgLoadedModule.clear();
+   for(LoadedMap::iterator i=sLoadedMap.begin(); i!=sLoadedMap.end(); ++i)
+      if (i->second)
+         i->second->mProc = 0;
+   sLoadedMap.clear();
    return unloaded;
 }
 
@@ -800,17 +884,20 @@ Dynamic __loadprim(String inLib, String inPrim,int inArgCount)
           full_name += HX_CSTRING("__MULT");
    }
 
-   String primName = inLib+HX_CSTRING("@")+full_name;
-   ExternalPrimitive *saved = sLoadedMap[primName];
-   if (saved)
-      return Dynamic(saved);
+   // Permanent before it becomes a map key: the map node is invisible to
+   // the GC, and the old post-insert makePermanent only changed the local
+   // copy - every lookup after the next collection compared against freed
+   // character data
+   String primName = (inLib+HX_CSTRING("@")+full_name).makePermanent();
+   std::lock_guard<std::recursive_mutex> lock(LoaderMutex());
+   LoadedMap::iterator cached = sLoadedMap.find(primName);
+   if (cached!=sLoadedMap.end() && cached->second)
+      return Dynamic(cached->second);
 
    void *proc = __hxcpp_get_proc_address(inLib,full_name,true);
    if (proc)
    {
-      primName = primName.makePermanent();
-
-      saved = new ExternalPrimitive(proc,inArgCount,primName);
+      ExternalPrimitive *saved = new ExternalPrimitive(proc,inArgCount,primName);
       sLoadedMap[primName] = saved;
       return Dynamic(saved);
    }
@@ -832,6 +919,7 @@ void __hxcpp_run_dll(String inLib, String inFunc)
 
 int __hxcpp_register_prim(const char *inName,void *inProc)
 {
+   std::lock_guard<std::recursive_mutex> lock(LoaderMutex());
    if (sgRegisteredPrims==0)
       sgRegisteredPrims = new RegistrationMap();
    void * &proc = (*sgRegisteredPrims)[inName];

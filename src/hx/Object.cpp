@@ -82,7 +82,16 @@ bool Object::__HasField(const String &inString)
 {
    return false;
 }
-Dynamic Object::__Run(const Array<Dynamic> &inArgs) { return 0; }
+Dynamic Object::__Run(const Array<Dynamic> &inArgs)
+{
+   #if (HXCPP_API_LEVEL>=500)
+   // Function objects override __Run - landing here means calling a value
+   // that is not a function.  Other targets raise an error; silently
+   // returning null masks the bug at the call site
+   hx::Throw( HX_CSTRING("Cannot call ") + __ToString() );
+   #endif
+   return 0;
+}
 Dynamic Object::__GetItem(int inIndex) const { return null(); }
 Dynamic Object::__SetItem(int inIndex,Dynamic) { return null();  }
 

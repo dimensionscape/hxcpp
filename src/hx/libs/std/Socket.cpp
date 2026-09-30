@@ -3,6 +3,7 @@
 #include <hx/OS.h>
 
 #include <string.h>
+#include <stddef.h>
 
 
 #ifdef NEKO_WINDOWS
@@ -87,7 +88,9 @@ SOCKET val_sock(Dynamic inValue)
       {
          inValue = inValue->__Field( HX_CSTRING("__s"), hx::paccNever );
          if (inValue.mPtr==0)
-            return 0;
+            // Not 0 - on posix that is stdin and operations would silently
+            // target the console instead of failing
+            return INVALID_SOCKET;
          type = inValue->__GetType();
       }
 
@@ -214,9 +217,15 @@ Dynamic _hx_std_socket_new( bool udp, bool ipv6 )
 void _hx_std_socket_close( Dynamic handle )
 {
    SOCKET s = val_sock(handle);
-   POSIX_LABEL(close_again);
-   if( s != INVALID_SOCKET && closesocket(s) ) {
-      HANDLE_EINTR(close_again);
+   if( s != INVALID_SOCKET )
+   {
+      // No EINTR retry: posix close() releases the descriptor even when
+      // interrupted, so retrying can close a descriptor another thread
+      // just received.  A lingering close (SO_LINGER) can block, so let
+      // the GC keep running.
+      hx::EnterGCFreeZone();
+      closesocket(s);
+      hx::ExitGCFreeZone();
    }
    reset_sock(handle);
 }
@@ -252,14 +261,21 @@ int _hx_std_socket_send( Dynamic o, Array<unsigned char> buf, int p, int l )
 {
    SOCKET sock = val_sock(o);
    int dlen = buf->length;
-   if( p < 0 || l < 0 || p > dlen || p + l > dlen )
+   // l > dlen - p, not p + l > dlen: the addition can overflow and skip the check
+   if( p < 0 || l < 0 || p > dlen || l > dlen - p )
       return 0;
 
-   const char *base = (const char *)&buf[0];
+   // volatile: the allocation start must stay visible in this frame so the
+   // conservative scan pins buf while send() reads it from inside the zone
+   const char * volatile base = (const char *)&buf[0];
    hx::EnterGCFreeZone();
+   POSIX_LABEL(send_again);
    dlen = send(sock, base + p , l, MSG_NOSIGNAL);
    if( dlen == SOCKET_ERROR )
+   {
+      HANDLE_EINTR(send_again);
       block_error();
+   }
    hx::ExitGCFreeZone();
    return dlen;
 }
@@ -273,15 +289,25 @@ int _hx_std_socket_recv( Dynamic o, Array<unsigned char> buf, int p, int l )
 {
    SOCKET sock = val_sock(o);
    int dlen = buf->length;
-   if( p < 0 || l < 0 || p > dlen || p + l > dlen )
+   if( p < 0 || l < 0 || p > dlen || l > dlen - p )
       return 0;
 
-   char *base = (char *)&buf[0];
+   char * volatile base = (char *)&buf[0];
    hx::EnterGCFreeZone();
    POSIX_LABEL(recv_again);
    dlen = recv(sock, base + p, l, MSG_NOSIGNAL);
    if( dlen == SOCKET_ERROR )
    {
+      #ifdef NEKO_WINDOWS
+      // A datagram larger than the buffer fills the buffer but reports
+      // WSAEMSGSIZE - posix silently truncates instead.  Match posix
+      // rather than discarding the data as a bogus "EOF"
+      if( WSAGetLastError() == WSAEMSGSIZE )
+      {
+         hx::ExitGCFreeZone();
+         return l;
+      }
+      #endif
       HANDLE_EINTR(recv_again);
       block_error();
    }
@@ -321,7 +347,7 @@ void _hx_std_socket_write( Dynamic o, Array<unsigned char> buf )
 {
    SOCKET sock = val_sock(o);
    int datalen = buf->length;
-   const char *cdata = (const char *)&buf[0];
+   const char * volatile cdata = (const char *)&buf[0];
    int pos = 0;
 
    hx::EnterGCFreeZone();
@@ -350,13 +376,17 @@ Array<unsigned char> _hx_std_socket_read( Dynamic o )
 {
    SOCKET sock = val_sock(o);
    Array<unsigned char> result = Array_obj<unsigned char>::__new();
-   char buf[256];
+   // Read in large chunks: a 256-byte buffer forced one recv() syscall (and
+   // array append) per 256 bytes when slurping a stream to EOF. 16KB cuts that
+   // ~64x while staying small enough for any thread stack and exception-safe
+   // (no heap buffer to leak if block_error throws).
+   char buf[16384];
 
    hx::EnterGCFreeZone();
    while( true )
    {
       POSIX_LABEL(read_again);
-      int len = recv(sock,buf,256,MSG_NOSIGNAL);
+      int len = recv(sock,buf,sizeof(buf),MSG_NOSIGNAL);
       if( len == SOCKET_ERROR ) {
          HANDLE_EINTR(read_again);
          block_error();
@@ -379,6 +409,11 @@ Array<unsigned char> _hx_std_socket_read( Dynamic o )
 **/
 int _hx_std_host_resolve( String host )
 {
+   // inet_addr's error value INADDR_NONE is also the valid limited
+   // broadcast address, which would otherwise fall into DNS and throw
+   if( host == HX_CSTRING("255.255.255.255") )
+      return (int)0xFFFFFFFF;
+
    unsigned int ip;
 
    hx::EnterGCFreeZone();
@@ -592,9 +627,21 @@ void _hx_std_socket_connect( Dynamic o, int host, int port )
    addr.sin_port = htons(port);
    *(int*)&addr.sin_addr.s_addr = host;
 
+   // val_sock does a dynamic field lookup and can throw - neither is
+   // allowed inside the free zone
+   SOCKET sock = val_sock(o);
    hx::EnterGCFreeZone();
-   if( connect(val_sock(o),(struct sockaddr*)&addr,sizeof(addr)) == SOCKET_ERROR )
+   if( connect(sock,(struct sockaddr*)&addr,sizeof(addr)) == SOCKET_ERROR )
    {
+      #ifdef NEKO_POSIX
+      // A signal interrupted a blocking connect: the connection continues
+      // asynchronously (posix), so report "in progress", not EOF
+      if( errno == EINTR )
+      {
+         hx::ExitGCFreeZone();
+         hx::Throw(HX_CSTRING("Blocking"));
+      }
+      #endif
       // This will throw a "Blocking" exception if the "error" was because
       // it's a non-blocking socket with connection in progress, otherwise
       // it will do nothing.
@@ -617,9 +664,17 @@ void _hx_std_socket_connect_ipv6( Dynamic o, Array<unsigned char> host, int port
    addr.sin6_port = htons(port);
    memcpy(&addr.sin6_addr,&host[0],16);
 
+   SOCKET sock = val_sock(o);
    hx::EnterGCFreeZone();
-   if( connect(val_sock(o),(struct sockaddr*)&addr,sizeof(addr)) != 0 )
+   if( connect(sock,(struct sockaddr*)&addr,sizeof(addr)) != 0 )
    {
+      #ifdef NEKO_POSIX
+      if( errno == EINTR )
+      {
+         hx::ExitGCFreeZone();
+         hx::Throw(HX_CSTRING("Blocking"));
+      }
+      #endif
       // This will throw a "Blocking" exception if the "error" was because
       // it's a non-blocking socket with connection in progress, otherwise
       // it will do nothing.
@@ -641,12 +696,10 @@ void _hx_std_socket_listen( Dynamic o, int n )
    if( listen(sock,n) == SOCKET_ERROR )
    {
       hx::ExitGCFreeZone();
-      return;
+      hx::Throw(HX_CSTRING("Listen failed"));
    }
    hx::ExitGCFreeZone();
 }
-
-static fd_set INVALID;
 
 static fd_set *make_socket_array( Array<Dynamic> a, fd_set *tmp, SOCKET *n )
 {
@@ -662,6 +715,15 @@ static fd_set *make_socket_array( Array<Dynamic> a, fd_set *tmp, SOCKET *n )
    {
       // make sure it is a socket...
       SOCKET sock = val_sock( a[i] );
+      if( sock == INVALID_SOCKET )
+         hx::Throw(HX_CSTRING("Closed socket in select"));
+      #ifndef NEKO_WINDOWS
+      // On posix fd_set is a fixed-size bitmap and FD_SET past it smashes
+      // the stack.  (On Windows it is a counted array, where the length
+      // check above is the right one.)
+      if( sock >= FD_SETSIZE )
+         hx::Throw(HX_CSTRING("Socket descriptor too large for select (use poll)"));
+      #endif
       if( sock > *n )
          *n = sock;
       FD_SET(sock,tmp);
@@ -731,8 +793,6 @@ Array<Dynamic> _hx_std_socket_select( Array<Dynamic> rs, Array<Dynamic> ws, Arra
    ra = make_socket_array(rs,&rx,&n);
    wa = make_socket_array(ws,&wx,&n);
    ea = make_socket_array(es,&ex,&n);
-   if( ra == &INVALID || wa == &INVALID || ea == &INVALID )
-      hx::Throw( HX_CSTRING("No valid sockets") );
 
    struct timeval tval;
    struct timeval *tt = 0;
@@ -742,9 +802,18 @@ Array<Dynamic> _hx_std_socket_select( Array<Dynamic> rs, Array<Dynamic> ws, Arra
    hx::EnterGCFreeZone();
    if( select((int)(n+1),ra,wa,ea,tt) == SOCKET_ERROR )
    {
+      // Sample the error before leaving the zone - the zone exit can
+      // clobber errno/GetLastError
+      #ifdef NEKO_WINDOWS
+      int err = WSAGetLastError();
       hx::ExitGCFreeZone();
-      HANDLE_EINTR(select_again);
-      hx::Throw( HX_CSTRING("Select error ") + String((int)errno) );
+      #else
+      int err = errno;
+      hx::ExitGCFreeZone();
+      if( err == EINTR )
+         goto select_again;
+      #endif
+      hx::Throw( HX_CSTRING("Select error ") + String(err) );
    }
    hx::ExitGCFreeZone();
 
@@ -770,10 +839,6 @@ void _hx_std_socket_fast_select( Array<Dynamic> rs, Array<Dynamic> ws, Array<Dyn
    wa = make_socket_array(ws,&wx,&n);
    ea = make_socket_array(es,&ex,&n);
 
-   if( ra == &INVALID || wa == &INVALID || ea == &INVALID )
-      hx::Throw( HX_CSTRING("No valid sockets") );
-
-
    struct timeval tval;
    struct timeval *tt = 0;
    if( timeout.mPtr )
@@ -782,13 +847,18 @@ void _hx_std_socket_fast_select( Array<Dynamic> rs, Array<Dynamic> ws, Array<Dyn
    hx::EnterGCFreeZone();
    if( select((int)(n+1),ra,wa,ea,tt) == SOCKET_ERROR )
    {
-      hx::ExitGCFreeZone();
-      HANDLE_EINTR(select_again);
+      // Sample the error before leaving the zone - the zone exit can
+      // clobber errno/GetLastError
       #ifdef NEKO_WINDOWS
-      hx::Throw( HX_CSTRING("Select error ") + String((int)WSAGetLastError()) );
+      int err = WSAGetLastError();
+      hx::ExitGCFreeZone();
       #else
-      hx::Throw( HX_CSTRING("Select error ") + String((int)errno) );
+      int err = errno;
+      hx::ExitGCFreeZone();
+      if( err == EINTR )
+         goto select_again;
       #endif
+      hx::Throw( HX_CSTRING("Select error ") + String(err) );
    }
 
    hx::ExitGCFreeZone();
@@ -874,9 +944,23 @@ Dynamic _hx_std_socket_accept( Dynamic o )
    SockLen addrlen = sizeof(addr);
    SOCKET s;
    hx::EnterGCFreeZone();
+   POSIX_LABEL(accept_again);
    s = accept(sock,(struct sockaddr*)&addr,&addrlen);
    if( s == INVALID_SOCKET )
+   {
+      HANDLE_EINTR(accept_again);
       block_error();
+   }
+
+   // accept() does not inherit these from the listening socket
+   #ifdef NEKO_MAC
+      int set = 1;
+      setsockopt(s,SOL_SOCKET,SO_NOSIGPIPE,(void *)&set, sizeof(int));
+   #endif
+   #ifdef NEKO_POSIX
+      int old = fcntl(s,F_GETFD,0);
+      if( old >= 0 ) fcntl(s,F_SETFD,old|FD_CLOEXEC);
+   #endif
    hx::ExitGCFreeZone();
 
    SocketWrapper *wrap = new SocketWrapper();
@@ -938,33 +1022,38 @@ void _hx_std_socket_set_timeout( Dynamic o, Dynamic t )
 {
    SOCKET sock = val_sock(o);
 
+   // null means no timeout (0).  Reject nonsense rather than configuring a
+   // garbage timeout (the old code passed an uninitialized timeval for
+   // negative values), and clamp huge values instead of overflowing
+   double seconds = t.mPtr ? (double)t : 0.0;
+   if( seconds < 0 || seconds != seconds )
+      hx::Throw(HX_CSTRING("Invalid socket timeout"));
+   if( seconds > 0x7fffffff )
+      seconds = 0x7fffffff;
+
 #ifdef NEKO_WINDOWS
    int time;
-   if( !t.mPtr )
+   if( seconds == 0 )
       time = 0;
    else {
-      time = (int)((double)(t) * 1000);
+      double ms = seconds * 1000;
+      time = ms > 0x7fffffff ? 0x7fffffff : (int)ms;
+      // Sub-millisecond must not round to 0 = block forever
+      if( time == 0 )
+         time = 1;
    }
 #else
    struct timeval time;
-   if( t.mPtr==0 ) {
-      time.tv_usec = 0;
-      time.tv_sec = 0;
-   } else {
-      init_timeval(t,&time);
-   }
+   time.tv_usec = (int)( (seconds - (int)seconds) * 1000000 );
+   time.tv_sec = (int)seconds;
 #endif
 
    hx::EnterGCFreeZone();
-   if( setsockopt(sock,SOL_SOCKET,SO_SNDTIMEO,(char*)&time,sizeof(time)) != 0 )
+   if( setsockopt(sock,SOL_SOCKET,SO_SNDTIMEO,(char*)&time,sizeof(time)) != 0
+    || setsockopt(sock,SOL_SOCKET,SO_RCVTIMEO,(char*)&time,sizeof(time)) != 0 )
    {
       hx::ExitGCFreeZone();
-      return;
-   }
-   if( setsockopt(sock,SOL_SOCKET,SO_RCVTIMEO,(char*)&time,sizeof(time)) != 0 )
-   {
-      hx::ExitGCFreeZone();
-      return;
+      hx::Throw(HX_CSTRING("Could not set socket timeout"));
    }
    hx::ExitGCFreeZone();
 }
@@ -982,7 +1071,19 @@ void _hx_std_socket_shutdown( Dynamic o, bool r, bool w )
    hx::EnterGCFreeZone();
    if( shutdown(sock,(r)?((w)?SHUT_RDWR:SHUT_RD):SHUT_WR) )
    {
+      // Keep not-connected silent - shutting down defensively before
+      // close is a common pattern.  Real failures should be visible
+      #ifdef NEKO_WINDOWS
+      int err = WSAGetLastError();
       hx::ExitGCFreeZone();
+      if( err != WSAENOTCONN )
+         hx::Throw(HX_CSTRING("Shutdown failed"));
+      #else
+      int err = errno;
+      hx::ExitGCFreeZone();
+      if( err != ENOTCONN )
+         hx::Throw(HX_CSTRING("Shutdown failed"));
+      #endif
       return;
    }
    hx::ExitGCFreeZone();
@@ -1004,7 +1105,9 @@ void _hx_std_socket_set_blocking( Dynamic o, bool b )
       if( ioctlsocket(sock,FIONBIO,&arg) != 0 )
       {
          hx::ExitGCFreeZone();
-         return;
+         // Failing silently leaves the socket in the wrong mode and the
+         // caller spinning or blocked with no clue why
+         hx::Throw(HX_CSTRING("Set blocking failed"));
       }
    }
 #else
@@ -1013,7 +1116,7 @@ void _hx_std_socket_set_blocking( Dynamic o, bool b )
       if( rights == -1 )
       {
          hx::ExitGCFreeZone();
-         return;
+         hx::Throw(HX_CSTRING("Set blocking failed"));
       }
       if( b )
          rights &= ~O_NONBLOCK;
@@ -1022,7 +1125,7 @@ void _hx_std_socket_set_blocking( Dynamic o, bool b )
       if( fcntl(sock,F_SETFL,rights) == -1 )
       {
          hx::ExitGCFreeZone();
-         return;
+         hx::Throw(HX_CSTRING("Set blocking failed"));
       }
    }
 #endif
@@ -1358,9 +1461,8 @@ int _hx_std_socket_send_to( Dynamic o, Array<unsigned char> buf, int p, int l, D
 {
    SOCKET sock = val_sock(o);
 
-   const char *cdata = (const char *)&buf[0];
    int dlen = buf->length;
-   if( p < 0 || l < 0 || p > dlen || p + l > dlen )
+   if( p < 0 || l < 0 || p > dlen || l > dlen - p )
       hx::Throw(HX_CSTRING("Invalid data position"));
 
 
@@ -1372,6 +1474,9 @@ int _hx_std_socket_send_to( Dynamic o, Array<unsigned char> buf, int p, int l, D
    addr.sin_port = htons(port);
    *(int*)&addr.sin_addr.s_addr = host;
 
+   // Capture after the field lookups above (which can allocate and move
+   // buf); volatile keeps the allocation start in the scanned frame
+   const char * volatile cdata = (const char *)&buf[0];
 
    hx::EnterGCFreeZone();
    POSIX_LABEL(send_again);
@@ -1396,12 +1501,16 @@ int _hx_std_socket_recv_from( Dynamic o, Array<unsigned char> buf, int p, int l,
    int retry = 0;
    SOCKET sock = val_sock(o);
 
-   char *data = (char *)&buf[0];
    int dlen = buf->length;
-   if( p < 0 || l < 0 || p > dlen || p + l > dlen )
+   if( p < 0 || l < 0 || p > dlen || l > dlen - p )
       hx::Throw(HX_CSTRING("Invalid data position"));
 
+   char * volatile data = (char *)&buf[0];
+
+   // Zeroed so the plain-recv retry fallback below reports 0.0.0.0:0
+   // instead of uninitialized stack memory
    struct sockaddr_in saddr;
+   memset(&saddr,0,sizeof(saddr));
    SockLen slen = sizeof(saddr);
 
    int ret = 0;
@@ -1412,8 +1521,18 @@ int _hx_std_socket_recv_from( Dynamic o, Array<unsigned char> buf, int p, int l,
    } else
       ret = recvfrom(sock, data + p , l, MSG_NOSIGNAL, (struct sockaddr*)&saddr, &slen);
    if( ret == SOCKET_ERROR ) {
-      HANDLE_EINTR(recv_from_again);
-      block_error();
+      #ifdef NEKO_WINDOWS
+      // Datagram larger than the buffer: the buffer and address are
+      // filled, Winsock just insists on reporting the truncation.
+      // posix truncates silently - match posix
+      if( WSAGetLastError() == WSAEMSGSIZE )
+         ret = l;
+      else
+      #endif
+      {
+         HANDLE_EINTR(recv_from_again);
+         block_error();
+      }
    }
 
    hx::ExitGCFreeZone();

@@ -263,6 +263,12 @@ struct ArraySetter : public ArrayBuiltinBase
          // sJitTemp0 = this
          compiler->move(sJitTemp0, thisVal);
 
+         // A negative index must not store - the unsigned length/alloc
+         // compares below treat it as huge, the expand call is a no-op and
+         // the store then lands before the buffer.  Compiled code drops the
+         // write (Item() returns a dummy); match that, the expression
+         // result is still the right-hand side.
+         JumpId negativeIndex = compiler->compare( cmpI_SIG_LESS, sJitTemp1.as(jtInt), (int)0 );
 
          // Check length..
          JumpId lengthOk = compiler->compare( cmpI_LESS, sJitTemp1.as(jtInt),
@@ -335,6 +341,7 @@ struct ArraySetter : public ArrayBuiltinBase
             printf("Unknown element size\n");
          }
 
+         compiler->comeFrom(negativeIndex);
 
          if (destType!=etVoid && destType!=etNull)
          {
@@ -1323,8 +1330,13 @@ struct ArrayBuiltin : public ArrayBuiltinBase
 
                compiler->move(sJitTemp0.as(jtPointer), thisVal);
                compiler->move(sJitTemp1.as(jtInt), index);
+               JumpId negativeIndex = 0;
                if (!unsafe)
                {
+                  // See the aoSet path - a negative index passes the
+                  // unsigned compares and the store lands before the buffer
+                  negativeIndex = compiler->compare( cmpI_SIG_LESS, sJitTemp1.as(jtInt), (int)0 );
+
                   JumpId enoughLength = compiler->compare( cmpI_LESS, sJitTemp1.as(jtInt),
                                                                  sJitTemp0.star(jtInt, ArrayBase::lengthOffset()) );
 
@@ -1360,8 +1372,6 @@ struct ArrayBuiltin : public ArrayBuiltinBase
                if (sizeof(ELEM)==1) // uchar, bool
                {
                   compiler->move( sJitTemp0.atReg(sJitTemp1).as(jtByte), tempVal );
-                  if (destType!=etNull)
-                     compiler->convert(tempVal, elemType, inDest, destType);
                }
                else if (elemType==etString)
                {
@@ -1374,15 +1384,10 @@ struct ArrayBuiltin : public ArrayBuiltinBase
                   #ifdef HXCPP_GC_GENERATIONAL
                   genWriteBarrier(compiler, sJitTemp2, tempVal.as(jtPointer) + StringOffset::Ptr );
                   #endif
-
-                  if (destType!=etNull)
-                     compiler->convert( sJitTemp0.star(jtString), etString, inDest, destType );
                }
                else if (sizeof(ELEM)==2)
                {
                   compiler->move( sJitTemp0.atReg(sJitTemp1,1), tempVal );
-                  if (destType!=etNull)
-                     compiler->convert(tempVal, elemType, inDest, destType);
                }
                else if (sizeof(ELEM)==4)
                {
@@ -1391,8 +1396,6 @@ struct ArrayBuiltin : public ArrayBuiltinBase
                   if (hx::ContainsPointers<ELEM>())
                      genWriteBarrier(compiler, sJitTemp2, tempVal );
                   #endif
-                  if (destType!=etNull)
-                     compiler->convert(tempVal, elemType, inDest, destType);
                }
                else if (sizeof(ELEM)==8)
                {
@@ -1401,14 +1404,19 @@ struct ArrayBuiltin : public ArrayBuiltinBase
                   if (hx::ContainsPointers<ELEM>())
                      genWriteBarrier(compiler, sJitTemp2, tempVal );
                   #endif
-                  if (destType!=etNull)
-                     compiler->convert(tempVal, elemType, inDest, destType);
                }
                else
                {
                   printf("Unknown element size\n");
                }
 
+               // The skipped store still produces the right-hand side as the
+               // expression result.  The string branch used to convert from
+               // the stored slot; tempVal holds the same value.
+               if (negativeIndex)
+                  compiler->comeFrom(negativeIndex);
+               if (destType!=etNull)
+                  compiler->convert(tempVal, elemType, inDest, destType);
 
                break;
             }

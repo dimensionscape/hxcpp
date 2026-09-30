@@ -22,10 +22,16 @@ public:
 
    inline static int floor(double inX) { return __int__(::std::floor(inX)); }
    inline static int ceil(double inX) { return __int__(::std::ceil(inX)); }
-   inline static int round(double inX) { return floor(inX+0.5); }
+   inline static int round(double inX) { return __int__(fround(inX)); }
    inline static double ffloor(double inX) { return ::std::floor(inX); }
    inline static double fceil(double inX) { return ::std::ceil(inX); }
-   inline static double fround(double inX) { return ::std::floor(inX+0.5); }
+   inline static double fround(double inX)
+   {
+      // Not floor(x+0.5): the addition double-rounds, so e.g. the largest
+      // double below 0.5 rounded up to 1 where the spec (and JS) give 0
+      double f = ::std::floor(inX);
+      return inX - f >= 0.5 ? f + 1 : f;
+   }
    inline static double random() { return __hxcpp_drand(); }
    inline static double sqrt(double inX) { return ::std::sqrt(inX); }
    inline static double cos(double inX) { return ::std::cos(inX); }

@@ -39,31 +39,26 @@ int64_t cpp::encoding::Ascii::encode(const String& string, View<uint8_t> buffer)
 
 String cpp::encoding::Ascii::decode(View<uint8_t> view)
 {
+    // Consistent with the Utf8/Utf16 decoders - empty input is ""
     if (view.isEmpty())
-    {
-        return hx::Throw(HX_CSTRING("View is empty"));
-    }
-
-    auto bytes = int64_t{ 0 };
-    auto i     = int64_t{ 0 };
-    auto chars = view.reinterpret<char>();
-
-    while (i < chars.length && 0 != chars.ptr[i])
-    {
-        bytes += sizeof(char);
-        i++;
-    }
-
-    if (0 == bytes)
     {
         return String::emptyString;
     }
 
+    // The view length is authoritative: scanning for a NUL silently
+    // truncated binary-ish payloads ("a\0b" decoded as "a"), and Haxe
+    // strings legally contain NULs.  Utf8::decode hands every all-ASCII
+    // buffer to this function, so the scan also made Utf8::decode stop at
+    // a NUL only when the rest of the buffer happened to be ASCII.
+    auto bytes = view.length;
+
     auto backing = hx::NewGCPrivate(0, bytes + sizeof(char));
 
     std::memcpy(backing, view.ptr.ptr, bytes);
+    // NewGCPrivate does not zero - the terminator must be written
+    static_cast<char*>(backing)[bytes] = 0;
 
-    return String(static_cast<const char*>(backing), bytes / sizeof(char));
+    return String(static_cast<const char*>(backing), static_cast<int>(bytes));
 }
 
 namespace
@@ -357,9 +352,12 @@ String cpp::encoding::Utf8::decode(const cpp::marshal::View<uint8_t>& buffer)
 
     return String(exact, chars);
 #else
-    auto backing = View<char>(hx::InternalNew(buffer.length, false), buffer.length);
+    // +1 for the terminator - the allocation is not zeroed and hxcpp
+    // strings are assumed NUL-terminated by native consumers
+    auto backing = View<char>(hx::InternalNew(buffer.length + 1, false), buffer.length + 1);
 
     std::memcpy(backing.ptr.ptr, buffer.ptr.ptr, buffer.length);
+    backing.ptr.ptr[buffer.length] = 0;
 
     return String(backing.ptr.ptr, static_cast<int>(buffer.length));
 #endif
@@ -367,6 +365,10 @@ String cpp::encoding::Utf8::decode(const cpp::marshal::View<uint8_t>& buffer)
 
 char32_t cpp::encoding::Utf8::codepoint(const cpp::marshal::View<uint8_t>& buffer)
 {
+    // Strict decoding.  Unvalidated continuation bytes silently produced
+    // mojibake from malformed input (and consumed a valid following
+    // character), and accepting overlong forms desynchronized the decode
+    // loops, which advance by the re-encoded length of the value
     auto b0 = static_cast<char32_t>(buffer[0]);
 
     if ((b0 & 0x80) == 0)
@@ -375,7 +377,17 @@ char32_t cpp::encoding::Utf8::codepoint(const cpp::marshal::View<uint8_t>& buffe
     }
     else if ((b0 & 0xE0) == 0xC0)
     {
-        return (static_cast<char32_t>(b0 & 0x1F) << 6) | static_cast<char32_t>(buffer.slice(1)[0] & 0x3F);
+        auto b1 = static_cast<char32_t>(buffer.slice(1)[0]);
+        if ((b1 & 0xC0) != 0x80)
+        {
+            return int{ hx::Throw(HX_CSTRING("Failed to read codepoint")) };
+        }
+        auto p = (static_cast<char32_t>(b0 & 0x1F) << 6) | (b1 & 0x3F);
+        if (p < 0x80) // overlong
+        {
+            return int{ hx::Throw(HX_CSTRING("Failed to read codepoint")) };
+        }
+        return p;
     }
     else if ((b0 & 0xF0) == 0xE0)
     {
@@ -384,7 +396,16 @@ char32_t cpp::encoding::Utf8::codepoint(const cpp::marshal::View<uint8_t>& buffe
 
         buffer.slice(1, staging.size()).copyTo(dst);
 
-        return (static_cast<char32_t>(b0 & 0x0F) << 12) | (static_cast<char32_t>(staging[0] & 0x3F) << 6) | static_cast<char32_t>(staging[1] & 0x3F);
+        if ((staging[0] & 0xC0) != 0x80 || (staging[1] & 0xC0) != 0x80)
+        {
+            return int{ hx::Throw(HX_CSTRING("Failed to read codepoint")) };
+        }
+        auto p = (static_cast<char32_t>(b0 & 0x0F) << 12) | (static_cast<char32_t>(staging[0] & 0x3F) << 6) | static_cast<char32_t>(staging[1] & 0x3F);
+        if (p < 0x800) // overlong
+        {
+            return int{ hx::Throw(HX_CSTRING("Failed to read codepoint")) };
+        }
+        return p;
     }
     else if ((b0 & 0xF8) == 0xF0)
     {
@@ -393,11 +414,23 @@ char32_t cpp::encoding::Utf8::codepoint(const cpp::marshal::View<uint8_t>& buffe
 
         buffer.slice(1, staging.size()).copyTo(dst);
 
-        return
+        if ((staging[0] & 0xC0) != 0x80 || (staging[1] & 0xC0) != 0x80 || (staging[2] & 0xC0) != 0x80)
+        {
+            return int{ hx::Throw(HX_CSTRING("Failed to read codepoint")) };
+        }
+        auto p =
             (static_cast<char32_t>(b0 & 0x07) << 18) |
             (static_cast<char32_t>(staging[0] & 0x3F) << 12) |
             (static_cast<char32_t>(staging[1] & 0x3F) << 6) |
             static_cast<char32_t>(staging[2] & 0x3F);
+        // Overlong or beyond U+10FFFF (out-of-range values leaked
+        // uninitialized memory into the decoded String via the silent
+        // Utf16::encode failure)
+        if (p < 0x10000 || p > 0x10FFFF)
+        {
+            return int{ hx::Throw(HX_CSTRING("Failed to read codepoint")) };
+        }
+        return p;
     }
     else
     {
@@ -456,6 +489,9 @@ namespace
             i += cpp::encoding::Utf16::getByteCount(p);
         }
 
+        // The allocation is not zeroed - the terminator must be written
+        chars.ptr.ptr[k] = 0;
+
         return String(chars.ptr.ptr, chars.length);
     }
 }
@@ -497,7 +533,9 @@ int64_t cpp::encoding::Utf16::getByteCount(const String& string)
         auto bytes = int64_t{ 0 };
         for (auto i = 0; i < string.length; i++)
         {
-            bytes += getByteCount(static_cast<char32_t>(string.raw_ptr()[i]));
+            // Through unsigned char: raw_ptr() is signed, so a byte >= 0x80
+            // sign-extended to a huge "codepoint" and miscounted as 4 bytes
+            bytes += getByteCount(static_cast<char32_t>(static_cast<unsigned char>(string.raw_ptr()[i])));
         }
 
         return bytes;
@@ -563,7 +601,8 @@ int64_t cpp::encoding::Utf16::encode(const String& string, const cpp::marshal::V
         auto bytes = int64_t{ 0 };
         for (auto i = 0; i < string.length; i++)
         {
-            bytes += getByteCount(static_cast<char32_t>(string.raw_ptr()[i]));
+            // See getByteCount - avoid signed-char sign extension
+            bytes += getByteCount(static_cast<char32_t>(static_cast<unsigned char>(string.raw_ptr()[i])));
         }
 
         if (bytes > buffer.length)
@@ -574,7 +613,7 @@ int64_t cpp::encoding::Utf16::encode(const String& string, const cpp::marshal::V
         auto i = int64_t{ 0 };
         for (auto k = 0; k < string.length; k++)
         {
-            i += encode(static_cast<char32_t>(string.raw_ptr()[k]), buffer.slice(i));
+            i += encode(static_cast<char32_t>(static_cast<unsigned char>(string.raw_ptr()[k])), buffer.slice(i));
         }
 
         return bytes;
@@ -616,7 +655,10 @@ int cpp::encoding::Utf16::encode(char32_t codepoint, const cpp::marshal::View<ui
         return 4;
     }
 
-    return 0;
+    // Beyond U+10FFFF is not representable - the silent return 0 left the
+    // caller's buffer tail unwritten (uninitialized memory in the decoded
+    // String) while counts assumed it was filled
+    return hx::Throw(HX_CSTRING("Invalid codepoint"));
 }
 
 String cpp::encoding::Utf16::decode(const cpp::marshal::View<uint8_t>& buffer)
@@ -672,6 +714,13 @@ inline char32_t cpp::encoding::Utf16::codepoint(const cpp::marshal::View<uint8_t
 
     if (0xD800 <= first && first < 0xDc00)
     {
+        // A lone trailing high surrogate (trivially produced by substr
+        // splitting a pair) used to surface as a confusing internal
+        // "View too small" from the read past the end
+        if (buffer.length < 4)
+        {
+            return int{ hx::Throw(HX_CSTRING("Invalid UTF16")) };
+        }
         auto second = static_cast<char16_t>(Marshal::readUInt16(buffer.slice(2)));
         if (0xDC00 <= second && second < 0xE000)
         {
