@@ -96,6 +96,10 @@ struct Deque : public Array_obj<Dynamic>
 	template<typename LOCKABLE>
 	inline void lockFor(LOCKABLE &inMutex)
 	{
+		// As for the sys.thread primitives: a consumer polling pop(false),
+		// allocating nothing, would never reach a safe point otherwise.
+		if (hx::gPauseForCollect)
+			__hxcpp_gc_safe_point();
 		if (!inMutex.TryLock())
 		{
 			hx::EnterGCFreeZone();
