@@ -58,6 +58,20 @@ typedef struct {
 	char *ssl_ca;
 	char *server_public_key;
 	int allow_public_key_retrieval;
+	// Seconds; 0 or less for no limit.
+	double connect_timeout;
+	double read_timeout;
+	double write_timeout;
+	int keepalive;
+	int keepalive_idle;
+	int keepalive_interval;
+	int keepalive_count;
+	// Held for mysql_open, in native memory.
+	char *host;
+	char *user;
+	char *pass;
+	char *socket;
+	int port;
 } MYSQL_OPTIONS;
 
 typedef enum {
@@ -135,6 +149,7 @@ struct _MYSQL {
 	int timed_out;   // the last read or write gave up on a timeout
 	int is41;
 	int errcode;
+	char sqlstate[6];
 	int last_field_count;
 	// From the last OK packet. 64-bit, as the protocol sends them: an
 	// AUTO_INCREMENT BIGINT is past 2^31 as soon as it is past 2^31.

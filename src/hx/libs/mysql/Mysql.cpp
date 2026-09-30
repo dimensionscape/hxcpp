@@ -89,9 +89,27 @@ Connection *getConnection(Dynamic o)
 }
 
 
+/*
+   The server's message and its error number and SQLSTATE -- never the
+   statement. The message used to be prefixed with the whole SQL text, values
+   and all, so a duplicate-key error carried an API token straight into the
+   logs. The number and SQLSTATE are also kept for _hx_mysql_errno and
+   _hx_mysql_sqlstate.
+*/
+static String describe_error( MYSQL *m )
+{
+   String message = String(mysql_error(m));
+   int code = mysql_errno(m);
+   if( code > 0 )
+      message = message + HX_CSTRING(" (MySQL error ") + String(code) + HX_CSTRING(", SQLSTATE ") + String(mysql_sqlstate(m)) + HX_CSTRING(")");
+   return message;
+}
+
 static void error( MYSQL *m, const char *msg )
 {
-   hx::Throw( String(msg) + HX_CSTRING(" ") + String(mysql_error(m)) );
+   if( msg && *msg )
+      hx::Throw( String(msg) + HX_CSTRING(" ") + describe_error(m) );
+   hx::Throw( describe_error(m) );
 }
 
 // ---------------------------------------------------------------
@@ -551,7 +569,7 @@ Dynamic _hx_mysql_request(Dynamic handle,String req)
    const char *sql = req.utf8_str(&sqlBuffer,true,&sqlBytes);
 
    if( mysql_real_query(connection->m,sql,sqlBytes) != 0 )
-      error(connection->m,req);
+      error(connection->m,0);
 
    MYSQL_RES *res = mysql_store_result(connection->m);
    if( !res )
@@ -559,7 +577,7 @@ Dynamic _hx_mysql_request(Dynamic handle,String req)
       if( mysql_field_count(connection->m) == 0 )
          return mysql_affected_rows(connection->m);
       else
-         error(connection->m,req);
+         error(connection->m,0);
    }
 
    return alloc_result(connection,res);
@@ -615,15 +633,23 @@ String  _hx_mysql_escape(Dynamic handle,String str)
 
 
 /**
-   connect : { host => string, port => int, user => string, pass => string, socket => string?,
-               sslMode => int?, sslCa => string?, serverPublicKey => string?,
-               allowPublicKeyRetrieval => bool? } -> 'connection
-   <doc>Connect to a database using the connection informations.
+   create : { host => string, port => int, user => string, pass => string, socket => string?,
+              sslMode => int?, sslCa => string?, serverPublicKey => string?,
+              allowPublicKeyRetrieval => bool?, connectTimeout => float?,
+              readTimeout => float?, writeTimeout => float?, keepAlive => bool?,
+              keepAliveIdle => int?, keepAliveInterval => int?, keepAliveCount => int? } -> 'connection
+   <doc>A connection, not yet open: open it with [open], and read why an open
+   failed with [errno] and [sqlstate] before closing it.
    sslMode: 0 disabled (the default), 1 preferred, 2 required, 3 verify the
    certificate's chain against sslCa (a PEM file), 4 verify its name too.
    serverPublicKey: PEM of the server's RSA key, for caching_sha2_password
    and sha256_password without TLS; allowPublicKeyRetrieval lets the client
    ask the server for it instead, which a man in the middle could answer.
+   Timeouts in seconds, 0 for none: connectTimeout bounds the TCP connect and
+   the handshake (unset: the system's connect, 50 s of handshake);
+   readTimeout and writeTimeout each read and write afterwards (unset: five
+   hours). keepAlive turns TCP keepalive on, with the probe timing given or
+   the system's.
    </doc>
 **/
 static char *copy_param(Dynamic params, const String &name)
@@ -638,47 +664,122 @@ static char *copy_param(Dynamic params, const String &name)
    return strdup(text.utf8_str(&buffer));
 }
 
-Dynamic _hx_mysql_connect(Dynamic params)
+static double seconds_param(Dynamic params, const String &name, double unset)
+{
+   Dynamic value = params->__Field(name, hx::paccDynamic);
+   return value == null() ? unset : (double)value;
+}
+
+static int int_param(Dynamic params, const String &name)
+{
+   Dynamic value = params->__Field(name, hx::paccDynamic);
+   return value == null() ? 0 : (int)value;
+}
+
+Dynamic _hx_mysql_create(Dynamic params)
 {
    // Copied to native memory: the connect blocks, and blocking calls run
    // outside the collector's sight, where a collected string may not be
    // read.
-   char *host = copy_param(params, HX_CSTRING("host"));
-   char *user = copy_param(params, HX_CSTRING("user"));
-   char *pass = copy_param(params, HX_CSTRING("pass"));
-   char *socket = copy_param(params, HX_CSTRING("socket"));
-   int port = params->__Field(HX_CSTRING("port"), hx::paccDynamic);
    Dynamic sslMode = params->__Field(HX_CSTRING("sslMode"), hx::paccDynamic);
    Dynamic allowRetrieval = params->__Field(HX_CSTRING("allowPublicKeyRetrieval"), hx::paccDynamic);
+   Dynamic keepAlive = params->__Field(HX_CSTRING("keepAlive"), hx::paccDynamic);
 
    MYSQL *cnx = mysql_init(NULL);
+   mysql_set_endpoint(cnx,
+      copy_param(params, HX_CSTRING("host")),
+      int_param(params, HX_CSTRING("port")),
+      copy_param(params, HX_CSTRING("user")),
+      copy_param(params, HX_CSTRING("pass")),
+      copy_param(params, HX_CSTRING("socket")));
    mysql_set_options(cnx,
       sslMode == null() ? 0 : (int)sslMode,
       copy_param(params, HX_CSTRING("sslCa")),
       copy_param(params, HX_CSTRING("serverPublicKey")),
       allowRetrieval != null() && (bool)allowRetrieval);
-
-   MYSQL *connected = mysql_real_connect(cnx,host ? host : "",user ? user : "",pass ? pass : "",NULL,port,socket,0);
-
-   if( pass )
-   {
-      memset(pass,0,strlen(pass));
-      free(pass);
-   }
-   free(host);
-   free(user);
-   free(socket);
-
-   if( connected == NULL )
-   {
-      String error = HX_CSTRING("Failed to connect to mysql server : ") + String(mysql_error(cnx));
-      mysql_close(cnx);
-      hx::Throw(error);
-   }
+   mysql_set_timeouts(cnx,
+      seconds_param(params, HX_CSTRING("connectTimeout"), 0),
+      seconds_param(params, HX_CSTRING("readTimeout"), -1),
+      seconds_param(params, HX_CSTRING("writeTimeout"), -1));
+   mysql_set_keepalive(cnx,
+      keepAlive != null() && (bool)keepAlive,
+      int_param(params, HX_CSTRING("keepAliveIdle")),
+      int_param(params, HX_CSTRING("keepAliveInterval")),
+      int_param(params, HX_CSTRING("keepAliveCount")));
 
    Connection *connection = new Connection();
    connection->create(cnx);
    return connection;
+}
+
+/**
+   open : 'connection -> void
+   <doc>Connects and logs in. Throws the reason on failure; [errno] and
+   [sqlstate] still answer for it until the connection is closed.</doc>
+**/
+void _hx_mysql_open(Dynamic handle)
+{
+   Connection *connection = getConnection(handle);
+   if( mysql_open(connection->m) != 0 )
+      hx::Throw( HX_CSTRING("Failed to connect to mysql server : ") + describe_error(connection->m) );
+}
+
+/**
+   connect : 'params -> 'connection
+   <doc>[create] and [open] in one: the connection, or the reason it could
+   not be made. The parameters are [create]'s.</doc>
+**/
+Dynamic _hx_mysql_connect(Dynamic params)
+{
+   Dynamic handle = _hx_mysql_create(params);
+   Connection *connection = getConnection(handle);
+   if( mysql_open(connection->m) != 0 )
+   {
+      String error = HX_CSTRING("Failed to connect to mysql server : ") + describe_error(connection->m);
+      connection->destroy();
+      hx::Throw(error);
+   }
+   return handle;
+}
+
+/**
+   ping : 'connection -> bool
+   <doc>COM_PING: whether the server answers, at the cost of one small round
+   trip rather than a statement.</doc>
+**/
+bool _hx_mysql_ping(Dynamic handle)
+{
+   Connection *connection = getConnection(handle);
+   return mysql_ping(connection->m) == 0;
+}
+
+/**
+   errno : 'connection -> int
+   <doc>The MySQL error number of the last failure, 0 after a success: the
+   server's (1062 a duplicate key, 1213 a deadlock) or the client's (2013 the
+   connection lost or timed out).</doc>
+**/
+int _hx_mysql_errno(Dynamic handle)
+{
+   return mysql_errno(getConnection(handle)->m);
+}
+
+/**
+   sqlstate : 'connection -> string
+   <doc>The SQLSTATE of the last failure, "00000" after a success.</doc>
+**/
+String _hx_mysql_sqlstate(Dynamic handle)
+{
+   return String(mysql_sqlstate(getConnection(handle)->m));
+}
+
+/**
+   thread_id : 'connection -> float
+   <doc>The server's id for this connection, as KILL takes it.</doc>
+**/
+Float _hx_mysql_thread_id(Dynamic handle)
+{
+   return (Float)mysql_thread_id(getConnection(handle)->m);
 }
 
 /**

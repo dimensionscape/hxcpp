@@ -16,26 +16,30 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 #include "my_proto.h"
 
 static void error( MYSQL *m, const char *err, const char *param ) {
-	if( param ) {
-		unsigned int max = MAX_ERR_SIZE - (strlen(err) + 3);
-		if( strlen(param) > max ) {
-			char *p2 = (char*)malloc(max + 1);
-			memcpy(p2,param,max-3);
-			p2[max - 3] = '.';
-			p2[max - 2] = '.';
-			p2[max - 1] = '.';
-			p2[max] = 0;
-			snprintf(m->last_error,sizeof(m->last_error),err,param);
-			free(p2);
-			return;
-		}
-	}
+	// snprintf truncates on its own. The branch this had for a long
+	// parameter built a shortened copy and then formatted the original, and
+	// left errcode as it was.
 	snprintf(m->last_error,sizeof(m->last_error),err,param);
 	m->errcode = -1;
+	strcpy(m->sqlstate,"HY000");
+}
+
+/*
+	A read or write that timed out leaves the protocol mid-exchange, with
+	the server's answer still to come: the connection cannot be used again,
+	so it is closed, and the next statement fails at once instead of reading
+	the old answer as its own.
+*/
+static void timed_out( MYSQL *m, double limit ) {
+	snprintf(m->last_error,sizeof(m->last_error),"Timed out after %g seconds waiting for the server",limit);
+	m->errcode = 2013; // CR_SERVER_LOST, as libmysqlclient reports a read timeout
+	strcpy(m->sqlstate,"HY000");
 }
 
 static void save_error( MYSQL *m, MYSQL_PACKET *p ) {
 	int ecode;
+	char state[6];
+	strcpy(state,"HY000");
 	p->pos = 0;
 	// seems like we sometimes get some FFFFFF sequences before
 	// the actual error...
@@ -47,10 +51,16 @@ static void save_error( MYSQL *m, MYSQL_PACKET *p ) {
 		}
 		ecode = myp_read_ui16(p);
 	} while( ecode == 0xFFFF );
-	if( m->is41 && p->buf[p->pos] == '#' )
-		p->pos += 6; // skip sqlstate marker
+	if( m->is41 && p->buf[p->pos] == '#' ) {
+		// The SQLSTATE: 40001 is a deadlock, 23000 a duplicate key, and the
+		// error number alone does not always say which class a failure is.
+		memcpy(state,p->buf + p->pos + 1,5);
+		state[5] = 0;
+		p->pos += 6;
+	}
 	error(m,"%s",myp_read_string(p));
 	m->errcode = ecode;
+	strcpy(m->sqlstate,state);
 }
 
 /*
@@ -80,11 +90,13 @@ static void myp_read_eof( MYSQL *m, MYSQL_PACKET *p ) {
 	}
 }
 
+static void io_failure( MYSQL *m, const char *what, int reading );
+
 static int myp_ok( MYSQL *m, int allow_others ) {
 	int code;
 	MYSQL_PACKET *p = &m->packet;
 	if( !myp_read_packet(m,p) ) {
-		error(m,"Failed to read packet",NULL);
+		io_failure(m,"Lost connection to the server while reading its answer",1);
 		return 0;
 	}
 	code = myp_read_byte(p);
@@ -110,6 +122,32 @@ static void myp_close( MYSQL *m ) {
 	m->s = INVALID_SOCKET;
 }
 
+/*
+	A read or write that failed after the connection was up. The exchange it
+	was part of is broken either way, so the socket is closed: the next
+	statement fails at once, rather than reading this one's late answer as
+	its own.
+*/
+static void io_failure( MYSQL *m, const char *what, int reading ) {
+	if( m->timed_out ) {
+		double limit = reading ? m->options.read_timeout : m->options.write_timeout;
+		timed_out(m,limit > 0 ? limit : 18000);
+	} else {
+		error(m,what,NULL);
+		m->errcode = 2013; // CR_SERVER_LOST
+	}
+	myp_tls_free(m);
+	myp_close(m);
+}
+
+static int not_connected( MYSQL *m ) {
+	if( m->s != INVALID_SOCKET )
+		return 0;
+	error(m,"The connection to the server is closed",NULL);
+	m->errcode = 2006; // CR_SERVER_GONE_ERROR
+	return 1;
+}
+
 MYSQL *mysql_init( void *unused ) {
 	MYSQL *m = (MYSQL*)malloc(sizeof(struct _MYSQL));
 	psock_init();
@@ -120,6 +158,12 @@ MYSQL *mysql_init( void *unused ) {
 	m->last_field_count = -1;
 	m->last_insert_id = -1;
 	m->affected_rows = -1;
+	strcpy(m->sqlstate,"00000");
+	// Unset: a caller that names no limits gets the ones this client always
+	// had, 50 seconds to connect and five hours per read.
+	m->options.connect_timeout = 0;
+	m->options.read_timeout = -1;
+	m->options.write_timeout = -1;
 	return m;
 }
 
@@ -254,15 +298,37 @@ MYSQL *mysql_real_connect( MYSQL *m, const char *host, const char *user, const c
 		return NULL;
 	}
 	psock_set_fastsend(m->s,1);
-	psock_set_timeout(m->s,50); // 50 seconds
-	if( psock_connect(m->s,h,port) != PS_OK ) {
-		myp_close(m);
-		error(m,"Failed to connect on host '%s'",host);
-		return NULL;
+	// The handshake is bounded by the connect timeout too: a server that
+	// accepts and never greets would otherwise hold the caller for as long
+	// as the socket waits.
+	psock_set_timeout(m->s,m->options.connect_timeout > 0 ? m->options.connect_timeout : 50);
+	{
+		SERR r = psock_connect_timeout(m->s,h,port,m->options.connect_timeout);
+		if( r != PS_OK ) {
+			int code = psock_last_error();
+			myp_close(m);
+			if( r == PS_BLOCK && m->options.connect_timeout > 0 ) {
+				snprintf(m->last_error,sizeof(m->last_error),"Timed out after %g seconds connecting to '%s'",m->options.connect_timeout,host);
+				m->errcode = 2003; // CR_CONN_HOST_ERROR
+			} else {
+				snprintf(m->last_error,sizeof(m->last_error),"Failed to connect on host '%s' (socket error %d)",host,code);
+				m->errcode = 2003;
+			}
+			strcpy(m->sqlstate,"HY000");
+			return NULL;
+		}
 	}
+	if( m->options.keepalive )
+		psock_set_keepalive(m->s,m->options.keepalive_idle,m->options.keepalive_interval,m->options.keepalive_count);
 	if( !myp_read_packet(m,p) ) {
 		myp_close(m);
-		error(m,"Failed to read handshake packet",NULL);
+		if( m->timed_out ) {
+			snprintf(m->last_error,sizeof(m->last_error),"Timed out after %g seconds waiting for the server's greeting",
+				m->options.connect_timeout > 0 ? m->options.connect_timeout : 50);
+			m->errcode = 2013;
+			strcpy(m->sqlstate,"HY000");
+		} else
+			error(m,"Failed to read handshake packet",NULL);
 		return NULL;
 	}
 	// process handshake packet
@@ -490,20 +556,95 @@ MYSQL *mysql_real_connect( MYSQL *m, const char *host, const char *user, const c
 	}
 
 	m->infos.auth_plugin = strdup(plugin);
-	// we are connected, setup a longer timeout
-	psock_set_timeout(m->s,18000);
+	// Connected: from here each read and write is bounded by its own limit,
+	// or none. The five hours this was before are what a caller that set
+	// neither still gets.
+	if( m->options.read_timeout < 0 && m->options.write_timeout < 0 )
+		psock_set_timeout(m->s,18000);
+	else {
+		psock_set_recv_timeout(m->s,m->options.read_timeout);
+		psock_set_send_timeout(m->s,m->options.write_timeout);
+	}
 	return m;
+}
+
+int mysql_open( MYSQL *m ) {
+	MYSQL *connected = mysql_real_connect(m,m->options.host ? m->options.host : "",m->options.user ? m->options.user : "",
+		m->options.pass ? m->options.pass : "",NULL,m->options.port,m->options.socket,0);
+	// Not needed again: nothing reconnects this structure.
+	if( m->options.pass ) {
+		memset(m->options.pass,0,strlen(m->options.pass));
+		free(m->options.pass);
+		m->options.pass = NULL;
+	}
+	return connected != NULL ? 0 : -1;
+}
+
+void mysql_set_endpoint( MYSQL *m, char *host, int port, char *user, char *pass, char *socket ) {
+	free(m->options.host);
+	free(m->options.user);
+	if( m->options.pass ) {
+		memset(m->options.pass,0,strlen(m->options.pass));
+		free(m->options.pass);
+	}
+	free(m->options.socket);
+	m->options.host = host;
+	m->options.port = port;
+	m->options.user = user;
+	m->options.pass = pass;
+	m->options.socket = socket;
+}
+
+void mysql_set_timeouts( MYSQL *m, double connect_timeout, double read_timeout, double write_timeout ) {
+	m->options.connect_timeout = connect_timeout;
+	m->options.read_timeout = read_timeout;
+	m->options.write_timeout = write_timeout;
+}
+
+void mysql_set_keepalive( MYSQL *m, int on, int idle, int interval, int count ) {
+	m->options.keepalive = on;
+	m->options.keepalive_idle = idle;
+	m->options.keepalive_interval = interval;
+	m->options.keepalive_count = count;
+}
+
+int mysql_ping( MYSQL *m ) {
+	MYSQL_PACKET *p = &m->packet;
+	int pcount = 0;
+	if( not_connected(m) )
+		return -1;
+	myp_begin_packet(p,0);
+	myp_write_byte(p,COM_PING);
+	if( !myp_send_packet(m,p,&pcount) ) {
+		io_failure(m,"Lost connection to the server while sending",0);
+		return -1;
+	}
+	return myp_ok(m,0) ? 0 : -1;
+}
+
+int mysql_errno( MYSQL *m ) {
+	return m->errcode > 0 ? m->errcode : 0;
+}
+
+const char *mysql_sqlstate( MYSQL *m ) {
+	return m->sqlstate[0] ? m->sqlstate : "00000";
+}
+
+unsigned int mysql_thread_id( MYSQL *m ) {
+	return m->infos.thread_id;
 }
 
 int mysql_select_db( MYSQL *m, const char *dbname ) {
 	MYSQL_PACKET *p = &m->packet;
 	int pcount = 0;
+	if( not_connected(m) )
+		return -1;
 	myp_begin_packet(p,0);
 	myp_write_byte(p,COM_INIT_DB);
 	// send dbname without trailing 0x00
 	myp_write(p,dbname,strlen(dbname));
 	if( !myp_send_packet(m,p,&pcount) ) {
-		error(m,"Failed to send packet",NULL);
+		io_failure(m,"Lost connection to the server while sending",0);
 		return -1;
 	}
 	return myp_ok(m,0) ? 0 : -1;
@@ -512,6 +653,10 @@ int mysql_select_db( MYSQL *m, const char *dbname ) {
 int mysql_real_query( MYSQL *m, const char *query, int qlength ) {
 	MYSQL_PACKET *p = &m->packet;
 	int pcount = 0;
+	m->errcode = 0;
+	strcpy(m->sqlstate,"00000");
+	if( not_connected(m) )
+		return -1;
 	myp_begin_packet(p,0);
 	myp_write_byte(p,COM_QUERY);
 	myp_write(p,query,qlength);
@@ -519,7 +664,7 @@ int mysql_real_query( MYSQL *m, const char *query, int qlength ) {
 	m->affected_rows = -1;
 	m->last_insert_id = -1;
 	if( !myp_send_packet(m,p,&pcount) ) {
-		error(m,"Failed to send packet",NULL);
+		io_failure(m,"Lost connection to the server while sending",0);
 		return -1;
 	}
 	if( !myp_ok(m,1) )
@@ -643,7 +788,7 @@ MYSQL_RES *mysql_store_result( MYSQL *m ) {
 	if( !do_store(m,r) ) {
 		mysql_free_result(r);
 		if( !m->errcode )
-			error(m,"Failure while storing result",NULL);
+			io_failure(m,"Lost connection to the server while reading a result",1);
 		return NULL;
 	}
 	m->last_field_count = r->nfields;
@@ -700,6 +845,13 @@ void mysql_close( MYSQL *m ) {
 	free(m->infos.auth_plugin);
 	free(m->options.ssl_ca);
 	free(m->options.server_public_key);
+	free(m->options.host);
+	free(m->options.user);
+	if( m->options.pass ) {
+		memset(m->options.pass,0,strlen(m->options.pass));
+		free(m->options.pass);
+	}
+	free(m->options.socket);
 	free(m);
 }
 

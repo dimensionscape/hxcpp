@@ -27,6 +27,7 @@
 #ifdef NEKO_WINDOWS
 	static int init_done = 0;
 	static WSADATA init_data;
+#	include <mstcpip.h>
 #else
 #	include <sys/types.h>
 #	include <sys/socket.h>
@@ -51,7 +52,10 @@
 static SERR block_error() {
 #ifdef NEKO_WINDOWS
 	int err = WSAGetLastError();
-	if( err == WSAEWOULDBLOCK || err == WSAEALREADY )
+	// WSAETIMEDOUT is how a blocking socket with SO_RCVTIMEO or SO_SNDTIMEO
+	// reports its timeout on Windows, where POSIX says EAGAIN: both are a
+	// wait that ran out, not a failure of the connection.
+	if( err == WSAEWOULDBLOCK || err == WSAEALREADY || err == WSAETIMEDOUT )
 #else
 	if( errno == EAGAIN || errno == EWOULDBLOCK || errno == EINPROGRESS || errno == EALREADY )
 #endif
@@ -157,18 +161,159 @@ SERR psock_connect( PSOCK s, PHOST host, int port ) {
 	return PS_OK;
 }
 
-SERR psock_set_timeout( PSOCK s, double t ) {
+static SERR set_timeout_option( PSOCK s, int option, double t ) {
+	// 0, or less, is no limit.
+	if( t < 0 )
+		t = 0;
 #ifdef NEKO_WINDOWS
-	int time = (int)(t * 1000);
+	DWORD time = (DWORD)(t * 1000);
+	if( t > 0 && time == 0 )
+		time = 1;
 #else
 	struct timeval time;
 	time.tv_usec = (int)((t - (int)t)*1000000);
 	time.tv_sec = (int)t;
 #endif
-	if( setsockopt(s,SOL_SOCKET,SO_SNDTIMEO,(char*)&time,sizeof(time)) != 0 )
+	if( setsockopt(s,SOL_SOCKET,option,(char*)&time,sizeof(time)) != 0 )
 		return PS_ERROR;
-	if( setsockopt(s,SOL_SOCKET,SO_RCVTIMEO,(char*)&time,sizeof(time)) != 0 )
+	return PS_OK;
+}
+
+SERR psock_set_timeout( PSOCK s, double t ) {
+	if( set_timeout_option(s,SO_SNDTIMEO,t) != PS_OK )
 		return PS_ERROR;
+	return set_timeout_option(s,SO_RCVTIMEO,t);
+}
+
+SERR psock_set_recv_timeout( PSOCK s, double t ) {
+	return set_timeout_option(s,SO_RCVTIMEO,t);
+}
+
+SERR psock_set_send_timeout( PSOCK s, double t ) {
+	return set_timeout_option(s,SO_SNDTIMEO,t);
+}
+
+/*
+	TCP keepalive, so a connection to a host that has vanished is noticed:
+	with none, a query waiting on a partitioned server waits for as long as
+	the socket timeout, which was five hours. `idle` seconds without traffic
+	before the first probe, `interval` between probes, `count` unanswered
+	probes before the connection is dropped; 0 leaves the system's own.
+	Windows sets the first two and fixes the count at ten.
+*/
+SERR psock_set_keepalive( PSOCK s, int idle, int interval, int count ) {
+	int on = 1;
+	if( setsockopt(s,SOL_SOCKET,SO_KEEPALIVE,(char*)&on,sizeof(on)) != 0 )
+		return PS_ERROR;
+#ifdef NEKO_WINDOWS
+	if( idle > 0 || interval > 0 ) {
+		struct tcp_keepalive values;
+		DWORD returned = 0;
+		values.onoff = 1;
+		values.keepalivetime = (idle > 0 ? idle : 7200) * 1000;
+		values.keepaliveinterval = (interval > 0 ? interval : 1) * 1000;
+		if( WSAIoctl(s,SIO_KEEPALIVE_VALS,&values,sizeof(values),NULL,0,&returned,NULL,NULL) != 0 )
+			return PS_ERROR;
+	}
+#else
+#	ifdef TCP_KEEPIDLE
+	if( idle > 0 )
+		setsockopt(s,IPPROTO_TCP,TCP_KEEPIDLE,(char*)&idle,sizeof(idle));
+#	elif defined(TCP_KEEPALIVE)
+	if( idle > 0 )
+		setsockopt(s,IPPROTO_TCP,TCP_KEEPALIVE,(char*)&idle,sizeof(idle));
+#	endif
+#	ifdef TCP_KEEPINTVL
+	if( interval > 0 )
+		setsockopt(s,IPPROTO_TCP,TCP_KEEPINTVL,(char*)&interval,sizeof(interval));
+#	endif
+#	ifdef TCP_KEEPCNT
+	if( count > 0 )
+		setsockopt(s,IPPROTO_TCP,TCP_KEEPCNT,(char*)&count,sizeof(count));
+#	endif
+#endif
+	return PS_OK;
+}
+
+int psock_last_error() {
+#ifdef NEKO_WINDOWS
+	return WSAGetLastError();
+#else
+	return errno;
+#endif
+}
+
+/*
+	connect() with a limit. A blocking connect to a host that drops the SYN
+	waits for the operating system to give up -- 21 seconds on Windows, over
+	two minutes on Linux -- and the socket timeouts do not bound it.
+*/
+SERR psock_connect_timeout( PSOCK s, PHOST host, int port, double timeout ) {
+	if( timeout <= 0 )
+		return psock_connect(s,host,port);
+	hx::AutoGCFreeZone block;
+	struct sockaddr_in addr;
+	int ready;
+	int err = 0;
+#	ifdef NEKO_WINDOWS
+	int errlen = sizeof(err);
+#	else
+	socklen_t errlen = sizeof(err);
+#	endif
+	memset(&addr,0,sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(port);
+	*(int*)&addr.sin_addr.s_addr = host;
+	if( psock_set_blocking(s,0) != PS_OK )
+		return PS_ERROR;
+	if( connect(s,(struct sockaddr*)&addr,sizeof(addr)) != 0 ) {
+		if( block_error() != PS_BLOCK ) {
+			psock_set_blocking(s,1);
+			return PS_ERROR;
+		}
+#	ifdef NEKO_WINDOWS
+		{
+			fd_set writable, failed;
+			struct timeval limit;
+			FD_ZERO(&writable);
+			FD_ZERO(&failed);
+			FD_SET(s,&writable);
+			FD_SET(s,&failed);
+			limit.tv_sec = (long)timeout;
+			limit.tv_usec = (long)((timeout - (long)timeout) * 1000000);
+			ready = select(0,NULL,&writable,&failed,&limit);
+			if( ready > 0 && FD_ISSET(s,&failed) )
+				ready = -1;
+		}
+#	else
+		{
+			struct pollfd fds;
+			int ms = (int)(timeout * 1000);
+			fds.fd = s;
+			fds.events = POLLOUT;
+			fds.revents = 0;
+			POSIX_LABEL(poll_again);
+			ready = poll(&fds,1,ms > 0 ? ms : 1);
+			if( ready < 0 ) {
+				HANDLE_EINTR(poll_again);
+			}
+		}
+#	endif
+		if( ready == 0 ) {
+			psock_set_blocking(s,1);
+			return PS_BLOCK; // timed out
+		}
+		if( ready < 0 || getsockopt(s,SOL_SOCKET,SO_ERROR,(char*)&err,&errlen) != 0 || err != 0 ) {
+			psock_set_blocking(s,1);
+#	ifdef NEKO_WINDOWS
+			WSASetLastError(err ? err : WSAECONNREFUSED);
+#	else
+			errno = err ? err : ECONNREFUSED;
+#	endif
+			return PS_ERROR;
+		}
+	}
+	psock_set_blocking(s,1);
 	return PS_OK;
 }
 

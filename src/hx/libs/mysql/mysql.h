@@ -88,6 +88,14 @@ typedef struct {
 #define mysql_server_status	mp_server_status
 #define mysql_is_tls		mp_is_tls
 #define mysql_set_options	mp_set_options
+#define mysql_open			mp_open
+#define mysql_set_endpoint	mp_set_endpoint
+#define mysql_set_timeouts	mp_set_timeouts
+#define mysql_set_keepalive	mp_set_keepalive
+#define mysql_ping			mp_ping
+#define mysql_errno			mp_errno
+#define mysql_sqlstate		mp_sqlstate
+#define mysql_thread_id		mp_thread_id
 #define mysql_auth_plugin	mp_auth_plugin
 #define mysql_escape_string	mp_escape_string
 #define mysql_real_escape_string mp_real_escape_string
@@ -111,6 +119,16 @@ int mysql_server_status( MYSQL *m );
 int mysql_is_tls( MYSQL *m );
 // Takes ownership of the malloc'd strings.
 void mysql_set_options( MYSQL *m, int ssl_mode, char *ssl_ca, char *server_public_key, int allow_public_key_retrieval );
+// Takes ownership of the malloc'd strings; the password is wiped once used.
+void mysql_set_endpoint( MYSQL *m, char *host, int port, char *user, char *pass, char *socket );
+// Seconds, 0 for none; a negative read and write timeout keeps the old five hours.
+void mysql_set_timeouts( MYSQL *m, double connect_timeout, double read_timeout, double write_timeout );
+void mysql_set_keepalive( MYSQL *m, int on, int idle, int interval, int count );
+int mysql_open( MYSQL *m );
+int mysql_ping( MYSQL *m );
+int mysql_errno( MYSQL *m );
+const char *mysql_sqlstate( MYSQL *m );
+unsigned int mysql_thread_id( MYSQL *m );
 const char *mysql_auth_plugin( MYSQL *m );
 int mysql_escape_string( MYSQL *m, char *sout, const char *sin, int length );
 int mysql_real_escape_string( MYSQL *m, char *sout, const char *sin, int length );
