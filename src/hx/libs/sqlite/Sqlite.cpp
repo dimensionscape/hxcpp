@@ -348,15 +348,17 @@ Dynamic _hx_sqlite_result_next(Dynamic handle)
                   f = bool(sqlite3_column_int(r->r,i));
                else
                {
-                  // SQLite INTEGER is 64-bit - timestamps, snowflake ids and
-                  // SUM() aggregates routinely exceed 2^31 and were silently
-                  // wrapped.  Stay an Int when it fits, widen to Float
-                  // (53-bit exact) otherwise.
+                  // INTEGER is 64-bit, and sqlite3_column_int kept the low
+                  // 32: a millisecond timestamp, 1727600000000, read as
+                  // 1023147008. An Int when the value fits one, as every
+                  // value did before, and an Int64 when it does not -- not a
+                  // Float, which is exact only to 2^53, short of a Snowflake
+                  // id or a SUM() of them.
                   sqlite3_int64 v = sqlite3_column_int64(r->r,i);
-                  if( v == (sqlite3_int64)(int)v )
+                  if( v >= -2147483647LL - 1 && v <= 2147483647LL )
                      f = int(v);
                   else
-                     f = Float(v);
+                     f = Dynamic( (cpp::Int64)v );
                }
                break;
             case SQLITE_FLOAT:

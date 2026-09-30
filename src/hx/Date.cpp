@@ -1,6 +1,9 @@
 #include <hxcpp.h>
 
 #include <time.h>
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
 
 #ifdef HX_WINDOWS
    #include <windows.h>
@@ -92,6 +95,137 @@ double __hxcpp_time_stamp()
 }
 
 /*
+ * Calendar arithmetic for any time, for where the C library's has a range.
+ *
+ * On Windows localtime and gmtime return NULL for a time before 1970 (and
+ * after 3000), and mktime fails for one. localtime's NULL was turned into an
+ * all-zero struct tm, which strftime then refused as an invalid day of the
+ * month -- through the CRT's invalid-parameter handler, which ends the
+ * process (0xC0000409): Date.fromTime(-1000).toString() killed it. gmtime's
+ * NULL was dereferenced outright.
+ */
+static long long hx_days_from_civil(long long y, long long m, long long d)
+{
+   y -= m <= 2;
+   long long era = (y >= 0 ? y : y - 399) / 400;
+   long long yoe = y - era * 400;
+   long long doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+   long long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+   return era * 146097 + doe - 719468;
+}
+
+#ifndef USE_TIME_R
+// Only where localtime_r and gmtime_r are missing: they convert any time.
+static void hx_civil_from_days(long long z, long long *outY, int *outM, int *outD)
+{
+   z += 719468;
+   long long era = (z >= 0 ? z : z - 146096) / 146097;
+   long long doe = z - era * 146097;
+   long long yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+   long long y = yoe + era * 400;
+   long long doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+   long long mp = (5 * doy + 2) / 153;
+   long long d = doy - (153 * mp + 2) / 5 + 1;
+   long long m = mp + (mp < 10 ? 3 : -9);
+   *outY = y + (m <= 2);
+   *outM = (int)m;
+   *outD = (int)d;
+}
+
+// The fields of a UTC time, whatever the time.
+static void hx_utc_fields(double inSeconds, struct tm *time)
+{
+   long long t = (long long)floor(inSeconds);
+   long long days = t / 86400;
+   long long rem = t % 86400;
+   if (rem < 0)
+   {
+      rem += 86400;
+      days--;
+   }
+
+   long long y;
+   int m, d;
+   hx_civil_from_days(days, &y, &m, &d);
+
+   memset(time, 0, sizeof(*time));
+   time->tm_year = (int)(y - 1900);
+   time->tm_mon = m - 1;
+   time->tm_mday = d;
+   time->tm_hour = (int)(rem / 3600);
+   time->tm_min = (int)(rem % 3600 / 60);
+   time->tm_sec = (int)(rem % 60);
+   // 1970-01-01 was a Thursday.
+   time->tm_wday = (int)(((days % 7) + 11) % 7);
+   time->tm_yday = (int)(days - hx_days_from_civil(y, 1, 1));
+   time->tm_isdst = 0;
+}
+
+#ifdef HX_WINDOWS
+/*
+ * The local zone's offset from UTC, in seconds, at a UTC time the CRT cannot
+ * convert: Windows' own zone rules through SystemTimeToTzSpecificLocalTime
+ * for any year a SYSTEMTIME holds (1601 on), and the zone's standard offset
+ * before that.
+ */
+static TIME_ZONE_INFORMATION hx_load_zone()
+{
+   TIME_ZONE_INFORMATION zone;
+   GetTimeZoneInformation(&zone);
+   return zone;
+}
+
+static long long hx_windows_offset(double inSeconds, int *outIsDst)
+{
+   // Read once, as the CRT reads its own: Date.fromTime builds a Date for
+   // the year 0 first, which comes through here, so this is on the path of
+   // every date made from a time.
+   static const TIME_ZONE_INFORMATION zone = hx_load_zone();
+   long long standard = -(long long)(zone.Bias + zone.StandardBias) * 60;
+   *outIsDst = 0;
+
+   struct tm utc;
+   hx_utc_fields(inSeconds, &utc);
+   if (utc.tm_year + 1900 < 1601)
+      return standard;
+
+   SYSTEMTIME utcTime, localTime;
+   memset(&utcTime, 0, sizeof(utcTime));
+   utcTime.wYear = (WORD)(utc.tm_year + 1900);
+   utcTime.wMonth = (WORD)(utc.tm_mon + 1);
+   utcTime.wDay = (WORD)utc.tm_mday;
+   utcTime.wHour = (WORD)utc.tm_hour;
+   utcTime.wMinute = (WORD)utc.tm_min;
+   utcTime.wSecond = (WORD)utc.tm_sec;
+   if (!SystemTimeToTzSpecificLocalTime(NULL, &utcTime, &localTime))
+      return standard;
+
+   long long local = hx_days_from_civil(localTime.wYear, localTime.wMonth, localTime.wDay) * 86400
+                   + localTime.wHour * 3600 + localTime.wMinute * 60 + localTime.wSecond;
+   long long universal = hx_days_from_civil(utcTime.wYear, utcTime.wMonth, utcTime.wDay) * 86400
+                   + utcTime.wHour * 3600 + utcTime.wMinute * 60 + utcTime.wSecond;
+   long long offset = local - universal;
+   *outIsDst = offset != standard ? 1 : 0;
+   return offset;
+}
+#endif
+
+// The fields of a local time the C library would not convert.
+static void hx_local_fields(double inSeconds, struct tm *time)
+{
+   #ifdef HX_WINDOWS
+   int isDst = 0;
+   long long offset = hx_windows_offset(inSeconds, &isDst);
+   hx_utc_fields(inSeconds + (double)offset, time);
+   time->tm_isdst = isDst;
+   #else
+   hx_utc_fields(inSeconds, time);
+   #endif
+}
+
+#endif
+
+/*
  * for the provided Epoch time, fills the passed struct tm with date_time representation in local time zone
  */
 void __internal_localtime(double inSeconds, struct tm* time)
@@ -116,7 +250,7 @@ void __internal_localtime(double inSeconds, struct tm* time)
    if (result)
       *time = *result;
    else
-      memset(time, 0, sizeof(*time) );
+      hx_local_fields(inSeconds, time);
    #endif
    sLastSeconds = inSeconds;
    sLastTm = *time;
@@ -142,7 +276,11 @@ void __internal_gmtime(double inSeconds, struct tm* time)
    #ifdef USE_TIME_R
    gmtime_r(&t, time);
    #else
-   *time = *gmtime(&t);
+   struct tm *result = gmtime(&t);
+   if (result)
+      *time = *result;
+   else
+      hx_utc_fields(inSeconds, time);
    #endif
    sLastSeconds = inSeconds;
    sLastTm = *time;
@@ -165,32 +303,37 @@ double __hxcpp_new_date(int inYear,int inMonth,int inDay,int inHour, int inMin, 
    time.tm_min = inMin;
    time.tm_sec = inSeconds;
 
-   return (mktime(&time) + ((double) inMilliseconds * 0.001));
+   time_t t = mktime(&time);
+   #ifdef HX_WINDOWS
+   // The Windows CRT's mktime fails before 1970 (and after 3000), and never
+   // returns -1 as a real time. The fields are local, so the offset is the
+   // one at the time they name, found from a first guess and corrected once.
+   if (t == (time_t)-1)
+   {
+      long long y = inYear + (inMonth >= 0 ? inMonth / 12 : -((11 - inMonth) / 12));
+      long long m = inMonth - (y - inYear) * 12;
+      double naive = (double)(hx_days_from_civil(y, m + 1, 1) + (inDay - 1)) * 86400.0
+                   + inHour * 3600.0 + inMin * 60.0 + inSeconds;
+      int isDst = 0;
+      double guess = naive - (double)hx_windows_offset(naive, &isDst);
+      double utc = naive - (double)hx_windows_offset(guess, &isDst);
+      return utc + ((double) inMilliseconds * 0.001);
+   }
+   #endif
+
+   return (t + ((double) inMilliseconds * 0.001));
 }
 
 // Used by DateTools.makeUtc
 double __hxcpp_utc_date(int inYear,int inMonth,int inDay,int inHour, int inMin, int inSeconds)
 {
-   int diff;
-   time_t a, b;
-   struct tm time, *temp;
- 
-   time.tm_year = inYear;
-   time.tm_isdst = -1;
-   time.tm_year = inYear - 1900;
-   time.tm_mon = inMonth;
-   time.tm_mday = inDay;
-   time.tm_hour = inHour;
-   time.tm_min = inMin;
-   time.tm_sec = inSeconds;
-   
-   a =  mktime(&time); //timestamp based on local interpretation of date parts
-   temp = gmtime(&a); //get utc date parts corresponding to this timestamp
-   temp->tm_isdst=-1; //reset dst flag for use in mktime
-   b = mktime(temp); //get timestamp for local interpretation of utc date parts
-   diff= a - b; //find difference in timestamp values .
-   
-   return a+diff; 
+   // Arithmetic, not mktime and gmtime: those read the fields in the local
+   // zone and then took the zone back off, which on Windows failed before
+   // 1970 -- gmtime(-1) is NULL there, and it was dereferenced.
+   long long y = inYear + (inMonth >= 0 ? inMonth / 12 : -((11 - inMonth) / 12));
+   long long m = inMonth - (y - inYear) * 12;
+   return (double)(hx_days_from_civil(y, m + 1, 1) + (inDay - 1)) * 86400.0
+        + inHour * 3600.0 + inMin * 60.0 + inSeconds;
 }
 
 /*
@@ -385,6 +528,14 @@ int __hxcpp_is_dst(double inSeconds)
  */
 double __hxcpp_timezone_offset(double inSeconds)
 {
+   #ifdef HX_WINDOWS
+   if (inSeconds < 0)
+   {
+      int isDst = 0;
+      return (double)hx_windows_offset(inSeconds, &isDst);
+   }
+   #endif
+
    struct tm localTime;
    __internal_localtime( inSeconds, &localTime);
 
@@ -401,9 +552,13 @@ double __hxcpp_timezone_offset(double inSeconds)
 String __internal_to_string(struct tm time)
 {
    // YYYY-MM-DD hh:mm:ss
-
+   //
+   // Formatted by hand. strftime validates the fields, and the Windows CRT
+   // answers a value it rejects -- a year before 1900, say -- through its
+   // invalid-parameter handler, which ends the process.
    char buf[100];
-   strftime(buf,100, "%Y-%m-%d %H:%M:%S", &time);
+   snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
+      time.tm_year + 1900, time.tm_mon + 1, time.tm_mday, time.tm_hour, time.tm_min, time.tm_sec);
    return String::create(buf);
 }
 

@@ -103,13 +103,16 @@ static void error( MYSQL *m, const char *msg )
 
 #undef CONV_FLOAT
 typedef enum {
-   CONV_INT,
+   CONV_INT,       // fits an Int whatever its value
    CONV_STRING,
    CONV_FLOAT,
    CONV_BINARY,
    CONV_DATE,
    CONV_DATETIME,
-   CONV_BOOL
+   CONV_BOOL,
+   CONV_INTEGER,   // signed, up to 64 bits: Int when it fits, Int64 when not
+   CONV_UNSIGNED,  // unsigned, up to 64 bits: the same, text past Int64
+   CONV_DECIMAL    // exact: text
 } CONV;
 
 struct Result : public hx::Object
@@ -119,14 +122,17 @@ struct Result : public hx::Object
    MYSQL_RES *r;
    int nfields;
    CONV *fields_convs;
-   String *field_names;
+   // Held by the collector, not in malloc'd memory: a name computed by the
+   // statement -- COUNT(*), CONCAT(...) -- is an ordinary string, since
+   // making each one permanent would keep every one ever seen.
+   Array<String> field_names;
    MYSQL_ROW current;
 
    void create(MYSQL_RES *inR)
    {
       r = inR;
       fields_convs = 0;
-      field_names = 0;
+      field_names = null();
       nfields = 0;
       _hx_set_finalizer(this, finalize);
    }
@@ -137,10 +143,7 @@ struct Result : public hx::Object
       {
          if (fields_convs)
            free(fields_convs);
-         if (field_names)
-           free(field_names);
          fields_convs = 0;
-         field_names = 0;
          mysql_free_result(r);
          r = 0;
       }
@@ -153,6 +156,10 @@ struct Result : public hx::Object
       ((Result *)(obj.mPtr))->destroy();
    }
 
+   void __Mark(hx::MarkContext *__inCtx) HXCPP_OVERRIDE { HX_MARK_MEMBER(field_names); }
+   #ifdef HXCPP_VISIT_ALLOCS
+   void __Visit(hx::VisitContext *__inCtx) HXCPP_OVERRIDE { HX_VISIT_MEMBER(field_names); }
+   #endif
 };
 
 Result *getResult(Dynamic o)
@@ -165,6 +172,89 @@ Result *getResult(Dynamic o)
 
 cpp::Function< Dynamic(Dynamic) > gDataToBytes;
 cpp::Function< Dynamic(Float) > gDateFromSeconds;
+
+// Days from 1970-01-01 to a date of the proleptic Gregorian calendar, for any
+// year: the arithmetic mktime does, without its range or its time zone.
+static long long days_from_civil( long long y, int m, int d )
+{
+   y -= m <= 2;
+   long long era = (y >= 0 ? y : y - 399) / 400;
+   long long yoe = y - era * 400;
+   long long doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+   long long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+   return era * 146097 + doe - 719468;
+}
+
+// An integer column at its full width: an Int when it fits one, which is
+// what every INT column was already, and an Int64 when it does not.
+static Dynamic integer_value( long long v )
+{
+   if( v >= -2147483647LL - 1 && v <= 2147483647LL )
+      return (int)v;
+   return Dynamic( (cpp::Int64)v );
+}
+
+/*
+   DATE, DATETIME and TIMESTAMP, read as UTC, to the microsecond the text
+   carries. They were read through mktime, in the local time zone, and DATE
+   through an int: past 2038 it wrapped (2040-06-01 read as 1904-04-26), and
+   on Windows mktime fails before 1970. A DATETIME holds no zone, and UTC is
+   the one reading that maps every value to a distinct instant and back; a
+   local reading skips the hour a clock springs forward. The zero dates MySQL
+   allows (0000-00-00) are no date at all, and read as null.
+*/
+static Dynamic date_value( const char *s )
+{
+   int y = 0, mo = 0, d = 0, h = 0, mi = 0, sec = 0;
+   int n = sscanf(s,"%d-%d-%d %d:%d:%d",&y,&mo,&d,&h,&mi,&sec);
+   if( n < 3 || mo < 1 || mo > 12 || d < 1 || d > 31 )
+      return null();
+
+   double fraction = 0;
+   const char *dot = strchr(s,'.');
+   if( dot )
+      fraction = atof(dot);
+
+   double seconds = (double)days_from_civil(y,mo,d) * 86400.0 + h * 3600.0 + mi * 60.0 + sec + fraction;
+   return gDateFromSeconds.call(seconds);
+}
+
+static Dynamic convert_value( CONV conv, const char *s, unsigned long length )
+{
+   switch( conv )
+   {
+      case CONV_INT:
+         return atoi(s);
+      case CONV_INTEGER:
+         return integer_value(strtoll(s,0,10));
+      case CONV_UNSIGNED:
+         {
+            unsigned long long v = strtoull(s,0,10);
+            if( v > 9223372036854775807ULL )
+               return String::create(s,(int)length);
+            return integer_value((long long)v);
+         }
+      case CONV_DECIMAL:
+         return String::create(s,(int)length);
+      case CONV_BOOL:
+         return *s != '0';
+      case CONV_FLOAT:
+         return atof(s);
+      case CONV_BINARY:
+         {
+            Array<unsigned char> buf = Array_obj<unsigned char>::__new((int)length,(int)length);
+            if( length )
+               memcpy(&buf[0],s,length);
+            return gDataToBytes.call(buf);
+         }
+      case CONV_DATE:
+      case CONV_DATETIME:
+         return date_value(s);
+      case CONV_STRING:
+      default:
+         return String::create(s,(int)length);
+   }
+}
 
 }
 
@@ -252,72 +342,18 @@ Dynamic _hx_mysql_result_next(Dynamic handle)
    if( !row )
       return null();
 
-   int count = r->nfields;
    hx::Anon cur = hx::Anon_obj::Create(0);
 
    r->current = row;
-   unsigned long *lengths = 0;
+   unsigned long *lengths = mysql_fetch_lengths(r->r);
    for(int i=0;i<r->nfields;i++)
    {
+      Dynamic v;
       if( row[i] )
-      {
-         Dynamic v;
-         switch( r->fields_convs[i] )
-         {
-            case CONV_INT:
-               v = atoi(row[i]);
-               break;
-            case CONV_STRING:
-               v = String(row[i]);
-               break;
-            case CONV_BOOL:
-               v = *row[i] != '0';
-               break;
-            case CONV_FLOAT:
-               v = atof(row[i]);
-               break;
-            case CONV_BINARY:
-               {
-               if( lengths == NULL )
-               {
-                  lengths = mysql_fetch_lengths(r->r);
-                  if( lengths == NULL )
-                     HXTHROW("mysql_fetch_lengths");
-               }
-               Array<unsigned char> buf = Array_obj<unsigned char>::__new(lengths[i],lengths[i]);
-               memcpy(&buf[0],row[i],lengths[i]);
-               v = gDataToBytes.call(buf);
-               }
-               break;
-
-            case CONV_DATE:
-               {
-                  struct tm t;
-                  sscanf(row[i],"%4d-%2d-%2d",&t.tm_year,&t.tm_mon,&t.tm_mday);
-                  t.tm_hour = 0;
-                  t.tm_min = 0;
-                  t.tm_sec = 0;
-                  t.tm_isdst = -1;
-                  t.tm_year -= 1900;
-                  t.tm_mon--;
-                  v = gDateFromSeconds.call((int)mktime(&t));
-               }
-               break;
-            case CONV_DATETIME:
-               {
-                  struct tm t;
-                  sscanf(row[i],"%4d-%2d-%2d %2d:%2d:%2d",&t.tm_year,&t.tm_mon,&t.tm_mday,&t.tm_hour,&t.tm_min,&t.tm_sec);
-                  t.tm_isdst = -1;
-                  t.tm_year -= 1900;
-                  t.tm_mon--;
-                  v = gDateFromSeconds.call(mktime(&t));
-               }
-               break;
-            default:
-               break;
-         }
-         cur->__SetField(r->field_names[i],v, hx::paccDynamic );
-      }
+         v = convert_value(r->fields_convs[i],row[i],lengths ? lengths[i] : (unsigned long)strlen(row[i]));
+      // SQL NULL is a value: the field is there, holding null. It was left
+      // out of the row, so a NULL column and a misspelt one looked alike.
+      cur->__SetField(r->field_names[i],v, hx::paccDynamic );
    }
    return cur;
 }
@@ -385,46 +421,53 @@ Float   _hx_mysql_result_get_float(Dynamic handle,int n)
    return s?atof(s):0;
 }
 
-static CONV convert_type( enum enum_field_types t, int flags, unsigned int length ) {
-   // FIELD_TYPE_TIME
-   // FIELD_TYPE_YEAR
-   // FIELD_TYPE_NEWDATE
-   // FIELD_TYPE_NEWDATE + 2: // 5.0 MYSQL_TYPE_BIT
+static CONV convert_type( enum enum_field_types t, int flags, unsigned int length, int charset ) {
    switch( t ) {
    case FIELD_TYPE_TINY:
       if( length == 1 )
          return CONV_BOOL;
+      return CONV_INT;
    case FIELD_TYPE_SHORT:
-   case FIELD_TYPE_LONG:
    case FIELD_TYPE_INT24:
       return CONV_INT;
+   case FIELD_TYPE_LONG:
+      // INT UNSIGNED goes to 4294967295, and atoi saturated it at 2^31 - 1.
+      return (flags & UNSIGNED_FLAG) ? CONV_INTEGER : CONV_INT;
    case FIELD_TYPE_LONGLONG:
+      // BIGINT was a Float, exact only to 2^53: every Snowflake id is past
+      // it.
+      return (flags & UNSIGNED_FLAG) ? CONV_UNSIGNED : CONV_INTEGER;
    case FIELD_TYPE_DECIMAL:
+   case FIELD_TYPE_NEWDECIMAL:
+      // Exact, as the column is; a Float was not.
+      return CONV_DECIMAL;
    case FIELD_TYPE_FLOAT:
    case FIELD_TYPE_DOUBLE:
-   case 246: // 5.0 MYSQL_NEW_DECIMAL
       return CONV_FLOAT;
-   case FIELD_TYPE_BLOB:
-   case FIELD_TYPE_TINY_BLOB:
-   case FIELD_TYPE_MEDIUM_BLOB:
-   case FIELD_TYPE_LONG_BLOB:
-      if( (flags & BINARY_FLAG) != 0 )
-         return CONV_BINARY;
-      return CONV_STRING;
    case FIELD_TYPE_DATETIME:
    case FIELD_TYPE_TIMESTAMP:
       return CONV_DATETIME;
    case FIELD_TYPE_DATE:
+   case FIELD_TYPE_NEWDATE:
       return CONV_DATE;
-   case FIELD_TYPE_NULL:
-   case FIELD_TYPE_ENUM:
-   case FIELD_TYPE_SET:
-   //case FIELD_TYPE_VAR_STRING:
-   //case FIELD_TYPE_GEOMETRY:
-   // 5.0 MYSQL_TYPE_VARCHAR
-   default:
-      if( (flags & BINARY_FLAG) != 0 )
+   case FIELD_TYPE_BIT:
+   case FIELD_TYPE_GEOMETRY:
+      return CONV_BINARY;
+   case FIELD_TYPE_VARCHAR:
+   case FIELD_TYPE_VAR_STRING:
+   case FIELD_TYPE_STRING:
+   case FIELD_TYPE_TINY_BLOB:
+   case FIELD_TYPE_MEDIUM_BLOB:
+   case FIELD_TYPE_LONG_BLOB:
+   case FIELD_TYPE_BLOB:
+      // Bytes for the binary character set only. BINARY_FLAG is set on text
+      // with a _bin collation too, so a VARCHAR ... COLLATE utf8mb4_bin came
+      // back as Bytes.
+      if( charset == 63 )
          return CONV_BINARY;
+      return CONV_STRING;
+   default:
+      // TIME, YEAR, JSON, ENUM, SET: text.
       return CONV_STRING;
    }
 }
@@ -441,19 +484,23 @@ static Result *alloc_result( Connection *c, MYSQL_RES *r )
    MYSQL_FIELD *fields = mysql_fetch_fields(r);
    res->current = 0;
    res->nfields = num_fields;
-   res->field_names = (String *)malloc(sizeof(String)*num_fields);
-   res->fields_convs = (CONV*)malloc(sizeof(CONV)*num_fields);   
+   res->field_names = Array_obj<String>::__new(num_fields,num_fields);
+   HX_OBJ_WB_GET(res, res->field_names.mPtr);
+   res->fields_convs = (CONV*)malloc(sizeof(CONV)*num_fields);
 
    for(i=0;i<num_fields;i++)
    {
       String name;
+      // The column's own name. One computed by the statement (COUNT(*) and
+      // the like) was renamed '???', so two of them in one row overwrote
+      // each other and neither could be read by name.
       if( strchr(fields[i].name,'(') )
-         name = String::createPermanent("???",3); // looks like an inner request : prevent hashing + cashing it
+         name = String::create(fields[i].name, -1);
       else
          name = String::createPermanent(fields[i].name, -1);
 
       res->field_names[i] = name;
-      res->fields_convs[i] = convert_type(fields[i].type,fields[i].flags,fields[i].length);
+      res->fields_convs[i] = convert_type(fields[i].type,fields[i].flags,fields[i].length,fields[i].charset);
    }
 
    return res;
