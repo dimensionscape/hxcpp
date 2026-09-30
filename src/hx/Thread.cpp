@@ -374,10 +374,13 @@ public:
 	#if defined(HX_WINDOWS)
 	double Now()
 	{
-		// Monotonic and 64-bit - clock() is a 32-bit millisecond count on
+		// Monotonic, 64-bit and fine-grained: haxe.Timer.stamp's clock, the
+		// performance counter.  clock() is a 32-bit millisecond count on
 		// MSVC, which wraps negative after ~24.8 days of process uptime and
-		// breaks every timed wait from then on
-		return (double)GetTickCount64()*0.001;
+		// breaks every timed wait from then on.  GetTickCount64 does not
+		// wrap, but it moves only on the ~15.6ms system tick, so a deadline
+		// taken from it came due up to a tick late: a 1ms wait took 15ms
+		return __time_stamp();
 	}
 	#elif defined(__SNC__)
 	double Now()
