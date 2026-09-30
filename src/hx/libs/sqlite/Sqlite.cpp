@@ -386,12 +386,21 @@ Dynamic _hx_sqlite_result_next(Dynamic handle)
       case SQLITE_DONE:
          r->destroy(true);
          return null();
-      case SQLITE_BUSY:
-         hx::Throw(HX_CSTRING("Database is busy"));
-      case SQLITE_ERROR:
-         sqlite_error(r->db);
       default:
-         hx::Throw(HX_CSTRING("Unkown sqlite result"));
+      {
+         // The step failed: finalize now, and ignore what finalize says. With
+         // the legacy sqlite3_prepare this uses, finalize returns the step's
+         // error again, and the statement was left for the next request or
+         // close to finalize with destroy(true) -- which threw that error as
+         // "Could not finalize request", failing the connection's next,
+         // unrelated statement. Finalizing first is also what gives SQLite's
+         // own message: the step's is only "SQL logic error".
+         sqlite3 *db = r->db;
+         r->destroy(false);
+         if( step == SQLITE_BUSY || step == SQLITE_LOCKED )
+            hx::Throw( HX_CSTRING("Database is busy : ") + String(sqlite3_errmsg(db)) );
+         sqlite_error(db);
+      }
    }
 
    return null();
