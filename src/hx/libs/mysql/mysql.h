@@ -86,6 +86,9 @@ typedef struct {
 #define mysql_field_count	mp_field_count
 #define mysql_affected_rows	mp_affected_rows
 #define mysql_server_status	mp_server_status
+#define mysql_is_tls		mp_is_tls
+#define mysql_set_options	mp_set_options
+#define mysql_auth_plugin	mp_auth_plugin
 #define mysql_escape_string	mp_escape_string
 #define mysql_real_escape_string mp_real_escape_string
 #define mysql_close			mp_close
@@ -105,6 +108,10 @@ MYSQL_RES *mysql_store_result( MYSQL *m );
 int mysql_field_count( MYSQL *m );
 int mysql_affected_rows( MYSQL *m );
 int mysql_server_status( MYSQL *m );
+int mysql_is_tls( MYSQL *m );
+// Takes ownership of the malloc'd strings.
+void mysql_set_options( MYSQL *m, int ssl_mode, char *ssl_ca, char *server_public_key, int allow_public_key_retrieval );
+const char *mysql_auth_plugin( MYSQL *m );
 int mysql_escape_string( MYSQL *m, char *sout, const char *sin, int length );
 int mysql_real_escape_string( MYSQL *m, char *sout, const char *sin, int length );
 void mysql_close( MYSQL *m );

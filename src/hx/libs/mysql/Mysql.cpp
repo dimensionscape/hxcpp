@@ -615,19 +615,61 @@ String  _hx_mysql_escape(Dynamic handle,String str)
 
 
 /**
-   connect : { host => string, port => int, user => string, pass => string, socket => string? } -> 'connection
-   <doc>Connect to a database using the connection informations</doc>
+   connect : { host => string, port => int, user => string, pass => string, socket => string?,
+               sslMode => int?, sslCa => string?, serverPublicKey => string?,
+               allowPublicKeyRetrieval => bool? } -> 'connection
+   <doc>Connect to a database using the connection informations.
+   sslMode: 0 disabled (the default), 1 preferred, 2 required, 3 verify the
+   certificate's chain against sslCa (a PEM file), 4 verify its name too.
+   serverPublicKey: PEM of the server's RSA key, for caching_sha2_password
+   and sha256_password without TLS; allowPublicKeyRetrieval lets the client
+   ask the server for it instead, which a man in the middle could answer.
+   </doc>
 **/
+static char *copy_param(Dynamic params, const String &name)
+{
+   Dynamic value = params->__Field(name, hx::paccDynamic);
+   if( value == null() )
+      return 0;
+   String text = value;
+   if( !text.raw_ptr() || text.length == 0 )
+      return 0;
+   hx::strbuf buffer;
+   return strdup(text.utf8_str(&buffer));
+}
+
 Dynamic _hx_mysql_connect(Dynamic params)
 {
-   String host = params->__Field(HX_CSTRING("host"), hx::paccDynamic );
-   int    port = params->__Field(HX_CSTRING("port"), hx::paccDynamic);
-   String user = params->__Field(HX_CSTRING("user"), hx::paccDynamic);
-   String pass = params->__Field(HX_CSTRING("pass"), hx::paccDynamic);
-   String socket = params->__Field(HX_CSTRING("socket"), hx::paccDynamic );
+   // Copied to native memory: the connect blocks, and blocking calls run
+   // outside the collector's sight, where a collected string may not be
+   // read.
+   char *host = copy_param(params, HX_CSTRING("host"));
+   char *user = copy_param(params, HX_CSTRING("user"));
+   char *pass = copy_param(params, HX_CSTRING("pass"));
+   char *socket = copy_param(params, HX_CSTRING("socket"));
+   int port = params->__Field(HX_CSTRING("port"), hx::paccDynamic);
+   Dynamic sslMode = params->__Field(HX_CSTRING("sslMode"), hx::paccDynamic);
+   Dynamic allowRetrieval = params->__Field(HX_CSTRING("allowPublicKeyRetrieval"), hx::paccDynamic);
 
    MYSQL *cnx = mysql_init(NULL);
-   if( mysql_real_connect(cnx,host.utf8_str(),user.utf8_str(),pass.utf8_str(),NULL,port,socket.utf8_str(),0) == NULL )
+   mysql_set_options(cnx,
+      sslMode == null() ? 0 : (int)sslMode,
+      copy_param(params, HX_CSTRING("sslCa")),
+      copy_param(params, HX_CSTRING("serverPublicKey")),
+      allowRetrieval != null() && (bool)allowRetrieval);
+
+   MYSQL *connected = mysql_real_connect(cnx,host ? host : "",user ? user : "",pass ? pass : "",NULL,port,socket,0);
+
+   if( pass )
+   {
+      memset(pass,0,strlen(pass));
+      free(pass);
+   }
+   free(host);
+   free(user);
+   free(socket);
+
+   if( connected == NULL )
    {
       String error = HX_CSTRING("Failed to connect to mysql server : ") + String(mysql_error(cnx));
       mysql_close(cnx);
@@ -637,6 +679,24 @@ Dynamic _hx_mysql_connect(Dynamic params)
    Connection *connection = new Connection();
    connection->create(cnx);
    return connection;
+}
+
+/**
+   is_tls : 'connection -> bool
+   <doc>Whether the session runs over TLS.</doc>
+**/
+bool _hx_mysql_is_tls(Dynamic handle)
+{
+   return mysql_is_tls(getConnection(handle)->m) != 0;
+}
+
+/**
+   auth_plugin : 'connection -> string
+   <doc>The authentication plugin the account logged in with.</doc>
+**/
+String _hx_mysql_auth_plugin(Dynamic handle)
+{
+   return String(mysql_auth_plugin(getConnection(handle)->m));
 }
 
 

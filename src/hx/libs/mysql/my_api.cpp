@@ -105,7 +105,8 @@ static int myp_ok( MYSQL *m, int allow_others ) {
 }
 
 static void myp_close( MYSQL *m ) {
-	psock_close(m->s);
+	if( m->s != INVALID_SOCKET )
+		psock_close(m->s);
 	m->s = INVALID_SOCKET;
 }
 
@@ -122,11 +123,122 @@ MYSQL *mysql_init( void *unused ) {
 	return m;
 }
 
+// The nonce every auth plugin scrambles with: the first 20 bytes of the auth
+// data in the greeting or in an auth switch request.
+#define NONCE_SIZE 20
+#define AUTH_MAX 512
+
+static const char *NATIVE_PASSWORD = "mysql_native_password";
+static const char *CACHING_SHA2_PASSWORD = "caching_sha2_password";
+static const char *SHA256_PASSWORD = "sha256_password";
+static const char *CLEAR_PASSWORD = "mysql_clear_password";
+
+static int known_plugin( const char *plugin ) {
+	return strcmp(plugin,NATIVE_PASSWORD) == 0 || strcmp(plugin,CACHING_SHA2_PASSWORD) == 0
+		|| strcmp(plugin,SHA256_PASSWORD) == 0 || strcmp(plugin,CLEAR_PASSWORD) == 0;
+}
+
+/*
+	The password, NUL-terminated, XORed with the nonce and encrypted with the
+	server's RSA key: what caching_sha2_password and sha256_password take
+	over a connection that is not encrypted.
+*/
+static int rsa_password( MYSQL *m, const char *pem, const char *pass, const unsigned char *nonce, unsigned char *out ) {
+	int length = (int)strlen(pass) + 1;
+	int i, n;
+	unsigned char *clear = (unsigned char*)malloc(length);
+	for(i=0;i<length;i++)
+		clear[i] = (unsigned char)(i < length - 1 ? pass[i] : 0) ^ nonce[i % NONCE_SIZE];
+	n = myp_rsa_encrypt(m,pem,clear,length,out,AUTH_MAX);
+	memset(clear,0,length);
+	free(clear);
+	return n;
+}
+
+/*
+	The answer to a plugin's first challenge, into `out` (AUTH_MAX bytes):
+	its length, or -1 with the error set.
+*/
+static int auth_response( MYSQL *m, const char *plugin, const char *pass, const unsigned char *nonce, unsigned char *out ) {
+	int length = (int)strlen(pass);
+	if( strcmp(plugin,NATIVE_PASSWORD) == 0 ) {
+		if( !length )
+			return 0;
+		myp_encrypt_password(pass,(const char*)nonce,out);
+		return SHA1_SIZE;
+	}
+	if( strcmp(plugin,CACHING_SHA2_PASSWORD) == 0 ) {
+		// XOR(SHA256(password), SHA256(SHA256(SHA256(password)), nonce))
+		unsigned char stage1[32], stage2[32], digest[32], both[32 + NONCE_SIZE];
+		int i;
+		if( !length )
+			return 0;
+		myp_sha256((const unsigned char*)pass,length,stage1);
+		myp_sha256(stage1,32,stage2);
+		memcpy(both,stage2,32);
+		memcpy(both + 32,nonce,NONCE_SIZE);
+		myp_sha256(both,32 + NONCE_SIZE,digest);
+		for(i=0;i<32;i++)
+			out[i] = stage1[i] ^ digest[i];
+		return 32;
+	}
+	if( strcmp(plugin,SHA256_PASSWORD) == 0 || strcmp(plugin,CLEAR_PASSWORD) == 0 ) {
+		if( m->tls || !length ) {
+			if( length + 1 > AUTH_MAX ) {
+				error(m,"Password too long",NULL);
+				return -1;
+			}
+			memcpy(out,pass,length + 1);
+			return length + 1;
+		}
+		if( strcmp(plugin,CLEAR_PASSWORD) == 0 ) {
+			error(m,"The account uses mysql_clear_password, which would send the password in the clear: connect with TLS",NULL);
+			return -1;
+		}
+		if( m->options.server_public_key )
+			return rsa_password(m,m->options.server_public_key,pass,nonce,out);
+		if( m->options.allow_public_key_retrieval ) {
+			out[0] = 1; // asks for the server's public key
+			return 1;
+		}
+		error(m,"The account uses sha256_password, which needs TLS, the server's RSA public key (serverPublicKey), or allowPublicKeyRetrieval",NULL);
+		return -1;
+	}
+	snprintf(m->last_error,sizeof(m->last_error),"Unsupported authentication plugin '%s'",plugin);
+	m->errcode = 2059; // CR_AUTH_PLUGIN_CANNOT_LOAD
+	return -1;
+}
+
+static int auth_send( MYSQL *m, const unsigned char *data, int length, int *pcount ) {
+	MYSQL_PACKET *p = &m->packet;
+	myp_begin_packet(p,length);
+	myp_write(p,data,length);
+	if( !myp_send_packet(m,p,pcount) ) {
+		error(m,"Failed to send authentication packet",NULL);
+		return 0;
+	}
+	return 1;
+}
+
+static MYSQL *connect_failed( MYSQL *m ) {
+	myp_tls_free(m);
+	myp_close(m);
+	return NULL;
+}
+
 MYSQL *mysql_real_connect( MYSQL *m, const char *host, const char *user, const char *pass, void *unused, int port, const char *socket, int options ) {
 	PHOST h;
-	char scramble_buf[21];
+	unsigned char nonce[NONCE_SIZE + 13];
+	char plugin[64];
+	unsigned char auth[AUTH_MAX];
+	int authlen;
+	unsigned int flags;
 	MYSQL_PACKET *p = &m->packet;
 	int pcount = 1;
+	if( !pass )
+		pass = "";
+	if( !user )
+		user = "";
 	if( socket && *socket ) {
 		error(m,"Unix Socket connections are not supported",NULL);
 		return NULL;
@@ -157,16 +269,18 @@ MYSQL *mysql_real_connect( MYSQL *m, const char *host, const char *user, const c
 	{
 		char filler[13];
 		unsigned int len;
+		memset(nonce,0,sizeof(nonce));
+		strcpy(plugin,NATIVE_PASSWORD);
 		m->infos.proto_version = myp_read_byte(p);
 		// this seems like an error packet
 		if( m->infos.proto_version == 0xFF ) {
 			myp_close(m);
 			save_error(m,p);
 			return NULL;
-		}	
+		}
 		m->infos.server_version = strdup(myp_read_string(p));
 		m->infos.thread_id = myp_read_int(p);
-		myp_read(p,scramble_buf,8);
+		myp_read(p,nonce,8);
 		myp_read_byte(p); // should be 0
 		m->infos.server_flags = myp_read_ui16(p);
 		m->infos.server_charset = myp_read_byte(p);
@@ -176,97 +290,206 @@ MYSQL *mysql_real_connect( MYSQL *m, const char *host, const char *user, const c
 		myp_read(p,filler,10);
 		// try to disable 41
 		m->is41 = (m->infos.server_flags & FL_PROTOCOL_41) != 0;
-		if( !p->error && m->is41 )
-			myp_read(p,scramble_buf + 8,13);
-		if( p->pos != p->size )
-			myp_read_string(p); // 5.5+
+		if( !p->error && m->is41 ) {
+			// The rest of the nonce: max(13, length - 8) bytes, of which the
+			// first 12 complete it.
+			unsigned char part2[256];
+			int size2 = (int)len - 8;
+			if( size2 < 13 )
+				size2 = 13;
+			myp_read(p,part2,size2);
+			memcpy(nonce + 8,part2,12);
+		}
+		if( p->pos < p->size ) {
+			// 5.5+: the auth plugin the server expects to be answered with.
+			const char *named = myp_read_string(p);
+			if( (m->infos.server_flags & FL_PLUGIN_AUTH) && *named && strlen(named) < sizeof(plugin) )
+				strcpy(plugin,named);
+		}
 		if( p->error ) {
 			myp_close(m);
 			error(m,"Failed to decode server handshake",NULL);
 			return NULL;
 		}
-		// fill answer packet
-		{
-			unsigned int flags = m->infos.server_flags;
-			int max_packet_size = 0x01000000;
-			SHA1_DIGEST hpass;
+		// A plugin this client does not speak: answer as mysql_native_password
+		// and let the server switch the client to what the account uses.
+		if( !known_plugin(plugin) )
+			strcpy(plugin,NATIVE_PASSWORD);
+	}
+
+	flags = m->infos.server_flags & (FL_LONG_PASSWORD | FL_PROTOCOL_41 | FL_TRANSACTIONS | FL_SECURE_CONNECTION | FL_PLUGIN_AUTH | FL_PLUGIN_AUTH_LENENC);
+
+	// TLS: asked for with an SSLRequest -- the first 32 bytes of a handshake
+	// response, with CLIENT_SSL set -- after which both sides run the TLS
+	// handshake and the real response follows, encrypted.
+	if( m->is41 && m->options.ssl_mode != MYSQL_SSL_DISABLED ) {
+		if( m->infos.server_flags & FL_SSL ) {
 			char filler[23];
-			flags &= (FL_PROTOCOL_41 | FL_TRANSACTIONS | FL_SECURE_CONNECTION);
-			myp_begin_packet(p,128);
-			if( m->is41 ) {
-				myp_write_int(p,flags);
-				myp_write_int(p,max_packet_size);
-				myp_write_byte(p,m->infos.server_charset);
-				memset(filler,0,23);
-				myp_write(p,filler,23);
-				myp_write_string(p,user);
-				if( *pass ) {
-					myp_encrypt_password(pass,scramble_buf,hpass);
-					myp_write_bin(p,SHA1_SIZE);
-					myp_write(p,hpass,SHA1_SIZE);
-					myp_write_byte(p,0);
-				} else
-					myp_write_bin(p,0);
-			} else {
-				myp_write_ui16(p,flags);
-				// max_packet_size
-				myp_write_byte(p,0xFF);
-				myp_write_byte(p,0xFF);
-				myp_write_byte(p,0xFF);
-				myp_write_string(p,user);
-				if( *pass ) {
-					char hpass[SEED_LENGTH_323 + 1];
-					myp_encrypt_pass_323(pass,scramble_buf,hpass);
-					hpass[SEED_LENGTH_323] = 0;
-					myp_write(p,hpass,SEED_LENGTH_323 + 1);
-				} else
-					myp_write_bin(p,0);
+			flags |= FL_SSL;
+			myp_begin_packet(p,32);
+			myp_write_int(p,flags);
+			myp_write_int(p,0x01000000);
+			myp_write_byte(p,m->infos.server_charset);
+			memset(filler,0,23);
+			myp_write(p,filler,23);
+			if( !myp_send_packet(m,p,&pcount) ) {
+				error(m,"Failed to send TLS request",NULL);
+				return connect_failed(m);
 			}
+			if( !myp_tls_start(m,host) )
+				return connect_failed(m);
+		} else if( m->options.ssl_mode >= MYSQL_SSL_REQUIRED ) {
+			myp_close(m);
+			error(m,"The server does not support TLS, and the connection requires it",NULL);
+			return NULL;
 		}
+	}
+
+	// fill answer packet
+	if( m->is41 ) {
+		char filler[23];
+		authlen = auth_response(m,plugin,pass,nonce,auth);
+		if( authlen < 0 )
+			return connect_failed(m);
+		myp_begin_packet(p,128);
+		myp_write_int(p,flags);
+		myp_write_int(p,0x01000000);
+		myp_write_byte(p,m->infos.server_charset);
+		memset(filler,0,23);
+		myp_write(p,filler,23);
+		myp_write_string(p,user);
+		if( flags & FL_PLUGIN_AUTH_LENENC ) {
+			myp_write_bin(p,authlen);
+			myp_write(p,auth,authlen);
+		} else if( flags & FL_SECURE_CONNECTION ) {
+			if( authlen > 255 ) {
+				error(m,"The server cannot take an authentication response this long",NULL);
+				return connect_failed(m);
+			}
+			myp_write_byte(p,authlen);
+			myp_write(p,auth,authlen);
+		} else {
+			myp_write(p,auth,authlen);
+			myp_write_byte(p,0);
+		}
+		if( flags & FL_PLUGIN_AUTH )
+			myp_write_string(p,plugin);
+	} else {
+		myp_begin_packet(p,128);
+		myp_write_ui16(p,flags);
+		// max_packet_size
+		myp_write_byte(p,0xFF);
+		myp_write_byte(p,0xFF);
+		myp_write_byte(p,0xFF);
+		myp_write_string(p,user);
+		if( *pass ) {
+			char hpass[SEED_LENGTH_323 + 1];
+			myp_encrypt_pass_323(pass,(const char*)nonce,hpass);
+			hpass[SEED_LENGTH_323] = 0;
+			myp_write(p,hpass,SEED_LENGTH_323 + 1);
+		} else
+			myp_write_bin(p,0);
 	}
 	// send connection packet
-send_cnx_packet:
 	if( !myp_send_packet(m,p,&pcount) ) {
-		myp_close(m);
 		error(m,"Failed to send connection packet",NULL);
-		return NULL;
+		return connect_failed(m);
 	}
-	// read answer packet
-	if( !myp_read_packet(m,p) ) {
-		myp_close(m);
-		error(m,"Failed to read packet",NULL);
-		return NULL;
-	}
-	// increase packet counter (because we read one packet)
-	pcount++;
-	// process answer
-	{
-		int code = myp_read_byte(p);
-		switch( code ) {
-		case 0: // OK packet
+
+	// The server answers until it accepts or refuses: an auth switch to
+	// another plugin, more data for caching_sha2_password, a public key.
+	while( 1 ) {
+		int code;
+		if( !myp_read_packet(m,p) ) {
+			error(m,"Failed to read packet",NULL);
+			return connect_failed(m);
+		}
+		// increase packet counter (because we read one packet)
+		pcount++;
+		code = myp_read_byte(p);
+		if( code == 0x00 ) { // OK packet
 			myp_read_ok(m,p);
 			break;
-		case 0xFF: // ERROR
-			myp_close(m);
-			save_error(m,p);
-			return NULL;
-		case 0xFE: // EOF
-			// we are asked to send old password authentification
-			if( p->size == 1 ) {
-				char hpass[SEED_LENGTH_323 + 1];
-				myp_encrypt_pass_323(pass,scramble_buf,hpass);
-				hpass[SEED_LENGTH_323] = 0;
-				myp_begin_packet(p,0);
-				myp_write(p,hpass,SEED_LENGTH_323 + 1);
-				goto send_cnx_packet;
-			}
-			// fallthrough
-		default:
-			myp_close(m);
-			error(m,"Invalid packet error",NULL);
-			return NULL;
 		}
+		if( code == 0xFF ) { // ERROR
+			save_error(m,p);
+			return connect_failed(m);
+		}
+		if( code == 0xFE ) {
+			if( p->size == 1 ) {
+				// we are asked to send old password authentification
+				char hpass[SEED_LENGTH_323 + 1];
+				myp_encrypt_pass_323(pass,(const char*)nonce,hpass);
+				hpass[SEED_LENGTH_323] = 0;
+				if( !auth_send(m,(const unsigned char*)hpass,SEED_LENGTH_323 + 1,&pcount) )
+					return connect_failed(m);
+				continue;
+			}
+			// Auth switch: the account uses another plugin than the greeting
+			// named, and here is a fresh nonce for it. This was taken as a
+			// broken packet, so no account on any other plugin could log in.
+			{
+				const char *named = myp_read_string(p);
+				int rest = p->size - p->pos;
+				if( strlen(named) >= sizeof(plugin) || !known_plugin(named) ) {
+					snprintf(m->last_error,sizeof(m->last_error),"Unsupported authentication plugin '%s'",named);
+					m->errcode = 2059;
+					return connect_failed(m);
+				}
+				strcpy(plugin,named);
+				memset(nonce,0,sizeof(nonce));
+				if( rest > NONCE_SIZE )
+					rest = NONCE_SIZE;
+				if( rest > 0 )
+					myp_read(p,nonce,rest);
+			}
+			authlen = auth_response(m,plugin,pass,nonce,auth);
+			if( authlen < 0 || !auth_send(m,auth,authlen,&pcount) )
+				return connect_failed(m);
+			continue;
+		}
+		if( code == 0x01 ) {
+			// More data from the plugin.
+			if( strcmp(plugin,CACHING_SHA2_PASSWORD) == 0 && p->size == 2 && (unsigned char)p->buf[1] == 3 )
+				continue; // fast auth succeeded: the OK follows
+			if( strcmp(plugin,CACHING_SHA2_PASSWORD) == 0 && p->size == 2 && (unsigned char)p->buf[1] == 4 ) {
+				// Full authentication: the server has no cached hash of this
+				// account's password and needs the password itself.
+				if( m->tls ) {
+					if( !auth_send(m,(const unsigned char*)pass,(int)strlen(pass) + 1,&pcount) )
+						return connect_failed(m);
+					continue;
+				}
+				if( m->options.server_public_key ) {
+					authlen = rsa_password(m,m->options.server_public_key,pass,nonce,auth);
+					if( authlen < 0 || !auth_send(m,auth,authlen,&pcount) )
+						return connect_failed(m);
+					continue;
+				}
+				if( m->options.allow_public_key_retrieval ) {
+					unsigned char request = 2;
+					if( !auth_send(m,&request,1,&pcount) )
+						return connect_failed(m);
+					continue; // the key comes back as more data
+				}
+				error(m,"The server needs the password itself (caching_sha2_password full authentication): connect with TLS, or give the server's RSA public key (serverPublicKey), or allowPublicKeyRetrieval",NULL);
+				return connect_failed(m);
+			}
+			if( p->size > 1 && (strcmp(plugin,CACHING_SHA2_PASSWORD) == 0 || strcmp(plugin,SHA256_PASSWORD) == 0) && !m->tls ) {
+				// The public key asked for: PEM, which the packet buffer has
+				// NUL-terminated.
+				const char *pem = p->buf + 1;
+				authlen = rsa_password(m,pem,pass,nonce,auth);
+				if( authlen < 0 || !auth_send(m,auth,authlen,&pcount) )
+					return connect_failed(m);
+				continue;
+			}
+		}
+		error(m,"Invalid packet error",NULL);
+		return connect_failed(m);
 	}
+
+	m->infos.auth_plugin = strdup(plugin);
 	// we are connected, setup a longer timeout
 	psock_set_timeout(m->s,18000);
 	return m;
@@ -464,13 +687,37 @@ int mysql_real_escape_string( MYSQL *m, char *sout, const char *sin, int length 
 void mysql_close( MYSQL *m ) {
 	MYSQL_PACKET *p = &m->packet;
 	int pcount = 0;
-	myp_begin_packet(p,0);
-	myp_write_byte(p,COM_QUIT);
-	myp_send_packet(m,p,&pcount);
+	if( m->s != INVALID_SOCKET ) {
+		myp_begin_packet(p,0);
+		myp_write_byte(p,COM_QUIT);
+		myp_send_packet(m,p,&pcount);
+		myp_tls_close_notify(m);
+	}
 	myp_close(m);
+	myp_tls_free(m);
 	free(m->packet.buf);
 	free(m->infos.server_version);
+	free(m->infos.auth_plugin);
+	free(m->options.ssl_ca);
+	free(m->options.server_public_key);
 	free(m);
+}
+
+int mysql_is_tls( MYSQL *m ) {
+	return m->tls != NULL;
+}
+
+void mysql_set_options( MYSQL *m, int ssl_mode, char *ssl_ca, char *server_public_key, int allow_public_key_retrieval ) {
+	m->options.ssl_mode = ssl_mode;
+	free(m->options.ssl_ca);
+	m->options.ssl_ca = ssl_ca;
+	free(m->options.server_public_key);
+	m->options.server_public_key = server_public_key;
+	m->options.allow_public_key_retrieval = allow_public_key_retrieval;
+}
+
+const char *mysql_auth_plugin( MYSQL *m ) {
+	return m->infos.auth_plugin ? m->infos.auth_plugin : "";
 }
 
 const char *mysql_error( MYSQL *m ) {
