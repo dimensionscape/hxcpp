@@ -208,6 +208,11 @@ int  _hx_mysql_result_get_nfields(Dynamic handle)
 **/
 Array<String> _hx_mysql_result_get_fields_names(Dynamic handle)
 {
+   // A statement that returns no rows answers with an OK packet, and its
+   // handle is the affected-row count: it has no fields.
+   if( handle->__GetType() == vtInt )
+      return Array_obj<String>::__new(0);
+
    Result *r = getResult(handle);
 
    MYSQL_FIELD *fields = mysql_fetch_fields(r->r);
@@ -234,6 +239,14 @@ Array<String> _hx_mysql_result_get_fields_names(Dynamic handle)
 **/
 Dynamic _hx_mysql_result_next(Dynamic handle)
 {
+   // The handle of an INSERT, UPDATE or DELETE is the Int the OK packet
+   // carried, which has no rows. This threw "Invalid result" for it, so
+   // iterating the result of any write -- as every generic caller does,
+   // since it cannot know in advance -- reported a failure after the server
+   // had applied the write.
+   if( handle->__GetType() == vtInt )
+      return null();
+
    Result *r = getResult(handle);
    MYSQL_ROW row = mysql_fetch_row(r->r);
    if( !row )
