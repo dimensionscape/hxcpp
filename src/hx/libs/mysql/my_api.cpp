@@ -408,6 +408,7 @@ MYSQL *mysql_real_connect( MYSQL *m, const char *host, const char *user, const c
 		} else if( m->options.ssl_mode >= MYSQL_SSL_REQUIRED ) {
 			myp_close(m);
 			error(m,"The server does not support TLS, and the connection requires it",NULL);
+			m->errcode = 2026; // CR_SSL_CONNECTION_ERROR, as libmysqlclient reports it
 			return NULL;
 		}
 	}
