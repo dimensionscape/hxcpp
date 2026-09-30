@@ -81,6 +81,7 @@
 * Fixed Socket.select on Windows reporting errno (always garbage) instead of WSAGetLastError, and both selects now sample the error code before leaving the GC free zone, which can clobber it
 * Fixed socket poll reporting sockets from a previous poll as ready after a poll error (stale index lists are now terminated)
 * Accepted sockets now inherit close-on-exec (posix) and SO_NOSIGPIPE (macOS) like freshly created ones - accepted connections leaked into child processes, and a client reset could SIGPIPE-kill a macOS server
+* Fixed sockets leaking into child processes on Windows: created sockets are no longer inheritable (WSA_FLAG_NO_HANDLE_INHERIT), accepted ones have the flag cleared, and sys.io.Process hands a child only its own three pipe ends (PROC_THREAD_ATTRIBUTE_HANDLE_LIST) - a connection the server closed stayed open until every child started while it was open had exited, and a closed listener kept taking connections. On Linux sockets are now created and accepted close-on-exec atomically (SOCK_CLOEXEC, accept4), leaving no window for a process another thread starts
 * Fixed resolving "255.255.255.255" (UDP limited broadcast) throwing "Unknown host" - inet_addr's error value collides with the broadcast address
 * Socket close no longer retries on EINTR (posix releases the descriptor regardless, so the retry could close a descriptor just handed to another thread) and runs in the GC free zone so a lingering close cannot stall collection
 * Hardened the socket/TLS buffer bounds checks against integer overflow in position+length

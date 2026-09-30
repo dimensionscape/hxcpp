@@ -37,6 +37,55 @@ static int do_close( int fd )
    }
    return 0;
 }
+#else
+// CreateProcess hands the child every inheritable handle this process holds
+// unless it is given a list of the ones to pass.  The list is a Vista API,
+// looked up at run time so builds whose headers predate it (MinGW, the XP
+// compatible mode) still compile, and still start processes the old way
+// where it is missing.
+#ifndef EXTENDED_STARTUPINFO_PRESENT
+#define EXTENDED_STARTUPINFO_PRESENT 0x00080000
+#endif
+#ifndef PROC_THREAD_ATTRIBUTE_HANDLE_LIST
+#define PROC_THREAD_ATTRIBUTE_HANDLE_LIST 0x00020002
+#endif
+
+// STARTUPINFOEXW, spelled out for the same reason
+struct StartupInfoWithList
+{
+   STARTUPINFOW info;
+   void *attributes;
+};
+
+struct HandleListApi
+{
+   typedef BOOL (WINAPI *InitFunc)(void *, DWORD, DWORD, SIZE_T *);
+   typedef BOOL (WINAPI *UpdateFunc)(void *, DWORD, DWORD_PTR, void *, SIZE_T, void *, SIZE_T *);
+   typedef void (WINAPI *DeleteFunc)(void *);
+
+   InitFunc init;
+   UpdateFunc update;
+   DeleteFunc remove;
+
+   HandleListApi() : init(0), update(0), remove(0)
+   {
+      HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+      if (kernel)
+      {
+         init = (InitFunc)GetProcAddress(kernel,"InitializeProcThreadAttributeList");
+         update = (UpdateFunc)GetProcAddress(kernel,"UpdateProcThreadAttribute");
+         remove = (DeleteFunc)GetProcAddress(kernel,"DeleteProcThreadAttributeList");
+      }
+   }
+
+   bool available() const { return init && update && remove; }
+
+   static const HandleListApi &get()
+   {
+      static HandleListApi api;
+      return api;
+   }
+};
 #endif
 
 
@@ -287,8 +336,42 @@ Dynamic _hx_std_process_run( String cmd, Array<String> vargs, int inShowParam )
 
       PROCESS_INFORMATION pinf;
       memset(&pinf,0,sizeof(pinf));
+
+      // The child inherits its three pipe ends and nothing else.  Given
+      // only bInheritHandles it took every inheritable handle this process
+      // held, sockets included, and a connection the child held a copy of
+      // stayed open after this process closed it, until the child exited.
+      // The list must outlive CreateProcess, so it lives in this frame
+      const HandleListApi &api = HandleListApi::get();
+      HANDLE inherit[3] = { sinf.hStdInput, sinf.hStdOutput, sinf.hStdError };
+      void *attributes = 0;
+      bool initialized = false;
+      bool listed = false;
+      if (dup && api.available())
+      {
+         SIZE_T size = 0;
+         api.init(0,1,0,&size);
+         if (size)
+            attributes = malloc(size);
+         initialized = attributes && api.init(attributes,1,0,&size);
+         listed = initialized &&
+            api.update(attributes,0,PROC_THREAD_ATTRIBUTE_HANDLE_LIST,inherit,sizeof(inherit),0,0);
+      }
+      StartupInfoWithList sinfex;
+      memset(&sinfex,0,sizeof(sinfex));
+      sinfex.info = sinf;
+      sinfex.info.cb = sizeof(sinfex);
+      sinfex.attributes = attributes;
+
       bool started = dup &&
-         CreateProcessW(NULL,(wchar_t *)name,NULL,NULL,TRUE,CREATE_NO_WINDOW,NULL,NULL,&sinf,&pinf);
+         CreateProcessW(NULL,(wchar_t *)name,NULL,NULL,TRUE,
+            CREATE_NO_WINDOW | (listed ? EXTENDED_STARTUPINFO_PRESENT : 0),
+            NULL,NULL,listed ? &sinfex.info : &sinf,&pinf);
+
+      if (initialized)
+         api.remove(attributes);
+      if (attributes)
+         free(attributes);
 
       // The child ends are always done with here; the parent ends too on
       // failure.  The executable-not-found path used to leak all six

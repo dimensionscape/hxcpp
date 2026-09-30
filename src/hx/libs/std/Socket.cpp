@@ -38,6 +38,10 @@ typedef PCSTR (WSAAPI *inet_ntop_func)(INT  Family, PVOID pAddr, PSTR pStringBuf
    static bool init_done = false;
    static WSADATA init_data;
 typedef int SocketLen;
+// Windows 7 SP1 and later; older SDK and MinGW headers lack the name
+#ifndef WSA_FLAG_NO_HANDLE_INHERIT
+#   define WSA_FLAG_NO_HANDLE_INHERIT 0x80
+#endif
 #else
 #   include <sys/types.h>
 #   include <sys/socket.h>
@@ -186,10 +190,29 @@ Dynamic _hx_std_socket_new( bool udp, bool ipv6 )
 
    SOCKET s;
    int family = ipv6 ? AF_INET6 : AF_INET;
-   if( udp )
-      s = socket(family,SOCK_DGRAM,0);
-   else
-      s = socket(family,SOCK_STREAM,0);
+   int type = udp ? SOCK_DGRAM : SOCK_STREAM;
+
+   #ifdef NEKO_WINDOWS
+      // Not inheritable, as posix sockets are close-on-exec below.  A
+      // Winsock handle is inheritable by default, so every process started
+      // while it was open (sys.io.Process, Sys.command) got a copy, and a
+      // connection this process closed stayed open until those exited.
+      // WSASocket with the overlapped flag is what socket() creates
+      s = WSASocketW(family,type,0,NULL,0,WSA_FLAG_OVERLAPPED|WSA_FLAG_NO_HANDLE_INHERIT);
+      if( s == INVALID_SOCKET && WSAGetLastError() == WSAEINVAL )
+      {
+         // Before Windows 7 SP1 the flag is refused - clear it afterwards
+         s = socket(family,type,0);
+         if( s != INVALID_SOCKET )
+            SetHandleInformation((HANDLE)s,HANDLE_FLAG_INHERIT,0);
+      }
+   #elif defined(HX_LINUX) && defined(SOCK_CLOEXEC)
+      // Close-on-exec from the start - set afterwards, a process another
+      // thread started in between inherited the socket anyway
+      s = socket(family,type|SOCK_CLOEXEC,0);
+   #else
+      s = socket(family,type,0);
+   #endif
 
    if( s == INVALID_SOCKET )
       return null();
@@ -199,7 +222,7 @@ Dynamic _hx_std_socket_new( bool udp, bool ipv6 )
       setsockopt(s,SOL_SOCKET,SO_NOSIGPIPE,(void *)&set, sizeof(int));
    #endif
 
-   #ifdef NEKO_POSIX
+   #if defined(NEKO_POSIX) && !(defined(HX_LINUX) && defined(SOCK_CLOEXEC))
       // we don't want sockets to be inherited in case of exec
       int old = fcntl(s,F_GETFD,0);
       if( old >= 0 ) fcntl(s,F_SETFD,old|FD_CLOEXEC);
@@ -945,7 +968,12 @@ Dynamic _hx_std_socket_accept( Dynamic o )
    SOCKET s;
    hx::EnterGCFreeZone();
    POSIX_LABEL(accept_again);
+   #if defined(HX_LINUX) && defined(SOCK_CLOEXEC)
+   // Close-on-exec from the start, as in socket_new
+   s = accept4(sock,(struct sockaddr*)&addr,&addrlen,SOCK_CLOEXEC);
+   #else
    s = accept(sock,(struct sockaddr*)&addr,&addrlen);
+   #endif
    if( s == INVALID_SOCKET )
    {
       HANDLE_EINTR(accept_again);
@@ -957,7 +985,14 @@ Dynamic _hx_std_socket_accept( Dynamic o )
       int set = 1;
       setsockopt(s,SOL_SOCKET,SO_NOSIGPIPE,(void *)&set, sizeof(int));
    #endif
-   #ifdef NEKO_POSIX
+   #ifdef NEKO_WINDOWS
+      // An accepted handle is not inheritable only when the listener was
+      // created with WSA_FLAG_NO_HANDLE_INHERIT - not when its flag was
+      // cleared afterwards, as socket_new's fallback does.  An inheritable
+      // one reached every process started while the connection was open,
+      // and the peer saw this process close it only when they all exited
+      SetHandleInformation((HANDLE)s,HANDLE_FLAG_INHERIT,0);
+   #elif defined(NEKO_POSIX) && !(defined(HX_LINUX) && defined(SOCK_CLOEXEC))
       int old = fcntl(s,F_GETFD,0);
       if( old >= 0 ) fcntl(s,F_SETFD,old|FD_CLOEXEC);
    #endif
