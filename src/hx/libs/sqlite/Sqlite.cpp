@@ -239,6 +239,19 @@ int     _hx_sqlite_last_insert_id(Dynamic handle)
 }
 
 /**
+   get_autocommit : 'db -> bool
+   <doc>Whether the database is in autocommit mode, which is to say whether no
+   transaction is open: sqlite3_get_autocommit. A transaction begun or ended
+   with SQL text -- BEGIN, COMMIT, a ROLLBACK SQLite performed itself after an
+   error -- is reflected here as surely as one begun through the API.</doc>
+**/
+bool _hx_sqlite_get_autocommit(Dynamic handle)
+{
+   database *db = getDatabase(handle);
+   return sqlite3_get_autocommit(db->db) != 0;
+}
+
+/**
    request : 'db -> sql:string -> 'result
    <doc>Executes the SQL request and returns its result</doc>
 **/
@@ -335,15 +348,17 @@ Dynamic _hx_sqlite_result_next(Dynamic handle)
                   f = bool(sqlite3_column_int(r->r,i));
                else
                {
-                  // SQLite INTEGER is 64-bit - timestamps, snowflake ids and
-                  // SUM() aggregates routinely exceed 2^31 and were silently
-                  // wrapped.  Stay an Int when it fits, widen to Float
-                  // (53-bit exact) otherwise.
+                  // INTEGER is 64-bit, and sqlite3_column_int kept the low
+                  // 32: a millisecond timestamp, 1727600000000, read as
+                  // 1023147008. An Int when the value fits one, as every
+                  // value did before, and an Int64 when it does not -- not a
+                  // Float, which is exact only to 2^53, short of a Snowflake
+                  // id or a SUM() of them.
                   sqlite3_int64 v = sqlite3_column_int64(r->r,i);
-                  if( v == (sqlite3_int64)(int)v )
+                  if( v >= -2147483647LL - 1 && v <= 2147483647LL )
                      f = int(v);
                   else
-                     f = Float(v);
+                     f = Dynamic( (cpp::Int64)v );
                }
                break;
             case SQLITE_FLOAT:
@@ -371,12 +386,21 @@ Dynamic _hx_sqlite_result_next(Dynamic handle)
       case SQLITE_DONE:
          r->destroy(true);
          return null();
-      case SQLITE_BUSY:
-         hx::Throw(HX_CSTRING("Database is busy"));
-      case SQLITE_ERROR:
-         sqlite_error(r->db);
       default:
-         hx::Throw(HX_CSTRING("Unkown sqlite result"));
+      {
+         // The step failed: finalize now, and ignore what finalize says. With
+         // the legacy sqlite3_prepare this uses, finalize returns the step's
+         // error again, and the statement was left for the next request or
+         // close to finalize with destroy(true) -- which threw that error as
+         // "Could not finalize request", failing the connection's next,
+         // unrelated statement. Finalizing first is also what gives SQLite's
+         // own message: the step's is only "SQL logic error".
+         sqlite3 *db = r->db;
+         r->destroy(false);
+         if( step == SQLITE_BUSY || step == SQLITE_LOCKED )
+            hx::Throw( HX_CSTRING("Database is busy : ") + String(sqlite3_errmsg(db)) );
+         sqlite_error(db);
+      }
    }
 
    return null();

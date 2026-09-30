@@ -35,7 +35,44 @@ typedef enum {
 	FL_SECURE_CONNECTION = 32768,
 	FL_MULTI_STATEMENTS  = 65536,
 	FL_MULTI_RESULTS = 131072,
+	FL_PLUGIN_AUTH = 0x80000,
+	FL_CONNECT_ATTRS = 0x100000,
+	FL_PLUGIN_AUTH_LENENC = 0x200000,
 } MYSQL_FLAG;
+
+// How much TLS a connection insists on, as libmysqlclient's --ssl-mode.
+typedef enum {
+	MYSQL_SSL_DISABLED = 0,
+	MYSQL_SSL_PREFERRED = 1,
+	MYSQL_SSL_REQUIRED = 2,
+	MYSQL_SSL_VERIFY_CA = 3,
+	MYSQL_SSL_VERIFY_IDENTITY = 4,
+} MYSQL_SSL_MODE;
+
+typedef struct _MYSQL_TLS MYSQL_TLS;
+
+// What a connection was asked for, copied out of the caller's strings so
+// nothing collected is touched once a call has left the collector's sight.
+typedef struct {
+	int ssl_mode;
+	char *ssl_ca;
+	char *server_public_key;
+	int allow_public_key_retrieval;
+	// Seconds; 0 or less for no limit.
+	double connect_timeout;
+	double read_timeout;
+	double write_timeout;
+	int keepalive;
+	int keepalive_idle;
+	int keepalive_interval;
+	int keepalive_count;
+	// Held for mysql_open, in native memory.
+	char *host;
+	char *user;
+	char *pass;
+	char *socket;
+	int port;
+} MYSQL_OPTIONS;
 
 typedef enum {
 	COM_SLEEP = 0x00,
@@ -88,6 +125,7 @@ typedef struct {
 	unsigned int server_flags;
 	unsigned char server_charset;
 	unsigned short server_status;
+	char *auth_plugin; // the plugin the account authenticated with
 } MYSQL_INFOS;
 
 typedef struct {
@@ -106,11 +144,27 @@ struct _MYSQL {
 	PSOCK s;
 	MYSQL_INFOS infos;
 	MYSQL_PACKET packet;
+	MYSQL_OPTIONS options;
+	MYSQL_TLS *tls;  // the session's TLS, once the handshake has run
+	int timed_out;   // the last read or write gave up on a timeout
 	int is41;
 	int errcode;
+	char sqlstate[6];
 	int last_field_count;
-	int affected_rows;
-	int last_insert_id;
+	// From the last OK packet. 64-bit, as the protocol sends them: an
+	// AUTO_INCREMENT BIGINT is past 2^31 as soon as it is past 2^31.
+	long long affected_rows;
+	long long last_insert_id;
+	unsigned short warning_count;
+	// The result being read a row at a time (mysql_use_result): its id, and
+	// its column count, so the rest of it can be read aside when another
+	// command needs the connection first. 0 when there is none.
+	int stream_id;
+	int stream_fields;
+	int next_stream_id;
+	// The rows read aside, for the result they belong to to take back.
+	struct _MYSQL_RES *orphan;
+	int orphan_id;
 	char last_error[MAX_ERR_SIZE];
 };
 
@@ -127,6 +181,12 @@ struct _MYSQL_RES {
 	MYSQL_ROW_DATA *current;
 	int row_count;
 	int memory_rows;
+	// Read a row at a time: the id matching MYSQL.stream_id while its rows
+	// are still on the wire, 0 for a result stored whole.
+	int stream_id;
+	int eof;
+	// The row last read, pointing into the connection's packet buffer.
+	MYSQL_ROW_DATA stream_row;
 };
 
 
@@ -145,6 +205,7 @@ unsigned short myp_read_ui16( MYSQL_PACKET *p );
 int myp_read_int( MYSQL_PACKET *p );
 const char *myp_read_string( MYSQL_PACKET *p );
 int myp_read_bin( MYSQL_PACKET *p );
+long long myp_read_bin64( MYSQL_PACKET *p );
 char *myp_read_bin_str( MYSQL_PACKET *p );
 
 // packet write
@@ -163,6 +224,15 @@ void myp_write_bin( MYSQL_PACKET *p, int size );
 void myp_crypt( unsigned char *out, const unsigned char *s1, const unsigned char *s2, unsigned int len );
 void myp_encrypt_password( const char *pass, const char *seed, SHA1_DIGEST out );
 void myp_encrypt_pass_323( const char *pass, const char seed[SEED_LENGTH_323], char out[SEED_LENGTH_323] );
+
+// TLS and the cryptography of caching_sha2_password (my_tls.cpp)
+int myp_tls_start( MYSQL *m, const char *host );
+void myp_tls_free( MYSQL *m );
+void myp_tls_close_notify( MYSQL *m );
+int myp_tls_recv( MYSQL *m, void *buf, int size );
+int myp_tls_send( MYSQL *m, const void *buf, int size );
+void myp_sha256( const unsigned char *data, int length, unsigned char out[32] );
+int myp_rsa_encrypt( MYSQL *m, const char *pem, const unsigned char *in, int length, unsigned char *out, int capacity );
 
 // escaping
 int myp_supported_charset( int charset );

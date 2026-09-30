@@ -85,6 +85,24 @@ typedef struct {
 #define mysql_store_result	mp_store_result
 #define mysql_field_count	mp_field_count
 #define mysql_affected_rows	mp_affected_rows
+#define mysql_server_status	mp_server_status
+#define mysql_is_tls		mp_is_tls
+#define mysql_set_options	mp_set_options
+#define mysql_open			mp_open
+#define mysql_set_endpoint	mp_set_endpoint
+#define mysql_set_timeouts	mp_set_timeouts
+#define mysql_set_keepalive	mp_set_keepalive
+#define mysql_keepalive_state	mp_keepalive_state
+#define mysql_ping			mp_ping
+#define mysql_errno			mp_errno
+#define mysql_sqlstate		mp_sqlstate
+#define mysql_thread_id		mp_thread_id
+#define mysql_use_result	mp_use_result
+#define mysql_fetch_row_stream	mp_fetch_row_stream
+#define mysql_insert_id		mp_insert_id
+#define mysql_affected_rows64	mp_affected_rows64
+#define mysql_get_server_info	mp_get_server_info
+#define mysql_auth_plugin	mp_auth_plugin
 #define mysql_escape_string	mp_escape_string
 #define mysql_real_escape_string mp_real_escape_string
 #define mysql_close			mp_close
@@ -103,6 +121,32 @@ int mysql_real_query( MYSQL *m, const char *query, int qlength );
 MYSQL_RES *mysql_store_result( MYSQL *m );
 int mysql_field_count( MYSQL *m );
 int mysql_affected_rows( MYSQL *m );
+int mysql_server_status( MYSQL *m );
+int mysql_is_tls( MYSQL *m );
+// Takes ownership of the malloc'd strings.
+void mysql_set_options( MYSQL *m, int ssl_mode, char *ssl_ca, char *server_public_key, int allow_public_key_retrieval );
+// Takes ownership of the malloc'd strings; the password is wiped once used.
+void mysql_set_endpoint( MYSQL *m, char *host, int port, char *user, char *pass, char *socket );
+// Seconds, 0 for none; a negative read and write timeout keeps the old five hours.
+void mysql_set_timeouts( MYSQL *m, double connect_timeout, double read_timeout, double write_timeout );
+void mysql_set_keepalive( MYSQL *m, int on, int idle, int interval, int count );
+// The keepalive the connection's socket has: on (0 or 1), then the idle and
+// interval in seconds and the probe count, each -1 where the system does not
+// report it; all four -1 once a failure has closed the socket.
+void mysql_keepalive_state( MYSQL *m, int *state );
+int mysql_open( MYSQL *m );
+int mysql_ping( MYSQL *m );
+int mysql_errno( MYSQL *m );
+const char *mysql_sqlstate( MYSQL *m );
+unsigned int mysql_thread_id( MYSQL *m );
+// A result whose rows are read one at a time, as they arrive.
+MYSQL_RES *mysql_use_result( MYSQL *m );
+// Its next row; NULL at its end, or on a failure, which *failed says.
+MYSQL_ROW mysql_fetch_row_stream( MYSQL *m, MYSQL_RES *r, int *failed );
+long long mysql_insert_id( MYSQL *m );
+long long mysql_affected_rows64( MYSQL *m );
+const char *mysql_get_server_info( MYSQL *m );
+const char *mysql_auth_plugin( MYSQL *m );
 int mysql_escape_string( MYSQL *m, char *sout, const char *sin, int length );
 int mysql_real_escape_string( MYSQL *m, char *sout, const char *sin, int length );
 void mysql_close( MYSQL *m );

@@ -1,15 +1,30 @@
 <xml>
 
+<!-- Included by Haxe's sys.db.Mysql and by any library calling the client
+     directly; without this, two includes link the objects twice, which GNU
+     ld refuses. -->
+<pragma once="true" />
+
+<!-- mbedTLS, for TLS to the server and for caching_sha2_password's SHA-256
+     and RSA. The ssl library's Build.xml is pragma once and links mbedTLS
+     for sys.ssl already, so a program using both gets one copy. -->
+<include name="${HXCPP}/src/hx/libs/ssl/Build.xml" />
+
 <files id="hxcpp_mysql" dir="${this_dir}" >
   <depend files="hxcpp-depends"/>
   <depend name="${this_dir}/Build.xml" dateOnly="true" />
   <depend name="${this_dir}/sha1.h" />
   <depend name="${this_dir}/socket.h" />
+  <depend name="${this_dir}/my_proto.h" />
+  <depend name="${this_dir}/mysql.h" />
   <cache value="true" asLibrary="true" />
+
+  <include name="${HXCPP}/project/thirdparty/mbedtls-flags.xml" />
 
   <file name="Mysql.cpp"/>
   <file name="my_api.cpp" tags="" />
   <file name="my_proto.cpp"/>
+  <file name="my_tls.cpp"/>
   <file name="socket.cpp"/>
   <file name="sha1.cpp"/>
 
