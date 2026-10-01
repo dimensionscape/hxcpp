@@ -6167,7 +6167,7 @@ public:
       // signal.  When no collection is pending this skips the kernel-event
       // call entirely.
       std::atomic_thread_fence(std::memory_order_seq_cst);
-      if (*(volatile int *)&hx::gPauseForCollect)
+      if (hx::gPauseForCollect.load(std::memory_order_relaxed))
       {
          mReadyForCollect.Set();
          mReadySignalled = true;
@@ -6214,7 +6214,7 @@ public:
 
       mGCFreeZone = false;
       std::atomic_thread_fence(std::memory_order_seq_cst);
-      if (*(volatile int *)&hx::gPauseForCollect)
+      if (hx::gPauseForCollect.load(std::memory_order_relaxed))
       {
          // A collection is pending or running.  The collector either saw us
          // in the zone (and expects us to stay parked) or is waiting on our
