@@ -10,6 +10,18 @@
 
 	<compilerflag value="-std=c99" unless="MSVC_VER" />
 
+	<!-- mbedTLS's symbols stay inside the binary that links them. hxcpp links
+	     Linux executables with -rdynamic, which exports every symbol of
+	     default visibility, and a shared library loaded later that carries its
+	     own mbedTLS without hiding it would have its calls bound to this copy
+	     -- another version, with other structures -- and crash. hxcpp's own
+	     toolchains for Linux, macOS, Android, iOS and Emscripten already
+	     compile everything hidden; this keeps mbedTLS hidden under one that
+	     does not. Hidden symbols still link within the executable or library
+	     that holds them: hxcpp's SSL, a native extension, a static Lime's
+	     curl. Windows exports nothing it is not told to. -->
+	<compilerflag value="-fvisibility=hidden" unless="windows" />
+
 	<file name="${MBEDTLS_DIR}/library/aes.c" />
 	<file name="${MBEDTLS_DIR}/library/aesce.c" />
 	<file name="${MBEDTLS_DIR}/library/aesni.c" />
