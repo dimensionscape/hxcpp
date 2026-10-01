@@ -196,6 +196,7 @@ vprocess *getOpenProcess(Dynamic handle)
 } // end anon namespace
 
 
+#ifdef NEKO_WINDOWS
 
 template<typename T>
 static String TQuoted(const T *ptr, int len)
@@ -248,6 +249,7 @@ static String quoteString(String v)
    return TQuoted(v.raw_ptr(),v.length);
 }
 
+#endif
 
 
 /**

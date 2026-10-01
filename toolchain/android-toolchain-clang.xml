@@ -75,7 +75,6 @@
   <flag value="-Wno-invalid-offsetof" />
   <flag value="-Wno-return-type-c-linkage" />
   <flag value="-Wno-parentheses" />
-  <flag value="-Wno-inconsistent-missing-override" unless="HXCPP_WARN_INCONSISTENT_OVERRIDE" />
   
 </compiler>
 
@@ -107,7 +106,25 @@
   <prefix value="lib"/>
   <lib name="-llog"/>
   <ext value=".so"/>
-    
+
 </linker>
-    
+
+<linker id="exe" exe="clang++" >
+
+  <exe name="clang++" />
+
+  <ext value="" />
+  <outflag value="-o" />
+  <prefix value="" />
+
+  <flag value="--target=${ABITRIPLE}${HXCPP_ANDROID_PLATFORM}" />
+
+  <flag value="-Wl,--no-undefined" unless="HXCPP_ALLOW_UNDEFINED" />
+
+  <flag value="-static-libstdc++" />
+
+  <lib name="-llog" />
+
+</linker>
+
 </xml>

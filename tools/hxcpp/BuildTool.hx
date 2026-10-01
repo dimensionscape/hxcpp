@@ -148,6 +148,10 @@ class BuildTool
             m32 = arch=="x86";
             arm64 = arch=="arm64";
          }
+         else if (mDefines.exists("android"))
+         {
+            arm64 = true;
+         }
          else
          {
             var hostArch = getArch();
@@ -1237,6 +1241,8 @@ class BuildTool
                     if (el.has.name)
                        s.mFlags.push(substitute(el.att.name));
                     s.mFlags.push(substitute(el.att.value));
+                case "outPre" : s.mOutPre = substitute(el.att.value);
+                case "outPost" : s.mOutPost = substitute(el.att.value);
                 case "exe" : s.mExe = substitute((el.att.name));
             }
       }

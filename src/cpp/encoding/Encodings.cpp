@@ -1,4 +1,6 @@
 #include <hxcpp.h>
+
+#if (HXCPP_API_LEVEL>=500)
 #include <array>
 
 using namespace cpp::marshal;
@@ -440,39 +442,6 @@ char32_t cpp::encoding::Utf8::codepoint(const cpp::marshal::View<uint8_t>& buffe
 
 namespace
 {
-    bool isSurrogate(char32_t codepoint)
-    {
-        return codepoint >= 0xd800 && codepoint < 0xe000;
-    }
-
-    bool isLowSurrogate(char32_t codepoint)
-    {
-        return codepoint >= 0xdc00 && codepoint < 0xe000;
-    }
-
-    bool isHighSurrogate(char32_t codepoint)
-    {
-        return codepoint >= 0xd800 && codepoint < 0xdc00;
-    }
-
-    bool isAsciiUtf16Buffer(const View<uint8_t>& buffer)
-    {
-        auto i = int64_t{ 0 };
-        while (i < buffer.length)
-        {
-            auto p = cpp::encoding::Utf16::codepoint(buffer.slice(i));
-
-            if (p > 127)
-            {
-                return false;
-            }
-
-            i += cpp::encoding::Utf16::getByteCount(p);
-        }
-
-        return true;
-    }
-
     String toAsciiString(const View<uint8_t>& buffer)
     {
         auto bytes  = buffer.length / sizeof(char16_t);
@@ -734,3 +703,5 @@ inline char32_t cpp::encoding::Utf16::codepoint(const cpp::marshal::View<uint8_t
         return static_cast<char32_t>(first);
     }
 }
+
+#endif
