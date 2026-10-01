@@ -45,6 +45,14 @@
  <flag value="-DHXCPP_GC_MOVING" if="HXCPP_GC_MOVING" tag="haxe" />
  <flag value="-DHXCPP_GC_GENERATIONAL" if="HXCPP_GC_GENERATIONAL" tag="haxe" />
 
+ <!-- A Haxe Int wraps on overflow, as every other target's does, and the
+      generated code relies on it: hashes, random generators, checksums,
+      haxe.crypto. In C++ a signed overflow is undefined rather than a wrap,
+      and gcc and clang optimise on that. -fwrapv makes it the wrap. Measured
+      with gcc 13 on CRC32, Adler-32, DEFLATE, MD5, SHA-256, a hash mix and
+      map lookups: no change. MSVC has no such flag. -->
+ <flag value="-fwrapv" unless="isMsvc" tag="haxe" />
+
  <!-- tracy features  -->
  <flag value='-DHXCPP_TRACY' if="HXCPP_TRACY" tag="haxe"/>
  <flag value='-DHXCPP_TRACY_MEMORY' if="HXCPP_TRACY_MEMORY" tag="haxe"/>
