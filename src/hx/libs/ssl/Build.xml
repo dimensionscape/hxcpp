@@ -20,6 +20,8 @@
 	<files id="mbedtls" />
 
 	<lib name="advapi32.lib" if="windows" unless="static_link" />
+	<!-- mbedTLS 3 draws its entropy from BCryptGenRandom -->
+	<lib name="bcrypt.lib" if="windows" unless="static_link" />
 	<lib name="crypt32.lib" if="windows" unless="static_link" />
 	<lib name="ws2_32.lib" if="windows" unless="static_link" />
 

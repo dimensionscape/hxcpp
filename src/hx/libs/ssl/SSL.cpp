@@ -42,8 +42,8 @@ typedef size_t socket_int;
 #include "mbedtls/ssl_ticket.h"
 #endif
 #include "mbedtls/ssl.h"
-#include "mbedtls/net.h"
 #include "mbedtls/debug.h"
+#include "psa/crypto.h"
 
 #define val_ssl(o)	((sslctx*)o.mPtr)
 #define val_conf(o)	((sslconf*)o.mPtr)
@@ -518,8 +518,8 @@ Dynamic _hx_ssl_conf_new( bool server ) {
 #ifdef NEKO_WINDOWS
 	mbedtls_ssl_conf_verify(conf->c, verify_callback, NULL);
 #endif
-	// The 2.28 preset still negotiates TLS 1.0/1.1 - floor at TLS 1.2
-	mbedtls_ssl_conf_min_version( conf->c, MBEDTLS_SSL_MAJOR_VERSION_3, MBEDTLS_SSL_MINOR_VERSION_3 );
+	// No version floor to set: mbedTLS 3 speaks TLS 1.2 and 1.3 only, and the
+	// preset negotiates 1.3 whenever the peer can
 	mbedtls_ssl_conf_rng( conf->c, mbedtls_ctr_drbg_random, &ctr_drbg );
 #ifndef HXCPP_SSL_NO_TICKETS
 	// Session tickets (RFC 5077), so a client that has been here before
@@ -764,7 +764,7 @@ Array<String> _hx_ssl_cert_get_altnames( Dynamic hcert ){
 	sslcert *cert = val_cert(hcert);
 	mbedtls_asn1_sequence *cur;
 	Array<String> result(0,1);
-	if( cert->c->ext_types & MBEDTLS_X509_EXT_SUBJECT_ALT_NAME ){
+	if( mbedtls_x509_crt_has_ext_type( cert->c, MBEDTLS_X509_EXT_SUBJECT_ALT_NAME ) ){
 		cur = &cert->c->subject_alt_names;
 
 		while( cur != NULL ){
@@ -862,7 +862,7 @@ Dynamic _hx_ssl_key_from_der( Array<unsigned char> buf, bool pub ){
 	if( pub )
 		r = mbedtls_pk_parse_public_key( pk->k, &buf[0], buf->length );
 	else
-		r = mbedtls_pk_parse_key( pk->k, &buf[0], buf->length, NULL, 0 );
+		r = mbedtls_pk_parse_key( pk->k, &buf[0], buf->length, NULL, 0, mbedtls_ctr_drbg_random, &ctr_drbg );
 	if( r != 0 ){
 		pk->destroy();
 		ssl_error(r);
@@ -884,11 +884,11 @@ Dynamic _hx_ssl_key_from_pem( String data, bool pub, String pass ){
 	if( pub ){
 		r = mbedtls_pk_parse_public_key( pk->k, b, data.length+1 );
 	}else if( pass == null() ){
-		r = mbedtls_pk_parse_key( pk->k, b, data.length+1, NULL, 0 );
+		r = mbedtls_pk_parse_key( pk->k, b, data.length+1, NULL, 0, mbedtls_ctr_drbg_random, &ctr_drbg );
 	}else{
       Array<unsigned char> pbytes(0,0);
       __hxcpp_bytes_of_string(pbytes,pass);
-		r = mbedtls_pk_parse_key( pk->k, b, data.length+1, (const unsigned char *)pbytes->GetBase(), pbytes->length );
+		r = mbedtls_pk_parse_key( pk->k, b, data.length+1, (const unsigned char *)pbytes->GetBase(), pbytes->length, mbedtls_ctr_drbg_random, &ctr_drbg );
 	}
 	free(b);
 	if( r != 0 ){
@@ -916,7 +916,9 @@ Array<unsigned char> _hx_ssl_dgst_make( Array<unsigned char> buf, String alg ){
 Array<unsigned char> _hx_ssl_dgst_sign( Array<unsigned char> buf, Dynamic hpkey, String alg ){
 	int r = -1;
 	size_t olen = 0;
-	unsigned char hash[32];
+	// Room for any digest md knows: 32 bytes was SHA-256's, and SHA-384 and
+	// SHA-512 wrote past it
+	unsigned char hash[MBEDTLS_MD_MAX_SIZE];
 	sslpkey *pk = val_pkey(hpkey);
 
    hx::strbuf ubuf;
@@ -927,11 +929,10 @@ Array<unsigned char> _hx_ssl_dgst_sign( Array<unsigned char> buf, Dynamic hpkey,
 	if( (r = mbedtls_md( md, &buf[0], buf->length, hash )) != 0 )
 		ssl_error(r);
 
-	Array<unsigned char> result = Array_obj<unsigned char>::__new(MBEDTLS_MPI_MAX_SIZE,MBEDTLS_MPI_MAX_SIZE);
-	if( (r = mbedtls_pk_sign( pk->k, mbedtls_md_get_type(md), hash, 0, &result[0], &olen, mbedtls_ctr_drbg_random, &ctr_drbg )) != 0 )
+	Array<unsigned char> result = Array_obj<unsigned char>::__new(MBEDTLS_PK_SIGNATURE_MAX_SIZE,MBEDTLS_PK_SIGNATURE_MAX_SIZE);
+	if( (r = mbedtls_pk_sign( pk->k, mbedtls_md_get_type(md), hash, 0, &result[0], MBEDTLS_PK_SIGNATURE_MAX_SIZE, &olen, mbedtls_ctr_drbg_random, &ctr_drbg )) != 0 )
 		ssl_error(r);
 
-	result[olen] = 0;
 	result->__SetSize(olen);
 	return result;
 }
@@ -939,7 +940,7 @@ Array<unsigned char> _hx_ssl_dgst_sign( Array<unsigned char> buf, Dynamic hpkey,
 bool _hx_ssl_dgst_verify( Array<unsigned char> buf, Array<unsigned char> sign, Dynamic hpkey, String alg ){
 	const mbedtls_md_info_t *md;
 	int r = -1;
-	unsigned char hash[32];
+	unsigned char hash[MBEDTLS_MD_MAX_SIZE];
 	sslpkey *pk = val_pkey(hpkey);
 
    hx::strbuf ubuf;
@@ -999,6 +1000,12 @@ void _hx_ssl_init() {
 	mbedtls_threading_set_alt( threading_mutex_init_alt, threading_mutex_free_alt,
                            threading_mutex_lock_alt, threading_mutex_unlock_alt );
 #endif
+
+	// TLS 1.3 runs its key exchange and key schedule through PSA, which must
+	// be initialised first -- after the mutexes, which PSA's own state takes.
+	// Should it fail, TLS 1.3 handshakes fail; TLS 1.2 does not use PSA in
+	// this configuration (MBEDTLS_USE_PSA_CRYPTO is off)
+	psa_crypto_init();
 
 	// Init RNG
 	mbedtls_entropy_init( &entropy );

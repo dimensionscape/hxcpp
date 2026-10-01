@@ -121,7 +121,8 @@
 * Reduced stop-the-world GC work: the per-collect class-statics walk iterates a dense registration list instead of chasing the class registry's hash buckets (the list replaces entries in place when cppia reloads re-register a name, so replaced classes do not stay rooted)
 * Type.resolveClass no longer crashes when called by a native host before any class has booted
 
-* Updated mbedtls to 2.28.2
+* Updated mbedtls to 3.6.7, the long-term-support release (from 2.28.2, whose support ended in 2024): TLS 1.3 is negotiated when the peer offers it, and MSVC builds use AES-NI. Native code that calls mbedtls directly meets the 3.x API (see mbedtls's docs/3.0-migration-guide.md)
+* Fixed sys.ssl.Digest.sign and verify overflowing a 32-byte buffer with SHA-384 and SHA-512 digests
 * Updated sqlite to 3.40.1
 * Updated zlib to 1.2.13
 
