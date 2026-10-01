@@ -890,6 +890,26 @@ void _hx_std_socket_fast_select( Array<Dynamic> rs, Array<Dynamic> ws, Array<Dyn
    make_array_result_inplace(es, ea);
 }
 
+#ifndef NEKO_WINDOWS
+/**
+   SO_REUSEADDR is for a listener taking back a port its predecessor left
+   in TIME_WAIT, and only a stream socket has one. On a datagram socket
+   Linux reads it otherwise: two sockets that both set it may share a port,
+   so binding to port 0 can hand out one already in use -- 18 of 1,000
+   sockets were given one, 306 of 4,000 -- and one of the two then receives
+   the other's datagrams. Any local process that set it could bind a UDP
+   server's port as well.
+**/
+static bool isStreamSocket(SOCKET sock)
+{
+   int type = SOCK_STREAM;
+   SocketLen length = sizeof(type);
+   if (getsockopt(sock,SOL_SOCKET,SO_TYPE,(char*)&type,&length) != 0)
+      return true;
+   return type == SOCK_STREAM;
+}
+#endif
+
 /**
    socket_bind : 'socket -> host : 'int -> port:int -> void
    <doc>Bind the socket for server usage on the given host and port</doc>
@@ -905,7 +925,8 @@ void _hx_std_socket_bind( Dynamic o, int host, int port )
    addr.sin_port = htons(port);
    *(int*)&addr.sin_addr.s_addr = host;
    #ifndef NEKO_WINDOWS
-   setsockopt(sock,SOL_SOCKET,SO_REUSEADDR,(char*)&opt,sizeof(opt));
+   if (isStreamSocket(sock))
+      setsockopt(sock,SOL_SOCKET,SO_REUSEADDR,(char*)&opt,sizeof(opt));
    #endif
 
    hx::EnterGCFreeZone();
@@ -934,7 +955,8 @@ void _hx_std_socket_bind_ipv6( Dynamic o, Array<unsigned char> host, int port )
    addr.sin6_port = htons(port);
    memcpy(&addr.sin6_addr,&host[0], 16);
    #ifndef NEKO_WINDOWS
-   setsockopt(sock,SOL_SOCKET,SO_REUSEADDR,(char*)&opt,sizeof(opt));
+   if (isStreamSocket(sock))
+      setsockopt(sock,SOL_SOCKET,SO_REUSEADDR,(char*)&opt,sizeof(opt));
    #endif
 
    hx::EnterGCFreeZone();
