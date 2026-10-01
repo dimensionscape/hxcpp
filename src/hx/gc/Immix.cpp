@@ -1657,6 +1657,10 @@ struct GlobalChunks
       int expected{ 0 };
       while(false == processListPopLock.compare_exchange_strong(expected, 1))
       {
+         // A failed exchange leaves the value it found in expected:
+         // reset it, or the next attempt compares 1 with 1 and
+         // "takes" a lock another thread holds.
+         expected = 0;
          // Spin
          #ifdef PROFILE_THREAD_USAGE
          sSpinCount++;
@@ -1741,6 +1745,10 @@ struct GlobalChunks
       int expected{ 0 };
       while(false == freeListPopLock.compare_exchange_strong(expected, 1))
       {
+         // A failed exchange leaves the value it found in expected:
+         // reset it, or the next attempt compares 1 with 1 and
+         // "takes" a lock another thread holds.
+         expected = 0;
          // Spin
          #ifdef PROFILE_THREAD_USAGE
          sSpinCount++;
