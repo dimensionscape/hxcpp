@@ -38,6 +38,9 @@ typedef size_t socket_int;
 #include "mbedtls/pk.h"
 #include "mbedtls/oid.h"
 #include "mbedtls/x509_crt.h"
+#ifndef HXCPP_SSL_NO_TICKETS
+#include "mbedtls/ssl_ticket.h"
+#endif
 #include "mbedtls/ssl.h"
 #include "mbedtls/net.h"
 #include "mbedtls/debug.h"
@@ -89,11 +92,18 @@ struct sslconf : public hx::Object
    HX_IS_INSTANCE_OF enum { _hx_ClassId = hx::clsIdSslConf };
 
 	mbedtls_ssl_config *c;
+#ifndef HXCPP_SSL_NO_TICKETS
+	// A server configuration's session tickets: see _hx_ssl_conf_new.
+	mbedtls_ssl_ticket_context *ticket;
+#endif
 
 	void create()
 	{
 		c = (mbedtls_ssl_config *)malloc(sizeof(mbedtls_ssl_config));
 		mbedtls_ssl_config_init(c);
+#ifndef HXCPP_SSL_NO_TICKETS
+		ticket = 0;
+#endif
 		_hx_set_finalizer(this, finalize);
 	}
 
@@ -105,6 +115,14 @@ struct sslconf : public hx::Object
 			free(c);
 			c = 0;
 		}
+#ifndef HXCPP_SSL_NO_TICKETS
+		if( ticket )
+		{
+			mbedtls_ssl_ticket_free( ticket );
+			free(ticket);
+			ticket = 0;
+		}
+#endif
 	}
 
 	static void finalize(Dynamic obj)
@@ -503,6 +521,37 @@ Dynamic _hx_ssl_conf_new( bool server ) {
 	// The 2.28 preset still negotiates TLS 1.0/1.1 - floor at TLS 1.2
 	mbedtls_ssl_conf_min_version( conf->c, MBEDTLS_SSL_MAJOR_VERSION_3, MBEDTLS_SSL_MINOR_VERSION_3 );
 	mbedtls_ssl_conf_rng( conf->c, mbedtls_ctr_drbg_random, &ctr_drbg );
+#ifndef HXCPP_SSL_NO_TICKETS
+	// Session tickets (RFC 5077), so a client that has been here before
+	// resumes without the handshake's signature and key exchange: 4-7 ms of
+	// CPU each on an MSVC build, where neither has assembly. A client only
+	// gets one if it asks, and a ticket that cannot be opened -- expired,
+	// from another process -- means a full handshake, as before.
+	//
+	// One key per server configuration, which its accepted connections
+	// share, so a ticket opens only on the server that issued it: one
+	// server's session cannot be resumed on another in the same process
+	// with a different certificate or client-certificate policy. The key is
+	// random, lives only in memory, and rotates every TICKET_LIFETIME
+	// seconds, which also bounds how long a ticket is honoured.
+	if( server )
+	{
+		static const uint32_t TICKET_LIFETIME = 3600;
+		mbedtls_ssl_ticket_context *ticket = (mbedtls_ssl_ticket_context *)malloc(sizeof(mbedtls_ssl_ticket_context));
+		mbedtls_ssl_ticket_init( ticket );
+		if( mbedtls_ssl_ticket_setup( ticket, mbedtls_ctr_drbg_random, &ctr_drbg, MBEDTLS_CIPHER_AES_256_GCM, TICKET_LIFETIME ) == 0 )
+		{
+			conf->ticket = ticket;
+			mbedtls_ssl_conf_session_tickets_cb( conf->c, mbedtls_ssl_ticket_write, mbedtls_ssl_ticket_parse, ticket );
+		}
+		else
+		{
+			// Without tickets, every handshake is a full one, as before.
+			mbedtls_ssl_ticket_free( ticket );
+			free( ticket );
+		}
+	}
+#endif
 	return conf;
 }
 
