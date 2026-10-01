@@ -5755,7 +5755,7 @@ void MarkConservative(int *inBottom, int *inTop,hx::MarkContext *__inCtx)
          // Last-value cache - adjacent stack slots often hold the same
          // pointer (spills, argument copies), and without this assignment
          // the prev test above never fires
-         prev = vptr;
+         prev = potentialObject;
 
          #ifdef PROFILE_COLLECT
          hx::localCount++;
