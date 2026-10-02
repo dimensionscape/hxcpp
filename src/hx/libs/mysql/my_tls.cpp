@@ -136,6 +136,14 @@ int myp_tls_start( MYSQL *m, const char *host ) {
 			tls_error(m, "TLS setup failed", r);
 			return 0;
 		}
+	} else if( m->options.ssl_mode < MYSQL_SSL_VERIFY_IDENTITY ) {
+		// No name to check, which VERIFY_CA does not ask for. mbedTLS 3.6
+		// refuses to verify a chain until told that is intended, which a NULL
+		// name says; VERIFY_IDENTITY with no host is left to fail.
+		if( (r = mbedtls_ssl_set_hostname(&t->ssl, NULL)) != 0 ) {
+			tls_error(m, "TLS setup failed", r);
+			return 0;
+		}
 	}
 
 	mbedtls_ssl_set_bio(&t->ssl, m, bio_send, bio_recv, NULL);
@@ -210,7 +218,7 @@ int myp_tls_send( MYSQL *m, const void *buf, int size ) {
 }
 
 void myp_sha256( const unsigned char *data, int length, unsigned char out[32] ) {
-	mbedtls_sha256_ret(data, (size_t)length, out, 0);
+	mbedtls_sha256(data, (size_t)length, out, 0);
 }
 
 int myp_rsa_encrypt( MYSQL *m, const char *pem, const unsigned char *in, int length, unsigned char *out, int capacity ) {

@@ -1,4 +1,5 @@
 #include <string.h>
+#include <atomic>
 
 #ifdef HX_WINDOWS
 #   include <winsock2.h>
@@ -42,8 +43,8 @@ typedef size_t socket_int;
 #include "mbedtls/ssl_ticket.h"
 #endif
 #include "mbedtls/ssl.h"
-#include "mbedtls/net.h"
 #include "mbedtls/debug.h"
+#include "psa/crypto.h"
 
 #define val_ssl(o)	((sslctx*)o.mPtr)
 #define val_conf(o)	((sslconf*)o.mPtr)
@@ -56,16 +57,62 @@ struct SocketWrapper : public hx::Object
    SOCKET socket;
 };
 
+// A configuration's mbedTLS state, owned jointly by its handle and by every
+// context set up on it. mbedTLS keeps a pointer to the configuration in each
+// context and reads it for the life of the connection -- every read checks
+// its renegotiation settings, and freeing the context reads it too -- so the
+// configuration has to outlive them all. It did not: closing a listening
+// socket closed its configuration, freeing it under the connections it had
+// accepted, which went on reading freed memory. A server that stops
+// listening while it finishes its connections, as a graceful shutdown does,
+// did exactly that. The handle and each context hold a reference, and the
+// last to let go frees it.
+struct sslconf_shared
+{
+	mbedtls_ssl_config config;
+#ifndef HXCPP_SSL_NO_TICKETS
+	// A server configuration's session tickets: see _hx_ssl_conf_new.
+	mbedtls_ssl_ticket_context *ticket;
+#endif
+	std::atomic<int> refs;
+};
+
+static sslconf_shared *sslconf_shared_retain( sslconf_shared *shared )
+{
+	shared->refs.fetch_add( 1, std::memory_order_relaxed );
+	return shared;
+}
+
+// From any thread: a context may be finalized by whichever thread collects.
+static void sslconf_shared_release( sslconf_shared *shared )
+{
+	if( shared->refs.fetch_sub( 1, std::memory_order_acq_rel ) != 1 )
+		return;
+	mbedtls_ssl_config_free( &shared->config );
+#ifndef HXCPP_SSL_NO_TICKETS
+	if( shared->ticket )
+	{
+		mbedtls_ssl_ticket_free( shared->ticket );
+		free( shared->ticket );
+	}
+#endif
+	delete shared;
+}
+
 struct sslctx : public hx::Object
 {
    HX_IS_INSTANCE_OF enum { _hx_ClassId = hx::clsIdSsl };
 
+	// First: native code outside this file reads it at that position.
 	mbedtls_ssl_context *s;
+	// The configuration s was set up on, held until s is freed.
+	sslconf_shared *conf;
 
 	void create()
 	{
 		s = (mbedtls_ssl_context *)malloc(sizeof(mbedtls_ssl_context));
 		mbedtls_ssl_init(s);
+		conf = 0;
 		_hx_set_finalizer(this, finalize);
 	}
 
@@ -76,6 +123,12 @@ struct sslctx : public hx::Object
 			mbedtls_ssl_free( s );
 			free(s);
 			s = 0;
+		}
+		// After the context: freeing it reads the configuration
+		if( conf )
+		{
+			sslconf_shared_release( conf );
+			conf = 0;
 		}
 	}
 
@@ -91,38 +144,33 @@ struct sslconf : public hx::Object
 {
    HX_IS_INSTANCE_OF enum { _hx_ClassId = hx::clsIdSslConf };
 
+	// First: native code outside this file reads it at that position. Null
+	// once the handle is closed, as before.
 	mbedtls_ssl_config *c;
-#ifndef HXCPP_SSL_NO_TICKETS
-	// A server configuration's session tickets: see _hx_ssl_conf_new.
-	mbedtls_ssl_ticket_context *ticket;
-#endif
+	sslconf_shared *shared;
 
 	void create()
 	{
-		c = (mbedtls_ssl_config *)malloc(sizeof(mbedtls_ssl_config));
-		mbedtls_ssl_config_init(c);
+		shared = new sslconf_shared();
+		mbedtls_ssl_config_init( &shared->config );
 #ifndef HXCPP_SSL_NO_TICKETS
-		ticket = 0;
+		shared->ticket = 0;
 #endif
+		shared->refs.store( 1, std::memory_order_relaxed );
+		c = &shared->config;
 		_hx_set_finalizer(this, finalize);
 	}
 
+	// Lets go of the handle's reference: the configuration itself goes when
+	// the last context set up on it does.
 	void destroy()
 	{
-		if( c )
+		c = 0;
+		if( shared )
 		{
-			mbedtls_ssl_config_free( c );
-			free(c);
-			c = 0;
+			sslconf_shared_release( shared );
+			shared = 0;
 		}
-#ifndef HXCPP_SSL_NO_TICKETS
-		if( ticket )
-		{
-			mbedtls_ssl_ticket_free( ticket );
-			free(ticket);
-			ticket = 0;
-		}
-#endif
 	}
 
 	static void finalize(Dynamic obj)
@@ -230,13 +278,17 @@ static void ssl_error( int ret ){
 
 Dynamic _hx_ssl_new( Dynamic hconf ) {
 	int ret;
+	sslconf *conf = val_conf(hconf);
+	// mbedtls_ssl_setup with a closed configuration's null crashed
+	if( !conf->shared )
+		hx::Throw( HX_CSTRING("ssl_new: the configuration is closed") );
 	sslctx *ssl = new sslctx();
 	ssl->create();
-	sslconf *conf = val_conf(hconf);
 	if( (ret = mbedtls_ssl_setup(ssl->s, conf->c)) != 0 ){
 		ssl->destroy();
 		ssl_error(ret);
 	}
+	ssl->conf = sslconf_shared_retain( conf->shared );
 	return ssl;
 }
 
@@ -518,8 +570,8 @@ Dynamic _hx_ssl_conf_new( bool server ) {
 #ifdef NEKO_WINDOWS
 	mbedtls_ssl_conf_verify(conf->c, verify_callback, NULL);
 #endif
-	// The 2.28 preset still negotiates TLS 1.0/1.1 - floor at TLS 1.2
-	mbedtls_ssl_conf_min_version( conf->c, MBEDTLS_SSL_MAJOR_VERSION_3, MBEDTLS_SSL_MINOR_VERSION_3 );
+	// No version floor to set: mbedTLS 3 speaks TLS 1.2 and 1.3 only, and the
+	// preset negotiates 1.3 whenever the peer can
 	mbedtls_ssl_conf_rng( conf->c, mbedtls_ctr_drbg_random, &ctr_drbg );
 #ifndef HXCPP_SSL_NO_TICKETS
 	// Session tickets (RFC 5077), so a client that has been here before
@@ -541,7 +593,7 @@ Dynamic _hx_ssl_conf_new( bool server ) {
 		mbedtls_ssl_ticket_init( ticket );
 		if( mbedtls_ssl_ticket_setup( ticket, mbedtls_ctr_drbg_random, &ctr_drbg, MBEDTLS_CIPHER_AES_256_GCM, TICKET_LIFETIME ) == 0 )
 		{
-			conf->ticket = ticket;
+			conf->shared->ticket = ticket;
 			mbedtls_ssl_conf_session_tickets_cb( conf->c, mbedtls_ssl_ticket_write, mbedtls_ssl_ticket_parse, ticket );
 		}
 		else
@@ -764,7 +816,7 @@ Array<String> _hx_ssl_cert_get_altnames( Dynamic hcert ){
 	sslcert *cert = val_cert(hcert);
 	mbedtls_asn1_sequence *cur;
 	Array<String> result(0,1);
-	if( cert->c->ext_types & MBEDTLS_X509_EXT_SUBJECT_ALT_NAME ){
+	if( mbedtls_x509_crt_has_ext_type( cert->c, MBEDTLS_X509_EXT_SUBJECT_ALT_NAME ) ){
 		cur = &cert->c->subject_alt_names;
 
 		while( cur != NULL ){
@@ -862,7 +914,7 @@ Dynamic _hx_ssl_key_from_der( Array<unsigned char> buf, bool pub ){
 	if( pub )
 		r = mbedtls_pk_parse_public_key( pk->k, &buf[0], buf->length );
 	else
-		r = mbedtls_pk_parse_key( pk->k, &buf[0], buf->length, NULL, 0 );
+		r = mbedtls_pk_parse_key( pk->k, &buf[0], buf->length, NULL, 0, mbedtls_ctr_drbg_random, &ctr_drbg );
 	if( r != 0 ){
 		pk->destroy();
 		ssl_error(r);
@@ -884,11 +936,11 @@ Dynamic _hx_ssl_key_from_pem( String data, bool pub, String pass ){
 	if( pub ){
 		r = mbedtls_pk_parse_public_key( pk->k, b, data.length+1 );
 	}else if( pass == null() ){
-		r = mbedtls_pk_parse_key( pk->k, b, data.length+1, NULL, 0 );
+		r = mbedtls_pk_parse_key( pk->k, b, data.length+1, NULL, 0, mbedtls_ctr_drbg_random, &ctr_drbg );
 	}else{
       Array<unsigned char> pbytes(0,0);
       __hxcpp_bytes_of_string(pbytes,pass);
-		r = mbedtls_pk_parse_key( pk->k, b, data.length+1, (const unsigned char *)pbytes->GetBase(), pbytes->length );
+		r = mbedtls_pk_parse_key( pk->k, b, data.length+1, (const unsigned char *)pbytes->GetBase(), pbytes->length, mbedtls_ctr_drbg_random, &ctr_drbg );
 	}
 	free(b);
 	if( r != 0 ){
@@ -916,7 +968,9 @@ Array<unsigned char> _hx_ssl_dgst_make( Array<unsigned char> buf, String alg ){
 Array<unsigned char> _hx_ssl_dgst_sign( Array<unsigned char> buf, Dynamic hpkey, String alg ){
 	int r = -1;
 	size_t olen = 0;
-	unsigned char hash[32];
+	// Room for any digest md knows: 32 bytes was SHA-256's, and SHA-384 and
+	// SHA-512 wrote past it
+	unsigned char hash[MBEDTLS_MD_MAX_SIZE];
 	sslpkey *pk = val_pkey(hpkey);
 
    hx::strbuf ubuf;
@@ -927,11 +981,10 @@ Array<unsigned char> _hx_ssl_dgst_sign( Array<unsigned char> buf, Dynamic hpkey,
 	if( (r = mbedtls_md( md, &buf[0], buf->length, hash )) != 0 )
 		ssl_error(r);
 
-	Array<unsigned char> result = Array_obj<unsigned char>::__new(MBEDTLS_MPI_MAX_SIZE,MBEDTLS_MPI_MAX_SIZE);
-	if( (r = mbedtls_pk_sign( pk->k, mbedtls_md_get_type(md), hash, 0, &result[0], &olen, mbedtls_ctr_drbg_random, &ctr_drbg )) != 0 )
+	Array<unsigned char> result = Array_obj<unsigned char>::__new(MBEDTLS_PK_SIGNATURE_MAX_SIZE,MBEDTLS_PK_SIGNATURE_MAX_SIZE);
+	if( (r = mbedtls_pk_sign( pk->k, mbedtls_md_get_type(md), hash, 0, &result[0], MBEDTLS_PK_SIGNATURE_MAX_SIZE, &olen, mbedtls_ctr_drbg_random, &ctr_drbg )) != 0 )
 		ssl_error(r);
 
-	result[olen] = 0;
 	result->__SetSize(olen);
 	return result;
 }
@@ -939,7 +992,7 @@ Array<unsigned char> _hx_ssl_dgst_sign( Array<unsigned char> buf, Dynamic hpkey,
 bool _hx_ssl_dgst_verify( Array<unsigned char> buf, Array<unsigned char> sign, Dynamic hpkey, String alg ){
 	const mbedtls_md_info_t *md;
 	int r = -1;
-	unsigned char hash[32];
+	unsigned char hash[MBEDTLS_MD_MAX_SIZE];
 	sslpkey *pk = val_pkey(hpkey);
 
    hx::strbuf ubuf;
@@ -956,38 +1009,12 @@ bool _hx_ssl_dgst_verify( Array<unsigned char> buf, Array<unsigned char> sign, D
 	return true;
 }
 
-#if (_MSC_VER || defined(WIN32))
-
-static void threading_mutex_init_alt( mbedtls_threading_mutex_t *mutex ){
-	if( mutex == NULL )
-		return;
-	InitializeCriticalSection( &mutex->cs );
-	mutex->is_valid = 1;
-}
-
-static void threading_mutex_free_alt( mbedtls_threading_mutex_t *mutex ){
-    if( mutex == NULL || !mutex->is_valid )
-        return;
-	DeleteCriticalSection( &mutex->cs );
-	mutex->is_valid = 0;
-}
-
-static int threading_mutex_lock_alt( mbedtls_threading_mutex_t *mutex ){
-    if( mutex == NULL || !mutex->is_valid )
-        return( MBEDTLS_ERR_THREADING_BAD_INPUT_DATA );
-
-	EnterCriticalSection( &mutex->cs );
-    return( 0 );
-}
-
-static int threading_mutex_unlock_alt( mbedtls_threading_mutex_t *mutex ){
-    if( mutex == NULL || !mutex->is_valid )
-        return( MBEDTLS_ERR_THREADING_BAD_INPUT_DATA );
-
-    LeaveCriticalSection( &mutex->cs );
-    return( 0 );
-}
-
+#if defined(MBEDTLS_THREADING_ALT) && defined(_WIN32)
+// The Windows mutexes, in project/thirdparty/config/mbedtls/threading_alt.c,
+// where they are also installed before main for code that is not hxcpp's.
+// Installing them is idempotent; calling it here keeps that object in links
+// that have no other way to pull it in (MinGW's).
+extern "C" void hxcpp_mbedtls_threading_init(void);
 #endif
 
 static bool _hx_ssl_inited = false;
@@ -995,10 +1022,17 @@ void _hx_ssl_init() {
     if (_hx_ssl_inited) return;
     _hx_ssl_inited = true;
 
-#if (_MSC_VER || defined(WIN32))
-	mbedtls_threading_set_alt( threading_mutex_init_alt, threading_mutex_free_alt,
-                           threading_mutex_lock_alt, threading_mutex_unlock_alt );
+#if defined(MBEDTLS_THREADING_ALT) && defined(_WIN32)
+	hxcpp_mbedtls_threading_init();
 #endif
+
+	// TLS 1.3 runs its key exchange and key schedule through PSA. mbedTLS 3.6
+	// starts PSA itself at a 1.3 handshake's first step, idempotently; doing
+	// it here, once, after the mutexes PSA's state takes, keeps the start-up
+	// -- seeding PSA's own generator -- off the first handshake, and is what
+	// any other use of PSA would need. TLS 1.2 does not use PSA in this
+	// configuration (MBEDTLS_USE_PSA_CRYPTO is off)
+	psa_crypto_init();
 
 	// Init RNG
 	mbedtls_entropy_init( &entropy );
