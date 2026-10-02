@@ -1,6 +1,10 @@
 <xml>
 
 <depend name="${HXCPP}/project/thirdparty/mbedtls-flags.xml" dateOnly="true" />
+<!-- Built against these, which nothing else would tell hxcpp: an object
+     compiled with an older configuration is compiled again. -->
+<depend name="${HXCPP}/project/thirdparty/config/mbedtls/include/mbedtls_config.h" dateOnly="true" />
+<depend name="${HXCPP}/project/thirdparty/config/mbedtls/include/threading_alt.h" dateOnly="true" />
 
 <compilerflag value="-I${HXCPP}/project/thirdparty/mbedtls-3.6.7/include" />
 <compilerflag value="-I${HXCPP}/project/thirdparty/config/mbedtls/include" />

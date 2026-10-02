@@ -133,6 +133,9 @@
 	<file name="${MBEDTLS_DIR}/library/ssl_tls13_generic.c" />
 	<file name="${MBEDTLS_DIR}/library/ssl_tls13_keys.c" />
 	<file name="${MBEDTLS_DIR}/library/ssl_tls13_server.c" />
+
+	<!-- hxcpp's own: the Windows mutexes, installed before main -->
+	<file name="${this_dir}/config/mbedtls/threading_alt.c" />
 </files>
 
 </xml>

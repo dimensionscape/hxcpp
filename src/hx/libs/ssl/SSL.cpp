@@ -957,38 +957,12 @@ bool _hx_ssl_dgst_verify( Array<unsigned char> buf, Array<unsigned char> sign, D
 	return true;
 }
 
-#if (_MSC_VER || defined(WIN32))
-
-static void threading_mutex_init_alt( mbedtls_threading_mutex_t *mutex ){
-	if( mutex == NULL )
-		return;
-	InitializeCriticalSection( &mutex->cs );
-	mutex->is_valid = 1;
-}
-
-static void threading_mutex_free_alt( mbedtls_threading_mutex_t *mutex ){
-    if( mutex == NULL || !mutex->is_valid )
-        return;
-	DeleteCriticalSection( &mutex->cs );
-	mutex->is_valid = 0;
-}
-
-static int threading_mutex_lock_alt( mbedtls_threading_mutex_t *mutex ){
-    if( mutex == NULL || !mutex->is_valid )
-        return( MBEDTLS_ERR_THREADING_BAD_INPUT_DATA );
-
-	EnterCriticalSection( &mutex->cs );
-    return( 0 );
-}
-
-static int threading_mutex_unlock_alt( mbedtls_threading_mutex_t *mutex ){
-    if( mutex == NULL || !mutex->is_valid )
-        return( MBEDTLS_ERR_THREADING_BAD_INPUT_DATA );
-
-    LeaveCriticalSection( &mutex->cs );
-    return( 0 );
-}
-
+#if defined(MBEDTLS_THREADING_ALT) && defined(_WIN32)
+// The Windows mutexes, in project/thirdparty/config/mbedtls/threading_alt.c,
+// where they are also installed before main for code that is not hxcpp's.
+// Installing them is idempotent; calling it here keeps that object in links
+// that have no other way to pull it in (MinGW's).
+extern "C" void hxcpp_mbedtls_threading_init(void);
 #endif
 
 static bool _hx_ssl_inited = false;
@@ -996,9 +970,8 @@ void _hx_ssl_init() {
     if (_hx_ssl_inited) return;
     _hx_ssl_inited = true;
 
-#if (_MSC_VER || defined(WIN32))
-	mbedtls_threading_set_alt( threading_mutex_init_alt, threading_mutex_free_alt,
-                           threading_mutex_lock_alt, threading_mutex_unlock_alt );
+#if defined(MBEDTLS_THREADING_ALT) && defined(_WIN32)
+	hxcpp_mbedtls_threading_init();
 #endif
 
 	// TLS 1.3 runs its key exchange and key schedule through PSA. mbedTLS 3.6
