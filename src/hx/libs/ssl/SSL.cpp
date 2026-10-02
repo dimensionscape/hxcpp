@@ -1001,10 +1001,12 @@ void _hx_ssl_init() {
                            threading_mutex_lock_alt, threading_mutex_unlock_alt );
 #endif
 
-	// TLS 1.3 runs its key exchange and key schedule through PSA, which must
-	// be initialised first -- after the mutexes, which PSA's own state takes.
-	// Should it fail, TLS 1.3 handshakes fail; TLS 1.2 does not use PSA in
-	// this configuration (MBEDTLS_USE_PSA_CRYPTO is off)
+	// TLS 1.3 runs its key exchange and key schedule through PSA. mbedTLS 3.6
+	// starts PSA itself at a 1.3 handshake's first step, idempotently; doing
+	// it here, once, after the mutexes PSA's state takes, keeps the start-up
+	// -- seeding PSA's own generator -- off the first handshake, and is what
+	// any other use of PSA would need. TLS 1.2 does not use PSA in this
+	// configuration (MBEDTLS_USE_PSA_CRYPTO is off)
 	psa_crypto_init();
 
 	// Init RNG
