@@ -1,4 +1,5 @@
 #include <string.h>
+#include <atomic>
 
 #ifdef HX_WINDOWS
 #   include <winsock2.h>
@@ -56,16 +57,62 @@ struct SocketWrapper : public hx::Object
    SOCKET socket;
 };
 
+// A configuration's mbedTLS state, owned jointly by its handle and by every
+// context set up on it. mbedTLS keeps a pointer to the configuration in each
+// context and reads it for the life of the connection -- every read checks
+// its renegotiation settings, and freeing the context reads it too -- so the
+// configuration has to outlive them all. It did not: closing a listening
+// socket closed its configuration, freeing it under the connections it had
+// accepted, which went on reading freed memory. A server that stops
+// listening while it finishes its connections, as a graceful shutdown does,
+// did exactly that. The handle and each context hold a reference, and the
+// last to let go frees it.
+struct sslconf_shared
+{
+	mbedtls_ssl_config config;
+#ifndef HXCPP_SSL_NO_TICKETS
+	// A server configuration's session tickets: see _hx_ssl_conf_new.
+	mbedtls_ssl_ticket_context *ticket;
+#endif
+	std::atomic<int> refs;
+};
+
+static sslconf_shared *sslconf_shared_retain( sslconf_shared *shared )
+{
+	shared->refs.fetch_add( 1, std::memory_order_relaxed );
+	return shared;
+}
+
+// From any thread: a context may be finalized by whichever thread collects.
+static void sslconf_shared_release( sslconf_shared *shared )
+{
+	if( shared->refs.fetch_sub( 1, std::memory_order_acq_rel ) != 1 )
+		return;
+	mbedtls_ssl_config_free( &shared->config );
+#ifndef HXCPP_SSL_NO_TICKETS
+	if( shared->ticket )
+	{
+		mbedtls_ssl_ticket_free( shared->ticket );
+		free( shared->ticket );
+	}
+#endif
+	delete shared;
+}
+
 struct sslctx : public hx::Object
 {
    HX_IS_INSTANCE_OF enum { _hx_ClassId = hx::clsIdSsl };
 
+	// First: native code outside this file reads it at that position.
 	mbedtls_ssl_context *s;
+	// The configuration s was set up on, held until s is freed.
+	sslconf_shared *conf;
 
 	void create()
 	{
 		s = (mbedtls_ssl_context *)malloc(sizeof(mbedtls_ssl_context));
 		mbedtls_ssl_init(s);
+		conf = 0;
 		_hx_set_finalizer(this, finalize);
 	}
 
@@ -76,6 +123,12 @@ struct sslctx : public hx::Object
 			mbedtls_ssl_free( s );
 			free(s);
 			s = 0;
+		}
+		// After the context: freeing it reads the configuration
+		if( conf )
+		{
+			sslconf_shared_release( conf );
+			conf = 0;
 		}
 	}
 
@@ -91,38 +144,33 @@ struct sslconf : public hx::Object
 {
    HX_IS_INSTANCE_OF enum { _hx_ClassId = hx::clsIdSslConf };
 
+	// First: native code outside this file reads it at that position. Null
+	// once the handle is closed, as before.
 	mbedtls_ssl_config *c;
-#ifndef HXCPP_SSL_NO_TICKETS
-	// A server configuration's session tickets: see _hx_ssl_conf_new.
-	mbedtls_ssl_ticket_context *ticket;
-#endif
+	sslconf_shared *shared;
 
 	void create()
 	{
-		c = (mbedtls_ssl_config *)malloc(sizeof(mbedtls_ssl_config));
-		mbedtls_ssl_config_init(c);
+		shared = new sslconf_shared();
+		mbedtls_ssl_config_init( &shared->config );
 #ifndef HXCPP_SSL_NO_TICKETS
-		ticket = 0;
+		shared->ticket = 0;
 #endif
+		shared->refs.store( 1, std::memory_order_relaxed );
+		c = &shared->config;
 		_hx_set_finalizer(this, finalize);
 	}
 
+	// Lets go of the handle's reference: the configuration itself goes when
+	// the last context set up on it does.
 	void destroy()
 	{
-		if( c )
+		c = 0;
+		if( shared )
 		{
-			mbedtls_ssl_config_free( c );
-			free(c);
-			c = 0;
+			sslconf_shared_release( shared );
+			shared = 0;
 		}
-#ifndef HXCPP_SSL_NO_TICKETS
-		if( ticket )
-		{
-			mbedtls_ssl_ticket_free( ticket );
-			free(ticket);
-			ticket = 0;
-		}
-#endif
 	}
 
 	static void finalize(Dynamic obj)
@@ -230,13 +278,17 @@ static void ssl_error( int ret ){
 
 Dynamic _hx_ssl_new( Dynamic hconf ) {
 	int ret;
+	sslconf *conf = val_conf(hconf);
+	// mbedtls_ssl_setup with a closed configuration's null crashed
+	if( !conf->shared )
+		hx::Throw( HX_CSTRING("ssl_new: the configuration is closed") );
 	sslctx *ssl = new sslctx();
 	ssl->create();
-	sslconf *conf = val_conf(hconf);
 	if( (ret = mbedtls_ssl_setup(ssl->s, conf->c)) != 0 ){
 		ssl->destroy();
 		ssl_error(ret);
 	}
+	ssl->conf = sslconf_shared_retain( conf->shared );
 	return ssl;
 }
 
@@ -541,7 +593,7 @@ Dynamic _hx_ssl_conf_new( bool server ) {
 		mbedtls_ssl_ticket_init( ticket );
 		if( mbedtls_ssl_ticket_setup( ticket, mbedtls_ctr_drbg_random, &ctr_drbg, MBEDTLS_CIPHER_AES_256_GCM, TICKET_LIFETIME ) == 0 )
 		{
-			conf->ticket = ticket;
+			conf->shared->ticket = ticket;
 			mbedtls_ssl_conf_session_tickets_cb( conf->c, mbedtls_ssl_ticket_write, mbedtls_ssl_ticket_parse, ticket );
 		}
 		else
