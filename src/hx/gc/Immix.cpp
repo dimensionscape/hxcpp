@@ -5908,6 +5908,12 @@ class LocalAllocator : public hx::StackContext
    bool            mReadySignalled;
    HxSemaphore     mReadyForCollect;
    HxSemaphore     mCollectDone;
+   // True from just before PauseForCollect signals mReadyForCollect until its
+   // wait for mCollectDone ends
+   volatile bool   mPausedForCollect;
+   // Set by the collector when it found us paused in PauseForCollect, so that
+   // ReleaseFromSafe signals mCollectDone, which we are waiting for
+   bool            mReleaseWhenDone;
    #endif
 
    int             mID;
@@ -5963,6 +5969,8 @@ public:
 
       // It is in the free zone - wait for 'SetTopOfStack' to activate
       #ifndef HXCPP_SINGLE_THREADED_APP
+      mPausedForCollect = false;
+      mReleaseWhenDone = false;
       mGCFreeZone = true;
       mReadyForCollect.Set();
       mReadySignalled = true;
@@ -6157,8 +6165,10 @@ public:
       if (sgIsCollecting)
          CriticalGCError("Bad Allocation while collecting - from finalizer?");
 
+      mPausedForCollect = true;
       mReadyForCollect.Set();
       mCollectDone.Wait();
+      mPausedForCollect = false;
       #endif
    }
 
@@ -6280,6 +6290,7 @@ public:
    void WaitForSafe()
    {
       #ifndef HXCPP_SINGLE_THREADED_APP
+      mReleaseWhenDone = false;
       if (!mGCFreeZone)
       {
          // Cause allocation routines to fail ...
@@ -6290,15 +6301,27 @@ public:
          spaceEnd = 0;
          #endif
          mReadyForCollect.Wait();
+         // Signalled by PauseForCollect, which now waits for mCollectDone, or by
+         //  the thread entering a GC-free zone, which does not
+         mReleaseWhenDone = mPausedForCollect;
       }
       #endif
    }
 
+   // Signals only a thread this collection found paused in PauseForCollect.
+   //  mGCFreeZone is no guide here: a thread that was in a zone throughout may
+   //  have left it since gPauseForCollect was cleared, or be briefly out of it
+   //  on its way to block on the state lock. An mCollectDone it is not waiting
+   //  for stays set, so its next PauseForCollect would return at once and run
+   //  through that collection.
    void ReleaseFromSafe()
    {
       #ifndef HXCPP_SINGLE_THREADED_APP
-      if (!mGCFreeZone)
+      if (mReleaseWhenDone)
+      {
+         mReleaseWhenDone = false;
          mCollectDone.Set();
+      }
       #endif
    }
 
