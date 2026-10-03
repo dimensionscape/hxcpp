@@ -1,0 +1,2 @@
+safe points: 0 of 10 sums wrong
+free zones: 0 of 10 sums wrong
