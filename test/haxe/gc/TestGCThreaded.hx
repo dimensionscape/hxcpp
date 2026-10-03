@@ -7,6 +7,7 @@ import haxe.crypto.Md5;
 import cpp.vm.Gc;
 import sys.io.File;
 #if haxe4
+import sys.thread.Lock;
 import sys.thread.Thread;
 #else
 import cpp.vm.Thread;
@@ -60,6 +61,57 @@ class TestGCThreaded extends Test
       stopNative();
       Assert.pass();
    }
+
+   #if haxe4
+   // A worker holds an array only in a local across safe points while this
+   // thread forces collections and allocates. On Windows x64 the local sits in a
+   // callee-saved register, which the pause did not capture: the array was
+   // freed under the worker, and its rows refilled with this thread's garbage.
+   public function testSafePointKeepsRegisterHeldObjects():Void
+   {
+      var expected = SAFE_POINT_ROUNDS * (SAFE_POINT_SIZE * (SAFE_POINT_SIZE + 1) >> 1);
+      for(attempt in 0...4)
+      {
+         var done = new Lock();
+         var result = 0;
+         var finished = false;
+         Thread.create( () -> {
+            result = sumAcrossSafePoints();
+            finished = true;
+            done.release();
+         });
+         while(!finished)
+         {
+            var garbage = [ for(i in 0...2000) [i, i, i, i] ];
+            Gc.run(true);
+         }
+         done.wait();
+         Assert.equals(expected, result);
+      }
+   }
+
+   static inline var SAFE_POINT_SIZE = 18;
+   static inline var SAFE_POINT_ROUNDS = 200000;
+
+   static function sumAcrossSafePoints():Int
+   {
+      var values = new Array<Int>();
+      for(i in 0...SAFE_POINT_SIZE)
+         values.push(i + 1);
+      // A second array made the same way reuses the stack slot the first was
+      // returned through, so the loop holds 'values' only in a register
+      var other = new Array<Int>();
+      other.push(SAFE_POINT_SIZE);
+      var sum = other[0] - SAFE_POINT_SIZE;
+      for(round in 0...SAFE_POINT_ROUNDS)
+      {
+         for(i in 0...SAFE_POINT_SIZE)
+            sum += values[i];
+         Gc.safePoint();
+      }
+      return sum;
+   }
+   #end
 
    @:native("nativeLoop")
    extern static function nativeLoop() : Void;

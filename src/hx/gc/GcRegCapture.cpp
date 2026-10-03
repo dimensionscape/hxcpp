@@ -34,31 +34,39 @@ void CaptureX86(RegisterCaptureBuffer &outBuffer)
 
 } // end namespace hx
 
-#elif defined(HXCPP_CAPTURE_x64) // } {
+#elif defined(HXCPP_CAPTURE_x64) && !defined(__GNUC__) // } {
 
-#if !defined(__GNUC__)
-#include <windows.h>
-#endif
+#include <string.h>
+
+namespace hx {
+
+// Called after RtlCaptureContext has filled ioBuffer.context, so what this function
+// does with the registers no longer matters. Its frame is below context.Rsp, and
+// the home area it may write is the capturing function's outgoing-argument space,
+// which holds nothing of the caller's.
+void CaptureX64Frame(RegisterCaptureBuffer &ioBuffer, int *inTopOfStack)
+{
+   void **from = (void **)ioBuffer.context.Rsp;
+   void **to = (void **)inTopOfStack;
+   size_t words = 0;
+   if (to > from)
+   {
+      words = (size_t)(to - from);
+      if (words > CAPTURE_FRAME_WORDS)
+         words = CAPTURE_FRAME_WORDS;
+      memcpy(ioBuffer.frame, from, words * sizeof(void *));
+   }
+   ioBuffer.frameWords = words;
+}
+
+} // end namespace hx
+
+#elif defined(HXCPP_CAPTURE_x64) // } {
 
 namespace hx {
 
 void CaptureX64(RegisterCaptureBuffer &outBuffer)
 {
-   #if !defined(__GNUC__)
-      CONTEXT context;
-
-      context.ContextFlags = CONTEXT_INTEGER;
-      RtlCaptureContext(&context);
-
-      outBuffer.rbx = (void *)context.Rbx;
-      outBuffer.rbp = (void *)context.Rbp;
-      outBuffer.rdi = (void *)context.Rdi;
-      outBuffer.r12 = (void *)context.R12;
-      outBuffer.r13 = (void *)context.R13;
-      outBuffer.r14 = (void *)context.R14;
-      outBuffer.r15 = (void *)context.R15;
-      memcpy(outBuffer.xmm, &context.Xmm0, sizeof(outBuffer.xmm));
-   #else
       void *regBx;
       void *regBp;
       void *regDi;
@@ -79,7 +87,6 @@ void CaptureX64(RegisterCaptureBuffer &outBuffer)
       outBuffer.r13 = reg13;
       outBuffer.r14 = reg14;
       outBuffer.r15 = reg15;
-   #endif
 }
 
 } // end namespace hx

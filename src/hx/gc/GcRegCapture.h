@@ -16,6 +16,10 @@
 
    #if (defined(HX_MACOS) || (defined(HX_WINDOWS) && !defined(HX_WINRT)) || defined(_XBOX_ONE) || (defined(HX_LINUX) && defined(__x86_64__)) ) && defined(HXCPP_M64)
       #define HXCPP_CAPTURE_x64
+      #if !defined(__GNUC__)
+         // RtlCaptureContext and CONTEXT
+         #include <windows.h>
+      #endif
    #endif
 
    #if defined(HXCPP_ARM64)
@@ -59,6 +63,43 @@ void CaptureX86(RegisterCaptureBuffer &outBuffer);
 
 #define CAPTURE_REG_START (int *)(&mRegisterBuf)
 #define CAPTURE_REG_END (int *)(&mRegisterBuf+1)
+
+#elif defined(HXCPP_CAPTURE_x64) && !defined(__GNUC__) // }  {
+
+// Windows x64 (MSVC). RBX, RBP, RDI, RSI and R12-R15 are callee-saved here, and a
+// pointer the interrupted code holds only in one of them has to be found.
+//
+// RtlCaptureContext is called by the capturing function itself, not by a helper:
+// a helper that needs its argument after the call keeps it in a callee-saved
+// register, and so records its own value there instead of the caller's.
+//
+// The capturing function (PauseForCollect, EnterGCFreeZone, SetupStackAndCollect)
+// saves the callee-saved registers it uses in its prologue and then reuses them,
+// so some of its caller's values are only in that save area - and MSVC can put the
+// 'dummy' local that marks the bottom of the scanned stack in the home area above
+// it. So the words from the captured stack pointer up are copied as well: the
+// capturing frame, save area included, and the few frames above it. They are
+// copied rather than scanned in place because EnterGCFreeZone returns before a
+// collection scans the thread, and its frame is reused by then.
+enum { CAPTURE_FRAME_WORDS = 64 };
+
+struct RegisterCaptureBuffer
+{
+   CONTEXT context;
+   void    *frame[CAPTURE_FRAME_WORDS];
+   // Zero until the first capture: a thread is marked from the time it attaches
+   size_t  frameWords = 0;
+};
+
+// Copies the stack from ioBuffer.context.Rsp up, to at most inTopOfStack, into ioBuffer.frame
+void CaptureX64Frame(RegisterCaptureBuffer &ioBuffer, int *inTopOfStack);
+
+#define CAPTURE_REGS \
+   RtlCaptureContext(&mRegisterBuf.context); \
+   hx::CaptureX64Frame(mRegisterBuf, mTopOfStack);
+
+#define CAPTURE_REG_START (int *)(&mRegisterBuf.context)
+#define CAPTURE_REG_END (int *)(mRegisterBuf.frame + mRegisterBuf.frameWords)
 
 #elif defined(HXCPP_CAPTURE_x64) // }  {
 
