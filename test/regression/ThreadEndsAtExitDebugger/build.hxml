@@ -1,0 +1,4 @@
+-cp ../ThreadEndsAtExit
+-cpp bin
+-m Main
+-D HXCPP_DEBUGGER

@@ -87,8 +87,11 @@ const char *_hx_dbg_find_scriptable_class_name(String className);
 
 
 static std::mutex gMutex;
-static std::map<int, DebuggerContext *> gMap;
-static std::list<DebuggerContext *> gList;
+// Never destroyed: a thread's context leaves them as the thread ends, and a
+// thread can end while the main thread, having returned from main, runs the
+// static destructors.
+static std::map<int, DebuggerContext *> &gMap = *new std::map<int, DebuggerContext *>();
+static std::list<DebuggerContext *> &gList = *new std::list<DebuggerContext *>();
 
 class Breakpoints;
 Breakpoints *ReleaseBreakpointsLocked(Breakpoints *inBreakpoints);

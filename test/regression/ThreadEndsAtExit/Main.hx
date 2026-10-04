@@ -6,7 +6,10 @@ import sys.thread.Thread;
 // That set was a static itself, destroyed by then: the first thread to end
 // faulted in the erase while holding the root lock, and the second waited on
 // that lock for ever -- on Windows inside the loader lock, so the process's
-// exit waited for it too and never finished.
+// exit waited for it too and never finished. With stack traces or the
+// debugger, an ending thread also leaves the stack map and the debugger's
+// lists, which were statics too, and the fault ended the process;
+// ThreadEndsAtExitDebugger builds this program that way.
 //
 // Rather than wait for the timing to line up, the threads are let go from a
 // function the C runtime calls after the static destructors (a .CRT$XPU entry
