@@ -2410,7 +2410,14 @@ void MarkStringArray(String *inPtr, int inLength, hx::MarkContext *__inCtx)
 
 FILE_SCOPE std::mutex* sGCRootLock = nullptr;
 typedef std::unordered_set<hx::Object **> RootSet;
-static RootSet sgRootSet;
+// Made in InitAlloc, as the lock is, and never destroyed. A thread's root is
+// removed as the thread ends, by hx::thread's thread_local holder, and a
+// thread can end while the main thread, having returned from main, runs the
+// process's static destructors. A static set was destroyed under it: the
+// erase read freed memory and faulted, holding the lock, so the next thread
+// to end waited on the lock for ever -- on Windows inside the loader lock,
+// which hung the process's exit.
+static RootSet *sgRootSet = nullptr;
 
 typedef std::unordered_map<void *,int> OffsetRootSet;
 static OffsetRootSet *sgOffsetRootSet=0;
@@ -2418,13 +2425,13 @@ static OffsetRootSet *sgOffsetRootSet=0;
 void GCAddRoot(hx::Object **inRoot)
 {
    std::lock_guard<std::mutex> lock(*sGCRootLock);
-   sgRootSet.insert(inRoot);
+   sgRootSet->insert(inRoot);
 }
 
 void GCRemoveRoot(hx::Object **inRoot)
 {
    std::lock_guard<std::mutex> lock(*sGCRootLock);
-   sgRootSet.erase(inRoot);
+   sgRootSet->erase(inRoot);
 }
 
 
@@ -4374,7 +4381,7 @@ public:
 
       hx::VisitClassStatics(inCtx);
 
-      for(hx::RootSet::iterator i = hx::sgRootSet.begin(); i!=hx::sgRootSet.end(); ++i)
+      for(hx::RootSet::iterator i = hx::sgRootSet->begin(); i!=hx::sgRootSet->end(); ++i)
       {
          hx::Object **obj = *i;
          if (*obj)
@@ -4821,7 +4828,7 @@ public:
       {
       hx::AutoMarkPush info(&mMarker,"Roots","root");
 
-      for(hx::RootSet::iterator i = hx::sgRootSet.begin(); i!=hx::sgRootSet.end(); ++i)
+      for(hx::RootSet::iterator i = hx::sgRootSet->begin(); i!=hx::sgRootSet->end(); ++i)
       {
          hx::Object *&obj = **i;
          if (obj)
@@ -6744,6 +6751,7 @@ void InitAlloc()
    sgFinalizers = new FinalizerList();
    sFinalizerLock = new std::mutex();
    sGCRootLock = new std::mutex();
+   sgRootSet = new RootSet();
 
    gMainThreadContext =  new LocalAllocator();
 
