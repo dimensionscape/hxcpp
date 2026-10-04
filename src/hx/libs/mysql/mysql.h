@@ -127,7 +127,9 @@ int mysql_is_tls( MYSQL *m );
 void mysql_set_options( MYSQL *m, int ssl_mode, char *ssl_ca, char *server_public_key, int allow_public_key_retrieval );
 // Takes ownership of the malloc'd strings; the password is wiped once used.
 void mysql_set_endpoint( MYSQL *m, char *host, int port, char *user, char *pass, char *socket );
-// Seconds, 0 for none; a negative read and write timeout keeps the old five hours.
+// Seconds, 0 for none. The connect timeout is one deadline for the whole open;
+// a negative one keeps the old bounds (the system's connect, 50 s a handshake
+// read), and a negative read and write timeout the old five hours.
 void mysql_set_timeouts( MYSQL *m, double connect_timeout, double read_timeout, double write_timeout );
 void mysql_set_keepalive( MYSQL *m, int on, int idle, int interval, int count );
 // The keepalive the connection's socket has: on (0 or 1), then the idle and

@@ -58,7 +58,10 @@ typedef struct {
 	char *ssl_ca;
 	char *server_public_key;
 	int allow_public_key_retrieval;
-	// Seconds; 0 or less for no limit.
+	// Seconds. connect_timeout: one deadline for the whole open, 0 for no
+	// limit, less than 0 unset (the system's connect, then 50 s for each
+	// read of the handshake). The read and write timeouts: 0 or less for no
+	// limit.
 	double connect_timeout;
 	double read_timeout;
 	double write_timeout;
@@ -147,6 +150,10 @@ struct _MYSQL {
 	MYSQL_OPTIONS options;
 	MYSQL_TLS *tls;  // the session's TLS, once the handshake has run
 	int timed_out;   // the last read or write gave up on a timeout
+	// Where mysql_open gives up, by psock_clock(): every read while the
+	// connection opens waits only for what is left of it. 0 outside an open,
+	// or with no connect timeout.
+	double deadline;
 	int is41;
 	int errcode;
 	char sqlstate[6];
@@ -191,6 +198,7 @@ struct _MYSQL_RES {
 
 
 // network
+int myp_wait_budget( MYSQL *m );
 int myp_recv_no_gc( MYSQL *m, void *buf, int size );
 int myp_send_no_gc( MYSQL *m, void *buf, int size );
 int myp_recv( MYSQL *m, void *buf, int size );

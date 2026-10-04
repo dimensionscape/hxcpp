@@ -738,10 +738,10 @@ String  _hx_mysql_escape(Dynamic handle,String str)
    serverPublicKey: PEM of the server's RSA key, for caching_sha2_password
    and sha256_password without TLS; allowPublicKeyRetrieval lets the client
    ask the server for it instead, which a man in the middle could answer.
-   Timeouts in seconds, 0 for none: connectTimeout bounds the TCP connect and
-   the handshake (unset: the system's connect, 50 s of handshake);
-   readTimeout and writeTimeout each read and write afterwards (unset: five
-   hours). keepAlive turns TCP keepalive on, with the probe timing given or
+   Timeouts in seconds, 0 for none: connectTimeout is one deadline for the
+   TCP connect and the handshake together (unset: the system's connect, then
+   50 s for each read of the handshake); readTimeout and writeTimeout each
+   read and write afterwards (unset: five hours). keepAlive turns TCP keepalive on, with the probe timing given or
    the system's.
    </doc>
 **/
@@ -793,7 +793,7 @@ Dynamic _hx_mysql_create(Dynamic params)
       copy_param(params, HX_CSTRING("serverPublicKey")),
       allowRetrieval != null() && (bool)allowRetrieval);
    mysql_set_timeouts(cnx,
-      seconds_param(params, HX_CSTRING("connectTimeout"), 0),
+      seconds_param(params, HX_CSTRING("connectTimeout"), -1),
       seconds_param(params, HX_CSTRING("readTimeout"), -1),
       seconds_param(params, HX_CSTRING("writeTimeout"), -1));
    mysql_set_keepalive(cnx,

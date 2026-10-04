@@ -197,8 +197,9 @@ MYSQL *mysql_init( void *unused ) {
 	m->affected_rows = -1;
 	strcpy(m->sqlstate,"00000");
 	// Unset: a caller that names no limits gets the ones this client always
-	// had, 50 seconds to connect and five hours per read.
-	m->options.connect_timeout = 0;
+	// had, 50 seconds for each read of the handshake and five hours per read
+	// after it. A connect timeout of 0 is no limit at all.
+	m->options.connect_timeout = -1;
 	m->options.read_timeout = -1;
 	m->options.write_timeout = -1;
 	return m;
@@ -312,7 +313,24 @@ static MYSQL *connect_failed( MYSQL *m ) {
 	return NULL;
 }
 
+static MYSQL *real_connect( MYSQL *m, const char *host, const char *user, const char *pass, int port, const char *socket );
+
+/*
+	One deadline for the whole of it -- the connect, TLS, the greeting and the
+	login -- as a connect timeout says. Each read waited the whole timeout
+	again, so a server that answered a byte at a time held the open for as
+	long as it went on: a greeting of 80 bytes sent 9 seconds apart passes a
+	10 second timeout at every read, and takes 12 minutes.
+*/
 MYSQL *mysql_real_connect( MYSQL *m, const char *host, const char *user, const char *pass, void *unused, int port, const char *socket, int options ) {
+	MYSQL *connected;
+	m->deadline = m->options.connect_timeout > 0 ? psock_clock() + m->options.connect_timeout : 0;
+	connected = real_connect(m,host,user,pass,port,socket);
+	m->deadline = 0;
+	return connected;
+}
+
+static MYSQL *real_connect( MYSQL *m, const char *host, const char *user, const char *pass, int port, const char *socket ) {
 	PHOST h;
 	unsigned char nonce[NONCE_SIZE + 13];
 	char plugin[64];
@@ -342,8 +360,10 @@ MYSQL *mysql_real_connect( MYSQL *m, const char *host, const char *user, const c
 	psock_set_fastsend(m->s,1);
 	// The handshake is bounded by the connect timeout too: a server that
 	// accepts and never greets would otherwise hold the caller for as long
-	// as the socket waits.
-	psock_set_timeout(m->s,m->options.connect_timeout > 0 ? m->options.connect_timeout : 50);
+	// as the socket waits. Reads take what is left of it (myp_wait_budget);
+	// a caller that set none has the 50 seconds a read this always had, and
+	// one that asked for no limit, none.
+	psock_set_timeout(m->s,m->options.connect_timeout > 0 ? m->options.connect_timeout : (m->options.connect_timeout < 0 ? 50 : 0));
 	{
 		SERR r = psock_connect_timeout(m->s,h,port,m->options.connect_timeout);
 		if( r != PS_OK ) {
@@ -510,7 +530,13 @@ MYSQL *mysql_real_connect( MYSQL *m, const char *host, const char *user, const c
 	while( 1 ) {
 		int code;
 		if( !myp_read_packet(m,p) ) {
-			error(m,"Failed to read packet",NULL);
+			if( m->timed_out ) {
+				snprintf(m->last_error,sizeof(m->last_error),"Timed out after %g seconds logging in to the server",
+					m->options.connect_timeout > 0 ? m->options.connect_timeout : 50);
+				m->errcode = 2013;
+				strcpy(m->sqlstate,"HY000");
+			} else
+				error(m,"Failed to read packet",NULL);
 			return connect_failed(m);
 		}
 		// increase packet counter (because we read one packet)

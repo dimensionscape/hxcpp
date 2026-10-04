@@ -33,6 +33,7 @@
 #	include <sys/types.h>
 #	include <sys/socket.h>
 #	include <sys/time.h>
+#	include <time.h>
 #	include <netinet/in.h>
 #	include <netinet/tcp.h>
 #	include <arpa/inet.h>
@@ -277,6 +278,25 @@ void psock_keepalive_state( PSOCK s, int *state ) {
 #	ifdef TCP_KEEPCNT
 	state[3] = keepalive_option(s,IPPROTO_TCP,TCP_KEEPCNT);
 #	endif
+}
+
+/*
+	Seconds on a clock that only goes forward, for deadlines: the time of day
+	jumps when the system's clock is set.
+*/
+double psock_clock() {
+#ifdef NEKO_WINDOWS
+	static LARGE_INTEGER frequency = {0};
+	LARGE_INTEGER now;
+	if( frequency.QuadPart == 0 )
+		QueryPerformanceFrequency(&frequency);
+	QueryPerformanceCounter(&now);
+	return (double)now.QuadPart / (double)frequency.QuadPart;
+#else
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC,&now);
+	return (double)now.tv_sec + (double)now.tv_nsec / 1e9;
+#endif
 }
 
 int psock_last_error() {

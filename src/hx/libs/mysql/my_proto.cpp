@@ -23,9 +23,32 @@ int myp_recv( MYSQL *m, void *buf, int size ) {
    return myp_recv_no_gc(m,buf,size);
 }
 
+/*
+	While a connection opens, each read waits only for what is left of the
+	connect timeout, not for the whole of it again: a server that sent its
+	greeting a byte at a time, each inside the timeout, held mysql_open for as
+	long as it went on. False once nothing is left. A read on TLS asks this
+	from the record layer, for each read of the socket it makes.
+*/
+int myp_wait_budget( MYSQL *m ) {
+	double left;
+	if( m->deadline <= 0 )
+		return 1;
+	left = m->deadline - psock_clock();
+	if( left < 0.000001 )
+		return 0;
+	psock_set_recv_timeout(m->s,left);
+	return 1;
+}
+
 int myp_recv_no_gc( MYSQL *m, void *buf, int size ) {
 	while( size ) {
-		int len = m->tls ? myp_tls_recv(m,buf,size) : psock_recv_no_gc(m->s,(char*)buf,size);
+		int len;
+		if( !m->tls && !myp_wait_budget(m) ) {
+			m->timed_out = 1;
+			return 0;
+		}
+		len = m->tls ? myp_tls_recv(m,buf,size) : psock_recv_no_gc(m->s,(char*)buf,size);
 		if( len <= 0 ) {
 			if( len == PS_BLOCK && !m->tls )
 				m->timed_out = 1;

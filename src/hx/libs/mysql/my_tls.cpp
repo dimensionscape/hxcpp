@@ -69,7 +69,13 @@ static int bio_send( void *ctx, const unsigned char *buf, size_t len ) {
 
 static int bio_recv( void *ctx, unsigned char *buf, size_t len ) {
 	MYSQL *m = (MYSQL*)ctx;
-	int r = psock_recv_no_gc(m->s, (char*)buf, (int)len);
+	int r;
+	// Within what is left of the connect timeout, while the connection opens.
+	if( !myp_wait_budget(m) ) {
+		m->timed_out = 1;
+		return MBEDTLS_ERR_SSL_TIMEOUT;
+	}
+	r = psock_recv_no_gc(m->s, (char*)buf, (int)len);
 	if( r >= 0 )
 		return r;
 	if( r == PS_BLOCK ) {
