@@ -2408,6 +2408,18 @@ void MarkStringArray(String *inPtr, int inLength, hx::MarkContext *__inCtx)
 
 // --- Roots -------------------------------
 
+// Guards both root sets. GCAddRoot and the others hold it to insert or erase,
+// and the collector holds it while it walks the sets (MarkAll, VisitAll): the
+// threads that change them do not wait for a collection. A thread that is
+// starting adds its root before it registers with the collector, one that is
+// ending removes its root after it has unregistered, and native code can add
+// or remove a root from a GC-free zone or from a thread hxcpp never knew.
+//
+// So whoever holds it must not allocate GC memory, reach a safe point, or wait
+// for another thread while it does. Then a thread waits for the collector here
+// only while a walk runs, and the collector waits only for an insert or an
+// erase to finish; neither ever waits for the other to do anything more. The
+// collector releases it before the finalizers run, since they may remove roots.
 FILE_SCOPE std::mutex* sGCRootLock = nullptr;
 typedef std::unordered_set<hx::Object **> RootSet;
 // Made in InitAlloc, as the lock is, and never destroyed. A thread's root is
@@ -4381,6 +4393,11 @@ public:
 
       hx::VisitClassStatics(inCtx);
 
+      {
+      // For the walks only: see sGCRootLock. The visit just patches moved
+      // pointers, and waits for nothing.
+      std::lock_guard<std::mutex> rootLock(*hx::sGCRootLock);
+
       for(hx::RootSet::iterator i = hx::sgRootSet->begin(); i!=hx::sgRootSet->end(); ++i)
       {
          hx::Object **obj = *i;
@@ -4404,6 +4421,7 @@ public:
                   *(char **)(i->first) = (char *)(obj) + offset;
             }
          }
+      }
 
       if (hx::sgFinalizers)
          for(int i=0;i<hx::sgFinalizers->size();i++)
@@ -4827,6 +4845,10 @@ public:
 
       {
       hx::AutoMarkPush info(&mMarker,"Roots","root");
+      // For the walks only: see sGCRootLock. Marking here waits for nothing
+      // and touches no root; the marking threads start, and the finalizers
+      // run, after it is released.
+      std::lock_guard<std::mutex> rootLock(*hx::sGCRootLock);
 
       for(hx::RootSet::iterator i = hx::sgRootSet->begin(); i!=hx::sgRootSet->end(); ++i)
       {

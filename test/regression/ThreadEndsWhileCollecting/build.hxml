@@ -1,0 +1,3 @@
+-cpp bin
+-m Main
+-D ABI=-MTd
