@@ -85,8 +85,12 @@ int myp_tls_start( MYSQL *m, const char *host ) {
 	int verify = m->options.ssl_mode >= MYSQL_SSL_VERIFY_CA;
 
 	tls_ready();
-	t = (MYSQL_TLS*)malloc(sizeof(MYSQL_TLS));
-	memset(t, 0, sizeof(MYSQL_TLS));
+	t = (MYSQL_TLS*)calloc(1, sizeof(MYSQL_TLS));
+	if( t == NULL ) {
+		snprintf(m->last_error, sizeof(m->last_error), "Out of memory starting TLS");
+		m->errcode = 2008; // CR_OUT_OF_MEMORY
+		return 0;
+	}
 	mbedtls_ssl_init(&t->ssl);
 	mbedtls_ssl_config_init(&t->conf);
 	mbedtls_x509_crt_init(&t->ca);

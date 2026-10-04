@@ -521,25 +521,31 @@ static Result *alloc_result( Connection *c, MYSQL_RES *r )
    Result *res = new Result();
    res->create(r);
 
+   // At most the client's bound on columns, 65,535, which the server's
+   // answer cannot get past: the count sized this before any column arrived.
    int num_fields = mysql_num_fields(r);
    int i,j;
    MYSQL_FIELD *fields = mysql_fetch_fields(r);
    res->current = 0;
-   res->nfields = num_fields;
+   res->nfields = 0;
    res->field_names = Array_obj<String>::__new(num_fields,num_fields);
    HX_OBJ_WB_GET(res, res->field_names.mPtr);
-   res->fields_convs = (CONV*)malloc(sizeof(CONV)*num_fields);
+   res->fields_convs = (CONV*)malloc(sizeof(CONV)*(num_fields > 0 ? num_fields : 1));
+   if( !res->fields_convs )
+      HXTHROW("Out of memory reading the server's answer");
+   res->nfields = num_fields;
 
    for(i=0;i<num_fields;i++)
    {
       String name;
+      const char *own = fields[i].name ? fields[i].name : "";
       // The column's own name. One computed by the statement (COUNT(*) and
       // the like) was renamed '???', so two of them in one row overwrote
       // each other and neither could be read by name.
-      if( strchr(fields[i].name,'(') )
-         name = String::create(fields[i].name, -1);
+      if( strchr(own,'(') )
+         name = String::create(own, -1);
       else
-         name = String::createPermanent(fields[i].name, -1);
+         name = String::createPermanent(own, -1);
 
       res->field_names[i] = name;
       res->fields_convs[i] = convert_type(fields[i].type,fields[i].flags,fields[i].length,fields[i].charset);
@@ -773,6 +779,8 @@ Dynamic _hx_mysql_create(Dynamic params)
    Dynamic keepAlive = params->__Field(HX_CSTRING("keepAlive"), hx::paccDynamic);
 
    MYSQL *cnx = mysql_init(NULL);
+   if( !cnx )
+      HXTHROW("Out of memory creating a MySQL connection");
    mysql_set_endpoint(cnx,
       copy_param(params, HX_CSTRING("host")),
       int_param(params, HX_CSTRING("port")),

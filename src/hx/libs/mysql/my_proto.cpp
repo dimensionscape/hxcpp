@@ -157,11 +157,18 @@ char *myp_read_bin_str( MYSQL_PACKET *p ) {
 	char *str;
 	if( size == -1 )
 		return NULL;
-	if( p->error || p->pos + size > p->size ) {
+	// Against what is left of the packet, not by adding the length to the
+	// position: a length near 2^31 wrapped the sum negative, passed, and
+	// sized a malloc of size + 1, which wrapped too -- NULL, copied into.
+	if( p->error || size < 0 || size > p->size - p->pos ) {
 		p->error = 1;
 		return NULL;
 	}
 	str = (char*)malloc(size + 1);
+	if( str == NULL ) {
+		p->error = 1;
+		return NULL;
+	}
 	memcpy(str,p->buf + p->pos, size);
 	str[size] = 0;
 	p->pos += size;
@@ -181,9 +188,19 @@ int myp_read_packet( MYSQL *m, MYSQL_PACKET *p ) {
 	//p->id = (psize >> 24);
 	psize &= 0xFFFFFF;
 	p->size = psize;
-	if( p->mem < (int)psize ) {
+	// A buffer is made when there is none, whatever the size: the rows of a
+	// result keep the buffers they arrive in, and the connection's own was
+	// let go before the first, so an empty packet then wrote its end marker
+	// through a null pointer.
+	if( p->buf == NULL || p->mem < (int)psize ) {
+		char *buf = (char*)malloc(psize + 1);
+		if( buf == NULL ) {
+			p->error = 1;
+			p->size = 0;
+			return 0;
+		}
 		free(p->buf);
-		p->buf = (char*)malloc(psize + 1);
+		p->buf = buf;
 		p->mem = psize;
 	}
 	p->buf[psize] = 0;

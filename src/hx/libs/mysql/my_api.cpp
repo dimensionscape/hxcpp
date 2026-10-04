@@ -51,12 +51,18 @@ static void save_error( MYSQL *m, MYSQL_PACKET *p ) {
 		}
 		ecode = myp_read_ui16(p);
 	} while( ecode == 0xFFFF );
-	if( m->is41 && p->buf[p->pos] == '#' ) {
+	if( m->is41 && p->pos < p->size && p->buf[p->pos] == '#' ) {
 		// The SQLSTATE: 40001 is a deadlock, 23000 a duplicate key, and the
 		// error number alone does not always say which class a failure is.
-		memcpy(state,p->buf + p->pos + 1,5);
-		state[5] = 0;
-		p->pos += 6;
+		// Only when all five characters are there: a packet that ended at
+		// the '#' had them copied from past its end, and the end marker
+		// they began with made the state "00000", success.
+		if( p->size - p->pos >= 6 ) {
+			memcpy(state,p->buf + p->pos + 1,5);
+			state[5] = 0;
+			p->pos += 6;
+		} else
+			p->pos = p->size;
 	}
 	error(m,"%s",myp_read_string(p));
 	m->errcode = ecode;
@@ -141,6 +147,34 @@ static void io_failure( MYSQL *m, const char *what, int reading ) {
 	myp_close(m);
 }
 
+/*
+	A packet no server sends -- a count or a length past what the protocol
+	allows, or one that does not match what came before it. Nothing after it
+	can be read in step, so the connection is closed, as for a read that
+	failed, and the error says what was wrong rather than that the
+	connection was lost. CR_MALFORMED_PACKET, as libmysqlclient reports it.
+
+	The server is not trusted to be honest: under the default ssl mode,
+	PREFERRED, no certificate is checked, so whoever answers in its place
+	writes these packets.
+*/
+static void malformed( MYSQL *m, const char *what ) {
+	snprintf(m->last_error,sizeof(m->last_error),"%s",what);
+	m->errcode = 2027; // CR_MALFORMED_PACKET
+	strcpy(m->sqlstate,"HY000");
+	myp_tls_free(m);
+	myp_close(m);
+}
+
+/* An allocation for the server's answer failed: the rest of it cannot be read. */
+static void out_of_memory( MYSQL *m ) {
+	snprintf(m->last_error,sizeof(m->last_error),"Out of memory reading the server's answer");
+	m->errcode = 2008; // CR_OUT_OF_MEMORY
+	strcpy(m->sqlstate,"HY000");
+	myp_tls_free(m);
+	myp_close(m);
+}
+
 static int not_connected( MYSQL *m ) {
 	if( m->s != INVALID_SOCKET )
 		return 0;
@@ -151,6 +185,8 @@ static int not_connected( MYSQL *m ) {
 
 MYSQL *mysql_init( void *unused ) {
 	MYSQL *m = (MYSQL*)malloc(sizeof(struct _MYSQL));
+	if( m == NULL )
+		return NULL;
 	psock_init();
 	memset(m,0,sizeof(struct _MYSQL));
 	m->s = INVALID_SOCKET;
@@ -192,6 +228,11 @@ static int rsa_password( MYSQL *m, const char *pem, const char *pass, const unsi
 	int length = (int)strlen(pass) + 1;
 	int i, n;
 	unsigned char *clear = (unsigned char*)malloc(length);
+	if( clear == NULL ) {
+		error(m,"Out of memory encrypting the password",NULL);
+		m->errcode = 2008; // CR_OUT_OF_MEMORY
+		return -1;
+	}
 	for(i=0;i<length;i++)
 		clear[i] = (unsigned char)(i < length - 1 ? pass[i] : 0) ^ nonce[i % NONCE_SIZE];
 	n = myp_rsa_encrypt(m,pem,clear,length,out,AUTH_MAX);
@@ -683,15 +724,47 @@ int mysql_real_query( MYSQL *m, const char *query, int qlength ) {
 	return 0;
 }
 
+/*
+	The most columns a result may have: every count the protocol's two-byte
+	length carries. MySQL's own limit is 4,096 columns in a table, but a join
+	can be wider than any one table, so the bound is set where no real
+	result reaches and the allocation it sizes stays small: about 5 MB of
+	column records at most. The count sized an allocation before any of the
+	columns arrived, with no bound and no check: nine bytes asked malloc for
+	150 GB, and the NULL it returned was written to.
+*/
+#define MAX_COLUMNS 0xFFFF
+
 // The field definitions after a result's header, and the EOF after them.
 static int read_fields( MYSQL *m, MYSQL_RES *r ) {
 	int i;
+	int count;
 	MYSQL_PACKET *p = &m->packet;
 	p->pos = 0;
-	r->nfields = myp_read_bin(p);
-	if( p->error ) return 0;
-	r->fields = (MYSQL_FIELD*)malloc(sizeof(MYSQL_FIELD) * r->nfields);
-	memset(r->fields,0,sizeof(MYSQL_FIELD) * r->nfields);
+	count = myp_read_bin(p);
+	if( p->error ) {
+		malformed(m,"The server sent a result header that could not be read");
+		return 0;
+	}
+	if( count == -1 ) {
+		// 0xFB: a request for a file of the client's (LOAD DATA LOCAL
+		// INFILE), which this client never offers to send, and which it
+		// read as a count of -1 columns.
+		malformed(m,"The server asked for a local file, which this client does not send");
+		return 0;
+	}
+	if( count < 1 || count > MAX_COLUMNS ) {
+		char what[160];
+		snprintf(what,sizeof(what),"The server sent a result of %d columns; this client takes from 1 to %d",count,MAX_COLUMNS);
+		malformed(m,what);
+		return 0;
+	}
+	r->fields = (MYSQL_FIELD*)calloc(count,sizeof(MYSQL_FIELD));
+	if( r->fields == NULL ) {
+		out_of_memory(m);
+		return 0;
+	}
+	r->nfields = count;
 	for(i=0;i<r->nfields;i++) {
 		if( !myp_read_packet(m,p) )
 			return 0;
@@ -711,15 +784,21 @@ static int read_fields( MYSQL *m, MYSQL_RES *r ) {
 			f->decimals = myp_read_byte(p);
 			if( m->is41 ) myp_read_byte(p); // should be 0
 			if( m->is41 ) myp_read_byte(p); // should be 0
-			if( p->error )
+			// A column has a name, if an empty one: NULL in its place was
+			// taken, and the result's first row read the name it lacked.
+			if( p->error || f->name == NULL ) {
+				malformed(m,"The server sent a column definition that could not be read");
 				return 0;
+			}
 		}
 	}
 	// first EOF packet
 	if( !myp_read_packet(m,p) )
 		return 0;
-	if( myp_read_byte(p) != 0xFE || p->size >= 9 )
+	if( myp_read_byte(p) != 0xFE || p->size >= 9 ) {
+		malformed(m,"The server's column definitions did not end where its result header said");
 		return 0;
+	}
 	myp_read_eof(m,p);
 	return 1;
 }
@@ -737,7 +816,10 @@ static void parse_row( MYSQL_PACKET *p, int nfields, MYSQL_ROW_DATA *current ) {
 			current->lengths[i] = 0;
 			current->datas[i] = NULL;
 		} else {
-			if( p->pos + l > p->size ) {
+			// Against what is left, not by adding: a length near 2^31 wrapped
+			// the sum negative and passed, and the row's end was then written
+			// 2 GB before its buffer.
+			if( p->error || l < 0 || l > p->size - p->pos ) {
 				p->error = 1;
 				l = 0;
 			}
@@ -775,11 +857,22 @@ static int store_rows( MYSQL *m, MYSQL_RES *r ) {
 		// allocate one more row
 		if( r->row_count == r->memory_rows ) {
 			MYSQL_ROW_DATA *rows;
-			r->memory_rows = r->memory_rows ? (r->memory_rows << 1) : 1;
-			rows = (MYSQL_ROW_DATA*)malloc(r->memory_rows * sizeof(MYSQL_ROW_DATA));
+			int grown = r->memory_rows ? (r->memory_rows << 1) : 1;
+			// Doubling past 2^30 rows wrapped the count negative; and a NULL
+			// from malloc was copied into.
+			if( grown <= 0 || (size_t)grown > ((size_t)-1) / sizeof(MYSQL_ROW_DATA) ) {
+				out_of_memory(m);
+				return 0;
+			}
+			rows = (MYSQL_ROW_DATA*)malloc(grown * sizeof(MYSQL_ROW_DATA));
+			if( rows == NULL ) {
+				out_of_memory(m);
+				return 0;
+			}
 			memcpy(rows,r->rows,r->row_count * sizeof(MYSQL_ROW_DATA));
 			free(r->rows);
 			r->rows = rows;
+			r->memory_rows = grown;
 		}
 		// read row fields
 		{
@@ -787,13 +880,20 @@ static int store_rows( MYSQL *m, MYSQL_RES *r ) {
 			current->raw = p->buf;
 			current->lengths = (unsigned long*)malloc(sizeof(unsigned long) * r->nfields);
 			current->datas = (char**)malloc(sizeof(char*) * r->nfields);
-			parse_row(p,r->nfields,current);
+			if( current->lengths != NULL && current->datas != NULL )
+				parse_row(p,r->nfields,current);
+			// the packet buffer as been stored, don't reuse it
+			p->buf = NULL;
+			p->mem = 0;
+			if( current->lengths == NULL || current->datas == NULL ) {
+				out_of_memory(m);
+				return 0;
+			}
 		}
-		// the packet buffer as been stored, don't reuse it
-		p->buf = NULL;
-		p->mem = 0;
-		if( p->error )
+		if( p->error ) {
+			malformed(m,"The server sent a row that does not match its columns");
 			return 0;
+		}
 	}
 	return 1;
 }
@@ -815,10 +915,21 @@ static int myp_drain( MYSQL *m ) {
 	MYSQL_RES *aside;
 	if( !m->stream_id )
 		return 1;
-	aside = (MYSQL_RES*)malloc(sizeof(struct _MYSQL_RES));
-	memset(aside,0,sizeof(struct _MYSQL_RES));
+	aside = (MYSQL_RES*)calloc(1,sizeof(struct _MYSQL_RES));
+	if( aside == NULL ) {
+		m->stream_id = 0;
+		out_of_memory(m);
+		return 0;
+	}
 	aside->nfields = m->stream_fields;
 	if( !store_rows(m,aside) ) {
+		if( m->s == INVALID_SOCKET ) {
+			// Refused as malformed, or out of memory: the connection is
+			// closed already, and the error says why.
+			mysql_free_result(aside);
+			m->stream_id = 0;
+			return 0;
+		}
 		if( m->errcode <= 0 ) {
 			mysql_free_result(aside);
 			m->stream_id = 0;
@@ -850,8 +961,11 @@ MYSQL_RES *mysql_store_result( MYSQL *m ) {
 		myp_read_ok(m,p);
 		return NULL;
 	}
-	r = (MYSQL_RES*)malloc(sizeof(struct _MYSQL_RES));
-	memset(r,0,sizeof(struct _MYSQL_RES));
+	r = (MYSQL_RES*)calloc(1,sizeof(struct _MYSQL_RES));
+	if( r == NULL ) {
+		out_of_memory(m);
+		return NULL;
+	}
 	m->errcode = 0;
 	if( !do_store(m,r) ) {
 		mysql_free_result(r);
@@ -880,8 +994,11 @@ MYSQL_RES *mysql_use_result( MYSQL *m ) {
 		myp_read_ok(m,p);
 		return NULL;
 	}
-	r = (MYSQL_RES*)malloc(sizeof(struct _MYSQL_RES));
-	memset(r,0,sizeof(struct _MYSQL_RES));
+	r = (MYSQL_RES*)calloc(1,sizeof(struct _MYSQL_RES));
+	if( r == NULL ) {
+		out_of_memory(m);
+		return NULL;
+	}
 	m->errcode = 0;
 	if( !read_fields(m,r) ) {
 		mysql_free_result(r);
@@ -889,12 +1006,17 @@ MYSQL_RES *mysql_use_result( MYSQL *m ) {
 			io_failure(m,"Lost connection to the server while reading a result",1);
 		return NULL;
 	}
+	r->stream_row.lengths = (unsigned long*)malloc(sizeof(unsigned long) * r->nfields);
+	r->stream_row.datas = (char**)malloc(sizeof(char*) * r->nfields);
+	if( r->stream_row.lengths == NULL || r->stream_row.datas == NULL ) {
+		mysql_free_result(r);
+		out_of_memory(m);
+		return NULL;
+	}
 	m->next_stream_id++;
 	if( m->next_stream_id <= 0 )
 		m->next_stream_id = 1;
 	r->stream_id = m->next_stream_id;
-	r->stream_row.lengths = (unsigned long*)malloc(sizeof(unsigned long) * (r->nfields ? r->nfields : 1));
-	r->stream_row.datas = (char**)malloc(sizeof(char*) * (r->nfields ? r->nfields : 1));
 	m->stream_id = r->stream_id;
 	m->stream_fields = r->nfields;
 	m->last_field_count = r->nfields;
@@ -965,7 +1087,7 @@ MYSQL_ROW mysql_fetch_row_stream( MYSQL *m, MYSQL_RES *r, int *failed ) {
 	if( p->error ) {
 		m->stream_id = 0;
 		r->eof = 1;
-		io_failure(m,"Failed to decode a row",1);
+		malformed(m,"The server sent a row that does not match its columns");
 		*failed = 1;
 		return NULL;
 	}
