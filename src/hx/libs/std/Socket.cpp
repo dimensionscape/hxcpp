@@ -547,7 +547,19 @@ String _hx_std_host_to_string( int ip )
 {
    struct in_addr i;
    *(int*)&i = ip;
+   #ifdef NEKO_WINDOWS
+   // Winsock keeps inet_ntoa's answer per thread
    return String( inet_ntoa(i) );
+   #else
+   // Not inet_ntoa: on macOS and the BSDs its buffer is one static for the
+   // whole process, which it first fills with "[inet_ntoa error]" and then
+   // formats over, so a thread formatting at the same time as another read
+   // that text back for 127.0.0.1
+   char buf[INET_ADDRSTRLEN];
+   if (!inet_ntop(AF_INET, &i, buf, sizeof(buf)))
+      return String();
+   return String( buf );
+   #endif
 }
 
 
