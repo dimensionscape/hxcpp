@@ -750,15 +750,12 @@ void __hxcpp_println_string(const String &inV)
 #endif
    hx::strbuf convertBuf;
    PRINTF("%s\n", inV.out_str(&convertBuf));
-   // An interactive console wants the line immediately; for a redirected
-   // stream a forced flush per line is a syscall per println
-#ifdef HX_WINDOWS
-   if (isConsole)
-      fflush(stdout);
-#else
-   if (isatty(1))
-      fflush(stdout);
-#endif
+   // Flush every line, redirected or not.  Boot asks for line buffering,
+   // but the Windows CRT treats _IOLBF as full buffering, so a redirected
+   // stdout there held a server's log lines back from whatever reads them,
+   // and lost them if the process died.  Elsewhere the buffer is already
+   // empty after the newline, so this costs nothing.
+   fflush(stdout);
 }
 
 
