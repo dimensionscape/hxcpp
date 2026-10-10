@@ -20,21 +20,30 @@ namespace
 #endif
             SorterFunc;
 
+        // Holds the array itself, not a pointer into its buffer: if the
+        // caller does not use the array after the sort, the sorter is all
+        // that keeps it, and its elements, alive through a collection in the
+        // comparator.  The two elements are copied out first, so the
+        // comparator is not handed references into a buffer a moving
+        // collection could relocate.
         struct ArraySorter
         {
-            ELEM* mArray;
+            hx::ArrayBase* mArray;
             SorterFunc mSorter;
 
-            ArraySorter(ELEM* inArray, SorterFunc inSorter) : mArray(inArray), mSorter(inSorter) {};
+            ArraySorter(hx::ArrayBase* inArray, SorterFunc inSorter) : mArray(inArray), mSorter(inSorter) {};
 
             bool operator()(int inA, int inB)
             {
-                return mSorter(mArray[inA], mArray[inB]) < 0;
+                ELEM* base = (ELEM*)mArray->GetBase();
+                ELEM a = base[inA];
+                ELEM b = base[inB];
+                return mSorter(a, b) < 0;
             }
         };
 
         template<class STORE>
-        static void SortImpl(ELEM* inArray, const int inLength, SorterFunc inSorter)
+        static void SortImpl(hx::ArrayBase* inArray, const int inLength, SorterFunc inSorter)
         {
             auto index = std::vector<STORE>(inLength);
             for (auto i = 0; i < inLength; i++)
@@ -42,6 +51,7 @@ namespace
                 index[i] = static_cast<STORE>(i);
             }
 
+            ELEM* base = (ELEM*)inArray->GetBase();
             std::stable_sort(index.begin(), index.end(), ArraySorter(inArray, inSorter));
 
             // Put the results back ...
@@ -52,14 +62,14 @@ namespace
                     from = index[from];
                 if (from != i)
                 {
-                    std::swap(inArray[i], inArray[from]);
+                    std::swap(base[i], base[from]);
                     index[i] = from;
                 }
             }
         }
 
     public:
-        static void Sort(ELEM* base, const int length, SorterFunc sorter)
+        static void Sort(hx::ArrayBase* array, const int length, SorterFunc sorter)
         {
             if (length < 2)
             {
@@ -68,15 +78,15 @@ namespace
 
             if (length <= std::numeric_limits<uint8_t>::max())
             {
-                SortImpl<uint8_t>(base, length, sorter);
+                SortImpl<uint8_t>(array, length, sorter);
             }
             else if (length <= std::numeric_limits<uint16_t>::max())
             {
-                SortImpl<uint16_t>(base, length, sorter);
+                SortImpl<uint16_t>(array, length, sorter);
             }
             else
             {
-                SortImpl<uint32_t>(base, length, sorter);
+                SortImpl<uint32_t>(array, length, sorter);
             }
         }
     };
@@ -589,9 +599,9 @@ String ArrayBase::joinArray(ArrayBase *inBase, String inSeparator)
 void ArrayBase::safeSort(DynamicSorterFunc inSorter, bool inIsString)
 {
    if (inIsString)
-       SafeSorter<String>::Sort((String *)mBase, length,inSorter);
+       SafeSorter<String>::Sort(this, length,inSorter);
    else
-       SafeSorter<Dynamic>::Sort((Dynamic *)mBase, length,inSorter);
+       SafeSorter<Dynamic>::Sort(this, length,inSorter);
 }
 
 

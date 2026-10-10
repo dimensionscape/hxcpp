@@ -919,18 +919,27 @@ public:
       std::sort(e, e+length, Sorter(inSorter) );
    }
 
+   // Compares two elements through their boxes.  It holds the boxed array
+   // itself, not a pointer into its buffer: a collection in the comparator
+   // marks the boxes only through the array, and a pointer to the buffer
+   // keeps the buffer alive but not the boxes in it.  The two boxes are
+   // copied out first, so the comparator is not handed references into a
+   // buffer a moving collection could relocate.
    struct BoxedSorter
    {
-      Dynamic    *mBoxed;
-      SorterFunc  mFunc;
+      hx::ArrayBase *mBoxed;
+      SorterFunc     mFunc;
 
-      BoxedSorter(Dynamic *inBoxed, SorterFunc inFunc) : mBoxed(inBoxed), mFunc(inFunc) { }
+      BoxedSorter(hx::ArrayBase *inBoxed, SorterFunc inFunc) : mBoxed(inBoxed), mFunc(inFunc) { }
       bool operator()(int inA, int inB)
       {
+         Dynamic *boxed = (Dynamic *)mBoxed->GetBase();
+         Dynamic a = boxed[inA];
+         Dynamic b = boxed[inB];
 #if (HXCPP_API_LEVEL>=500)
-         return mFunc(mBoxed[inA], mBoxed[inB]) < 0;
+         return mFunc(a, b) < 0;
 #else
-         return mFunc(mBoxed[inA], mBoxed[inB])->__ToInt() < 0;
+         return mFunc(a, b)->__ToInt() < 0;
 #endif
       }
    };
@@ -1213,9 +1222,11 @@ void Array_obj<ELEM_>::sort(SorterFunc inSorter)
       // The comparator takes Dynamic arguments, so comparing raw values
       // directly boxes two of them per comparison - n log n boxes.  Box
       // each element once, sort an index through the boxed values, then
-      // permute the raw values into place.  The boxed array is reachable
-      // from this frame for the whole sort, so its buffer stays valid
-      // even if the comparator triggers a collection.
+      // permute the raw values into place.  The sorter holds the boxed
+      // array for the whole sort.  'boxed' itself is dead once the sort
+      // starts, so an optimised build may keep no copy of it, and with
+      // only a pointer into its buffer a collection in the comparator
+      // freed the boxes.
       if (length<2)
          return;
       Array<Dynamic> boxed(length, length);
@@ -1229,8 +1240,7 @@ void Array_obj<ELEM_>::sort(SorterFunc inSorter)
       for(int i=0;i<length;i++)
          index[i] = i;
 
-      std::stable_sort(index.begin(), index.end(),
-                       BoxedSorter((Dynamic *)boxed->GetBase(), inSorter));
+      std::stable_sort(index.begin(), index.end(), BoxedSorter(boxed.mPtr, inSorter));
 
       // Apply the permutation with cycle-following swaps (see SafeSorter).
       // Re-read mBase - the comparator may have run user code.
