@@ -25,7 +25,9 @@ namespace
         // that keeps it, and its elements, alive through a collection in the
         // comparator.  The two elements are copied out first, so the
         // comparator is not handed references into a buffer a moving
-        // collection could relocate.
+        // collection could relocate.  The comparator may also shorten the
+        // array or release its buffer, so an element past the current
+        // length is not read: it compares as equal.
         struct ArraySorter
         {
             hx::ArrayBase* mArray;
@@ -35,6 +37,10 @@ namespace
 
             bool operator()(int inA, int inB)
             {
+                if (inA >= mArray->length || inB >= mArray->length)
+                {
+                    return false;
+                }
                 ELEM* base = (ELEM*)mArray->GetBase();
                 ELEM a = base[inA];
                 ELEM b = base[inB];
@@ -51,7 +57,8 @@ namespace
                 index[i] = static_cast<STORE>(i);
             }
 
-            std::stable_sort(index.begin(), index.end(), ArraySorter(inArray, inSorter));
+            ArraySorter sorter(inArray, inSorter);
+            hx::StableSort(index.data(), inLength, sorter);
 
             // Put the results back ... unless the comparator changed the
             // length, which leaves the index describing elements that are
