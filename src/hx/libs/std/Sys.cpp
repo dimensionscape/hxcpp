@@ -135,12 +135,13 @@ void _hx_std_put_env( String e, String v )
 
 void _hx_std_sys_sleep( double f )
 {
-   // A negative duration must not sleep at all - the double->DWORD
-   // conversion on Windows wraps it to ~49.7 days, and schedulers routinely
-   // compute sleep(deadline - now), which dips below zero under load.
-   // (!(f>0) also catches NaN.)
+   // A negative duration sleeps for zero - the double->DWORD conversion on
+   // Windows wraps it to ~49.7 days, and schedulers routinely compute
+   // sleep(deadline - now), which dips below zero under load.  (!(f>0) also
+   // catches NaN.)  Zero still sleeps: Sys.sleep(0) gives up the time slice,
+   // and spin-wait loops rely on that to let other threads run.
    if (!(f > 0))
-      return;
+      f = 0;
    hx::EnterGCFreeZone();
 #if defined(NEKO_WINDOWS)
    Sleep((DWORD)(f * 1000));
