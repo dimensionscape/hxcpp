@@ -32,6 +32,7 @@ typedef int64_t __int64;
 #include <time.h>
 #include <clocale>
 #include <mutex>
+#include <chrono>
 
 #ifdef HX_WINRT
 #define PRINTF WINRT_PRINTF
@@ -244,6 +245,9 @@ namespace
          unsigned long long mix = (unsigned long long)(size_t)this;
          mix ^= ((unsigned long long)time(0)) << 24;
          mix ^= (unsigned long long)clock();
+         // Fine-grained on every platform, so two runs started in the same
+         // second (with no address randomisation) still differ
+         mix ^= (unsigned long long)std::chrono::high_resolution_clock::now().time_since_epoch().count();
          #ifdef HX_WINDOWS
          LARGE_INTEGER now;
          QueryPerformanceCounter(&now);
