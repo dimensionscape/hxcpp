@@ -2,6 +2,7 @@
   <compilerflag value="-DHAVE_CONFIG_H" />
   <compilerflag value="-DPCRE2_STATIC" />
   <compilerflag value="-DSUPPORT_UNICODE" />
+  <compilerflag value="-DSUPPORT_JIT" if="HXCPP_PCRE_JIT" unless="HXCPP_PCRE_NO_JIT" />
   <compilerflag value="-I${PCRE_DIR}" />
   <compilerflag value="-std=c99" unless="MSVC_VER" />
 

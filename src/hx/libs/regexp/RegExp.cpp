@@ -8,6 +8,29 @@
 
 #define PCRE(o)      ((pcredata*)o.mPtr)
 
+// The PCRE2 JIT is opt-in (-D HXCPP_PCRE_JIT, see Build.xml).  Jitted code
+// runs on a small fixed stack, so a long subject can fail with
+// PCRE2_ERROR_JIT_STACKLIMIT where the interpreter succeeds; such a match is
+// run again by the interpreter, so turning the JIT on never changes a result.
+template<typename CODE>
+static inline void regexp_jit_compile(CODE *inCode, int (*inCompile)(CODE *, uint32_t))
+{
+   #ifdef HXCPP_PCRE_JIT
+   // Best effort - matching falls back to the interpreter when jit
+   // compilation is unavailable or fails
+   inCompile(inCode, PCRE2_JIT_COMPLETE);
+   #endif
+}
+
+static inline bool regexp_retry_without_jit(int inResult)
+{
+   #ifdef HXCPP_PCRE_JIT
+   return inResult==PCRE2_ERROR_JIT_STACKLIMIT;
+   #else
+   return false;
+   #endif
+}
+
 static void regexp_compilation_error(String pattern, int error_code, size_t error_offset) {
    PCRE2_UCHAR8 error_buffer[128];
    pcre2_get_error_message_8(error_code, error_buffer, sizeof(error_buffer));
@@ -102,6 +125,7 @@ struct pcredata : public hx::Object
             if (!rUtf16) {
                regexp_compilation_error(expr,error_code,error_offset);
             }
+            regexp_jit_compile(rUtf16, pcre2_jit_compile_16);
             match_data16 = pcre2_match_data_create_from_pattern_16(rUtf16, NULL);
          }
 
@@ -109,6 +133,8 @@ struct pcredata : public hx::Object
          // which Haxe strings allow to contain lone surrogates, and skipping
          // validation on invalid utf is documented undefined behaviour
          int n = pcre2_match_16(rUtf16,(PCRE2_SPTR16)string.raw_wptr(),pos+len,pos,0,match_data16,NULL);
+         if (regexp_retry_without_jit(n))
+            n = pcre2_match_16(rUtf16,(PCRE2_SPTR16)string.raw_wptr(),pos+len,pos,PCRE2_NO_JIT,match_data16,NULL);
          return checkMatch(n);
       }
 
@@ -122,13 +148,18 @@ struct pcredata : public hx::Object
          if (!rUtf8) {
             regexp_compilation_error(expr,error_code,error_offset);
          }
+         regexp_jit_compile(rUtf8, pcre2_jit_compile_8);
          match_data8 = pcre2_match_data_create_from_pattern_8(rUtf8, NULL);
       }
 
       #endif
       // The 8-bit subject comes from utf8_str(), which validates, so
       // PCRE2_NO_UTF_CHECK is safe here
-      return checkMatch( pcre2_match_8(rUtf8,(PCRE2_SPTR8)string.utf8_str(),pos+len,pos,PCRE2_NO_UTF_CHECK,match_data8,NULL) );
+      PCRE2_SPTR8 subject = (PCRE2_SPTR8)string.utf8_str();
+      int n = pcre2_match_8(rUtf8,subject,pos+len,pos,PCRE2_NO_UTF_CHECK,match_data8,NULL);
+      if (regexp_retry_without_jit(n))
+         n = pcre2_match_8(rUtf8,subject,pos+len,pos,PCRE2_NO_UTF_CHECK|PCRE2_NO_JIT,match_data8,NULL);
+      return checkMatch(n);
    }
 
    size_t* get_matches() {
@@ -216,6 +247,7 @@ Dynamic _hx_regexp_new_options(String s, String opt)
       if( !p ) {
          regexp_compilation_error(s,error_code,error_offset);
       }
+      regexp_jit_compile(p, pcre2_jit_compile_16);
       pcredata *pdata = new pcredata;
       pdata->create16(p,s,options);
       return pdata;
@@ -229,6 +261,7 @@ Dynamic _hx_regexp_new_options(String s, String opt)
       if( !p ) {
          regexp_compilation_error(s,error_code,error_offset);
       }
+      regexp_jit_compile(p, pcre2_jit_compile_8);
       pcredata *pdata = new pcredata;
       pdata->create8(p,s,options);
       return pdata;

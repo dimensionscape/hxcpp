@@ -4,6 +4,18 @@
 
 <set name="PCRE_DIR" value="${HXCPP}/project/thirdparty/pcre2-10.42/src" />
 
+<!-- The PCRE2 JIT is opt-in: -D HXCPP_PCRE_JIT.  It needs memory that is
+     both writable and executable, which these platforms forbid, so it stays
+     off there whatever is asked. -->
+<set name="HXCPP_PCRE_NO_JIT" value="1" if="emscripten" />
+<set name="HXCPP_PCRE_NO_JIT" value="1" if="iphoneos" />
+<set name="HXCPP_PCRE_NO_JIT" value="1" if="iphonesim" />
+<set name="HXCPP_PCRE_NO_JIT" value="1" if="appletvos" />
+<set name="HXCPP_PCRE_NO_JIT" value="1" if="appletvsim" />
+<set name="HXCPP_PCRE_NO_JIT" value="1" if="watchos" />
+<set name="HXCPP_PCRE_NO_JIT" value="1" if="watchsimulator" />
+<set name="HXCPP_PCRE_NO_JIT" value="1" if="winrt" />
+
 <files id="pcre2-8" tags="" >
   <depend files="hxcpp-depends"/>
   <depend name="${this_dir}/Build.xml" dateOnly="true" />
@@ -32,6 +44,7 @@
   <cache value="true" asLibrary="true" />
 
   <compilerflag value="-I${PCRE_DIR}"/>
+  <compilerflag value="-DHXCPP_PCRE_JIT" if="HXCPP_PCRE_JIT" unless="HXCPP_PCRE_NO_JIT" />
 
   <file name="${this_dir}/RegExp.cpp"/>
 </files>

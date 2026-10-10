@@ -198,6 +198,19 @@ class Test extends utest.Test
       }
    }
 
+   function testRegexpLongSubject() {
+      // With -D HXCPP_PCRE_JIT this pattern exhausts the JIT's stack on a long
+      // subject, so the match has to be run again by the interpreter
+      var comment = new StringBuf();
+      comment.add("/*");
+      for (i in 0...100000)
+         comment.add("x");
+      var unterminated = ~/\/\*(((?!\*\/).)*)$/s;
+      Assert.isTrue(unterminated.match(comment.toString()));
+      // and a utf16 subject
+      Assert.isTrue(unterminated.match(comment.toString() + "é"));
+   }
+
    function testSqlite()
    {
       log("Test sqlite");
