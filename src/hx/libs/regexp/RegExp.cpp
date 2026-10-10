@@ -56,6 +56,61 @@ struct pcredata : public hx::Object
    String string;
    String expr;
 
+   #ifdef HX_SMART_STRINGS
+   // The last utf16 subject, and the same text as valid utf16.  Haxe strings
+   // may hold lone surrogates, which pcre2 must not be given with
+   // PCRE2_NO_UTF_CHECK, but letting it check made global matching
+   // quadratic: every call checks from its start position to the end.  So
+   // each subject is checked here once.  A valid one is matched as it is;
+   // one with lone surrogates through a copy with U+FFFD in their place,
+   // which has the same length, so the match positions apply to the
+   // original.  Holding the subject keeps its buffer from being reused
+   // while it is remembered.
+   String checkedSubject;
+   String safeSubject;
+
+   const char16_t *utf16Subject(const String &inString)
+   {
+      if (inString.raw_wptr()!=checkedSubject.raw_wptr() || inString.length!=checkedSubject.length)
+      {
+         int len = inString.length;
+         int bad = -1;
+         const char16_t *w = inString.raw_wptr();
+         for(int i=0;i<len && bad<0;i++)
+         {
+            char16_t c = w[i];
+            if (c>=0xd800 && c<=0xdbff && i+1<len && w[i+1]>=0xdc00 && w[i+1]<=0xdfff)
+               i++;
+            else if (c>=0xd800 && c<=0xdfff)
+               bad = i;
+         }
+
+         checkedSubject = inString;
+         HX_OBJ_WB_GET(this, checkedSubject.raw_ref());
+         if (bad<0)
+            safeSubject = inString;
+         else
+         {
+            char16_t *copy = String::allocChar16Ptr(len);
+            // Read the source again - the allocation may have moved it
+            w = inString.raw_wptr();
+            memcpy(copy, w, len*sizeof(char16_t));
+            for(int i=bad;i<len;i++)
+            {
+               char16_t c = copy[i];
+               if (c>=0xd800 && c<=0xdbff && i+1<len && copy[i+1]>=0xdc00 && copy[i+1]<=0xdfff)
+                  i++;
+               else if (c>=0xd800 && c<=0xdfff)
+                  copy[i] = 0xfffd;
+            }
+            safeSubject = String(copy, len);
+         }
+         HX_OBJ_WB_GET(this, safeSubject.raw_ref());
+      }
+      return safeSubject.raw_wptr();
+   }
+   #endif
+
    void create8(pcre2_code_8 *inR, String inExpr, int inFlags)
    {
       rUtf8 = inR;
@@ -129,12 +184,11 @@ struct pcredata : public hx::Object
             match_data16 = pcre2_match_data_create_from_pattern_16(rUtf16, NULL);
          }
 
-         // No PCRE2_NO_UTF_CHECK here - the subject is the raw utf16 buffer,
-         // which Haxe strings allow to contain lone surrogates, and skipping
-         // validation on invalid utf is documented undefined behaviour
-         int n = pcre2_match_16(rUtf16,(PCRE2_SPTR16)string.raw_wptr(),pos+len,pos,0,match_data16,NULL);
+         // Valid utf16 (see utf16Subject), so PCRE2_NO_UTF_CHECK is safe
+         PCRE2_SPTR16 subject = (PCRE2_SPTR16)utf16Subject(string);
+         int n = pcre2_match_16(rUtf16,subject,pos+len,pos,PCRE2_NO_UTF_CHECK,match_data16,NULL);
          if (regexp_retry_without_jit(n))
-            n = pcre2_match_16(rUtf16,(PCRE2_SPTR16)string.raw_wptr(),pos+len,pos,PCRE2_NO_JIT,match_data16,NULL);
+            n = pcre2_match_16(rUtf16,subject,pos+len,pos,PCRE2_NO_UTF_CHECK|PCRE2_NO_JIT,match_data16,NULL);
          return checkMatch(n);
       }
 
@@ -182,9 +236,25 @@ struct pcredata : public hx::Object
       #endif
    }
 
-   void __Mark(hx::MarkContext *__inCtx) HXCPP_OVERRIDE { HX_MARK_MEMBER(string); HX_MARK_MEMBER(expr); }
+   void __Mark(hx::MarkContext *__inCtx) HXCPP_OVERRIDE
+   {
+      HX_MARK_MEMBER(string);
+      HX_MARK_MEMBER(expr);
+      #ifdef HX_SMART_STRINGS
+      HX_MARK_MEMBER(checkedSubject);
+      HX_MARK_MEMBER(safeSubject);
+      #endif
+   }
    #ifdef HXCPP_VISIT_ALLOCS
-   void __Visit(hx::VisitContext *__inCtx) HXCPP_OVERRIDE { HX_VISIT_MEMBER(string); HX_VISIT_MEMBER(expr); }
+   void __Visit(hx::VisitContext *__inCtx) HXCPP_OVERRIDE
+   {
+      HX_VISIT_MEMBER(string);
+      HX_VISIT_MEMBER(expr);
+      #ifdef HX_SMART_STRINGS
+      HX_VISIT_MEMBER(checkedSubject);
+      HX_VISIT_MEMBER(safeSubject);
+      #endif
+   }
    #endif
 
    static void finalize(Dynamic obj)

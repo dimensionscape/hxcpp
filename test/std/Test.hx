@@ -211,6 +211,20 @@ class Test extends utest.Test
       Assert.isTrue(unterminated.match(comment.toString() + "é"));
    }
 
+   function testRegexpLoneSurrogate() {
+      // A lone surrogate matches as U+FFFD would, and match positions and
+      // matched text refer to the original string
+      var lone = String.fromCharCode(0xD800);
+      var subject = "ab" + lone + "cdé";
+      var cd = ~/c(d)/;
+      Assert.isTrue(cd.match(subject));
+      Assert.equals(3, cd.matchedPos().pos);
+      Assert.equals("d", cd.matched(1));
+      var any = ~/b(.)c/;
+      Assert.isTrue(any.match(subject));
+      Assert.equals(lone, any.matched(1));
+   }
+
    function testSqlite()
    {
       log("Test sqlite");
