@@ -67,7 +67,9 @@ struct ClassMapLock
          // Spin
       }
    }
-   ~ClassMapLock() { sClassMapLock = 0; }
+   // An atomic store, not a plain one: on ARM a plain store can become
+   // visible before the map writes made under the lock
+   ~ClassMapLock() { _hx_atomic_store(&sClassMapLock, 0); }
 };
 
 Class _hx_RegisterClass(const String &inClassName, CanCastFunc inCanCast,
