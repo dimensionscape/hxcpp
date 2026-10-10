@@ -1227,25 +1227,30 @@ void Array_obj<ELEM_>::sort(SorterFunc inSorter)
       // starts, so an optimised build may keep no copy of it, and with
       // only a pointer into its buffer a collection in the comparator
       // freed the boxes.
-      if (length<2)
+      const int n = length;
+      if (n<2)
          return;
-      Array<Dynamic> boxed(length, length);
+      Array<Dynamic> boxed(n, n);
       {
          ELEM_ *e = (ELEM_ *)mBase;
-         for(int i=0;i<length;i++)
+         for(int i=0;i<n;i++)
             boxed->init(i, Dynamic(e[i]));
       }
 
-      auto index = std::vector<int>(length);
-      for(int i=0;i<length;i++)
+      auto index = std::vector<int>(n);
+      for(int i=0;i<n;i++)
          index[i] = i;
 
       std::stable_sort(index.begin(), index.end(), BoxedSorter(boxed.mPtr, inSorter));
 
       // Apply the permutation with cycle-following swaps (see SafeSorter).
-      // Re-read mBase - the comparator may have run user code.
+      // The comparator may have run user code, so re-read mBase.  If that
+      // code changed the length, the index describes values that are gone:
+      // leave the array as the comparator left it.
+      if (length!=n)
+         return;
       ELEM_ *e = (ELEM_ *)mBase;
-      for(int i=0;i<length;i++)
+      for(int i=0;i<n;i++)
       {
          int from = index[i];
          while (from < i)

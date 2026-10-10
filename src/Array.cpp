@@ -51,10 +51,16 @@ namespace
                 index[i] = static_cast<STORE>(i);
             }
 
-            ELEM* base = (ELEM*)inArray->GetBase();
             std::stable_sort(index.begin(), index.end(), ArraySorter(inArray, inSorter));
 
-            // Put the results back ...
+            // Put the results back ... unless the comparator changed the
+            // length, which leaves the index describing elements that are
+            // gone.  It may have moved the buffer too, so read it again.
+            if (inArray->__length() != inLength)
+            {
+                return;
+            }
+            ELEM* base = (ELEM*)inArray->GetBase();
             for (int i = 0; i < inLength; i++)
             {
                 int from = index[i];
