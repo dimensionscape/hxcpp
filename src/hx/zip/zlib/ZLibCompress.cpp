@@ -73,8 +73,14 @@ Array<uint8_t> hx::zip::Compress_obj::run(cpp::marshal::View<uint8_t> src, int l
 		zlibThrow(handle.get(), error);
 	}
 
-	// Shrink in place - slice() would allocate and copy the whole result
-	output->__SetSize(static_cast<int>(handle->total_out));
+	// The buffer was sized for the worst case, about the input size.  Shrink
+	// in place when the result fills most of it; otherwise copy to an exact
+	// fit, or a small result would keep the whole input-sized buffer alive
+	auto used = static_cast<int>(handle->total_out);
+	if (used >= output->length / 2)
+		output->__SetSize(used);
+	else
+		output->__SetSizeExact(used);
 	return output;
 }
 
