@@ -482,6 +482,11 @@ Dynamic _hx_std_process_run( String cmd, Array<String> vargs, int inShowParam )
       dup2(input[0],0);
       dup2(output[1],1);
       dup2(error[1],2);
+      // An ignored signal stays ignored across exec, so without this every
+      // child would inherit the SIGPIPE ignore above, and a pipeline such as
+      // "cat big | head -1" would get write errors instead of stopping
+      // quietly.  Restore the default, as Python's subprocess does.
+      signal(SIGPIPE, SIG_DFL);
       execvp(argv[0],(char* const*)&argv[0]);
       ssize_t unused = write(2, execFailed.c_str(), execFailed.size());
       (void)unused;
