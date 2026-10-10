@@ -281,6 +281,25 @@ std::recursive_mutex &LoaderMutex()
    static std::recursive_mutex m;
    return m;
 }
+
+// Takes the loader lock from a Haxe thread.  The holder allocates (strings,
+// the primitive objects) and runs dlopen, and a collection waits for every
+// thread to pause, so a thread blocked here must wait inside a GC free zone
+// or the two would wait for each other forever.
+struct LoaderLock
+{
+   LoaderLock()
+   {
+      if (!LoaderMutex().try_lock())
+      {
+         bool entered = hx::TryGCFreeZone();
+         LoaderMutex().lock();
+         if (entered)
+            hx::ExitGCFreeZone();
+      }
+   }
+   ~LoaderLock() { LoaderMutex().unlock(); }
+};
 }
 
 
@@ -537,7 +556,7 @@ void __hxcpp_push_dll_path(String inPath)
    // list, and a one-character path skipped the separator check
    if (inPath.length==0)
       return;
-   std::lock_guard<std::recursive_mutex> lock(LoaderMutex());
+   LoaderLock lock;
    int lastCode = inPath.cca(inPath.length-1);
 
    if ( lastCode!='\\' && lastCode!='/')
@@ -569,7 +588,7 @@ Dynamic __loadprim(String inLib, String inPrim,int inArgCount)
    // the GC, and the old post-insert makePermanent only changed the local
    // copy, leaving the key's character data to be collected
    String libString = (inLib + HX_CSTRING("_") + full_name).makePermanent();
-   std::lock_guard<std::recursive_mutex> lock(LoaderMutex());
+   LoaderLock lock;
    LoadedMap::iterator cached = sLoadedMap.find(libString);
    if (cached!=sLoadedMap.end() && cached->second)
       return Dynamic(cached->second);
@@ -612,7 +631,7 @@ extern "C" void *hx_cffi(const char *inName);
 
 void *__hxcpp_get_proc_address(String inLib, String full_name,bool inNdllProc,bool inQuietFail)
 {
-   std::lock_guard<std::recursive_mutex> lock(LoaderMutex());
+   LoaderLock lock;
    if (inLib.length==0)
    {
       void *registeredStatic = FindRegisteredPrim(full_name.__CStr());
@@ -847,7 +866,7 @@ void *__hxcpp_get_proc_address(String inLib, String full_name,bool inNdllProc,bo
 
 int __hxcpp_unload_all_libraries()
 {
-   std::lock_guard<std::recursive_mutex> lock(LoaderMutex());
+   LoaderLock lock;
    int unloaded = 0;
    while(sgOrderedModules.size())
    {
@@ -889,7 +908,7 @@ Dynamic __loadprim(String inLib, String inPrim,int inArgCount)
    // copy - every lookup after the next collection compared against freed
    // character data
    String primName = (inLib+HX_CSTRING("@")+full_name).makePermanent();
-   std::lock_guard<std::recursive_mutex> lock(LoaderMutex());
+   LoaderLock lock;
    LoadedMap::iterator cached = sLoadedMap.find(primName);
    if (cached!=sLoadedMap.end() && cached->second)
       return Dynamic(cached->second);
@@ -919,6 +938,8 @@ void __hxcpp_run_dll(String inLib, String inFunc)
 
 int __hxcpp_register_prim(const char *inName,void *inProc)
 {
+   // Plain lock: native libraries register from static initializers, which
+   // can run before hxcpp has started, and nothing here allocates
    std::lock_guard<std::recursive_mutex> lock(LoaderMutex());
    if (sgRegisteredPrims==0)
       sgRegisteredPrims = new RegistrationMap();

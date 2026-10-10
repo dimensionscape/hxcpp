@@ -203,11 +203,18 @@ String __hxcpp_get_kind(Dynamic inObject)
       return null();
    if (type==(int)(size_t)k_cpp_pointer)
       return HX_CSTRING("cpp.Pointer");
-   std::lock_guard<std::mutex> lock(KindMutex());
-   ReverseKindMap::const_iterator it = sgReverseKindMap.find(type);
-   if (it==sgReverseKindMap.end())
-      return null();
-   return String::create(it->second.c_str(), it->second.size());
+   // Copy the name under the lock and make the GC string after releasing
+   // it: an allocation can start a collection, which would wait forever for
+   // a thread blocked on this lock
+   std::string name;
+   {
+      std::lock_guard<std::mutex> lock(KindMutex());
+      ReverseKindMap::const_iterator it = sgReverseKindMap.find(type);
+      if (it==sgReverseKindMap.end())
+         return null();
+      name = it->second;
+   }
+   return String::create(name.c_str(), (int)name.size());
 }
 
 
