@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <string>
+#include <vector>
 #include <time.h>
 
 #ifndef EPPC
@@ -90,14 +92,40 @@ String _hx_std_get_env( String v )
    #ifdef HX_WINRT
       return String();
    #else
-      AutoLock lock(hxEnvMutex());
+      // Copy the value out under the lock, and make the GC string after
+      // releasing it: an allocation can start a collection, which would
+      // wait forever for a thread blocked on this lock
+      bool found = false;
       #if defined(NEKO_WINDOWS) && defined(HX_SMART_STRINGS)
          hx::strbuf wbuf;
-         return String::create( _wgetenv( v.wchar_str(&wbuf) ) );
+         const wchar_t *name = v.wchar_str(&wbuf);
+         std::wstring value;
+         {
+            AutoLock lock(hxEnvMutex());
+            const wchar_t *found_value = _wgetenv(name);
+            if (found_value)
+            {
+               found = true;
+               value = found_value;
+            }
+         }
       #else
          hx::strbuf buf;
-         return String::create( getenv(v.utf8_str(&buf)) );
+         const char *name = v.utf8_str(&buf);
+         std::string value;
+         {
+            AutoLock lock(hxEnvMutex());
+            const char *found_value = getenv(name);
+            if (found_value)
+            {
+               found = true;
+               value = found_value;
+            }
+         }
       #endif
+      if (!found)
+         return String();
+      return String::create(value.c_str(), (int)value.size());
    #endif
 }
 
@@ -112,19 +140,30 @@ void _hx_std_put_env( String e, String v )
 #elif defined(NEKO_WINDOWS)
    String set = e + HX_CSTRING("=") + (v != null()?v:"");
 
-   AutoLock lock(hxEnvMutex());
+   // Convert before taking the lock - conversion can allocate, and an
+   // allocation must not happen under it (see _hx_std_get_env)
    #ifdef HX_SMART_STRINGS
    if (set.isUTF16Encoded())
-      _wputenv(set.wchar_str());
+   {
+      const wchar_t *w = set.wchar_str();
+      AutoLock lock(hxEnvMutex());
+      _wputenv(w);
+   }
    else
    #endif
-      putenv(set.utf8_str());
+   {
+      const char *u = set.utf8_str();
+      AutoLock lock(hxEnvMutex());
+      putenv(u);
+   }
 #else
+   const char *name = e.utf8_str();
+   const char *value = v == null() ? 0 : v.utf8_str();
    AutoLock lock(hxEnvMutex());
-   if (v == null())
-      unsetenv(e.utf8_str());
+   if (!value)
+      unsetenv(name);
    else
-      setenv(e.utf8_str(),v.utf8_str(),1);
+      setenv(name,value,1);
 #endif
 }
 
@@ -853,19 +892,22 @@ Array<String> _hx_std_sys_env()
 {
    Array<String> result = Array_obj<String>::__new();
    #ifndef HX_WINRT
-   AutoLock lock(hxEnvMutex());
-   char **e = environ;
-   while( *e )
+   // Copy the entries under the lock, build the GC strings after releasing
+   // it (see _hx_std_get_env)
+   std::vector<std::string> entries;
    {
-      char *x = strchr(*e,'=');
+      AutoLock lock(hxEnvMutex());
+      for(char **e = environ; *e; e++)
+         entries.push_back(*e);
+   }
+   for(size_t i=0;i<entries.size();i++)
+   {
+      const char *entry = entries[i].c_str();
+      const char *x = strchr(entry,'=');
       if( x == NULL )
-      {
-         e++;
          continue;
-      }
-      result->push(String::create(*e,(int)(x-*e)));
+      result->push(String::create(entry,(int)(x-entry)));
       result->push(String::create(x+1));
-      e++;
    }
    #endif
    return result;
