@@ -1387,7 +1387,7 @@ const ::String &::String::makePermanent() const
          while(_hx_atomic_compare_exchange(&sPermanentStringSetMutex, 0, 1) != 0)
             __hxcpp_gc_safe_point();
          TNonGcStringSet *element = sPermanentStringSet->find(myHash ,  *this);
-         sPermanentStringSetMutex = 0;
+         _hx_atomic_store(&sPermanentStringSetMutex, 0);
          if (element)
          {
             const_cast<String *>(this)->__s = element->key.__s;
@@ -1413,7 +1413,7 @@ const ::String &::String::makePermanent() const
       while(_hx_atomic_compare_exchange(&sPermanentStringSetMutex, 0, 1) != 0)
          __hxcpp_gc_safe_point();
       sPermanentStringSet->set(*this,null());
-      sPermanentStringSetMutex = 0;
+      _hx_atomic_store(&sPermanentStringSetMutex, 0);
    }
 
    return *this;
@@ -1723,6 +1723,9 @@ String String::fromCharCode( int c )
          {
             ptr = (String *)malloc( sizeof(String)*1024 );
             memset((void *)ptr, 0, sizeof(String)*1024 );
+            // The fast path reads the table without the lock - make the
+            // zeroed table visible before the pointer to it
+            std::atomic_thread_fence(std::memory_order_release);
             sCharToString[group] = ptr;
          }
          if (!ptr[cid].__s)
@@ -1747,6 +1750,7 @@ String String::fromCharCode( int c )
             tmp.__w = p;
             fixHashPerm16(tmp);
             ptr[cid].length = l;
+            std::atomic_thread_fence(std::memory_order_release);
             ptr[cid].__w = p;
             #else
             char buf[5];
@@ -1756,11 +1760,15 @@ String String::fromCharCode( int c )
             buf[utf8Len] = '\0';
             const char *s = (char *)InternalCreateConstBuffer(buf,utf8Len+1,true);
             ptr[cid].length = utf8Len;
+            std::atomic_thread_fence(std::memory_order_release);
             ptr[cid].__s = s;
             #endif
          }
-         sCharToStringMutex = 0;
+         _hx_atomic_store(&sCharToStringMutex, 0);
       }
+      // Pairs with the release fences above: having seen the string
+      // pointer, see the length and characters written before it
+      std::atomic_thread_fence(std::memory_order_acquire);
       return ptr[cid];
    }
 }
