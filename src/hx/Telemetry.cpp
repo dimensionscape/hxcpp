@@ -204,7 +204,11 @@ public:
       std::map<void*, hx::Telemetry*>::iterator exist = alloc_map.find(_last_obj);
       if (exist != alloc_map.end() && _last_obj!=(NULL)) {
         type = "_unknown";
-        int vtt = _last_obj->__GetType();
+        // The object is looked up when the NEXT allocation is tracked, which can come before its
+        // constructor has run (Array::__copy allocates its buffer first). New memory is zeroed, so
+        // a null vtable means it is not an object yet.
+        int vtt = *(void**)_last_obj == 0 ? -1 : _last_obj->__GetType();
+        if (vtt == -1) type = "_unconstructed";
         if (vtt==vtInt || vtt==vtFloat || vtt==vtBool) type = "_non_class";
         else if (vtt==vtObject ||
                  vtt==vtString ||
